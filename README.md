@@ -11,15 +11,33 @@ is the Phase-0 + engine-gate spike for `~/Development/MLXApp` (see that repo's
 - Phase 0 acceptance: MET. Loads a local mlx-community model and streams.
 - Engine gate (Tier-1 tool calling): PASSED 5/5 on Qwen3-4B-4bit (matches omlx).
   Details in `~/Development/MLXApp/docs/09-tier1-results.md`.
+- Phase 1 (ACP chat server): IMPLEMENTED and protocol-validated over stdio
+  (`tools/acp_smoke.py`, 8/8). Remaining: the manual ActionUIChatDemo UI run.
 
 ## Modes
 
 ```
-mlx-agent gate [--model <dir>]              # run the 5-case Tier-1 tool-calling gate
+mlx-agent acp  [--model <dir>]                   # ACP server over stdio (Phase 1: chat, no tools)
+mlx-agent gate [--model <dir>]                   # run the 5-case Tier-1 tool-calling gate
 mlx-agent chat [--model <dir>] --prompt <text>   # load + stream one completion
 ```
 
 Default model dir: `/Users/tkukielk/Development/MLXApp/models/Qwen3-4B-4bit`.
+
+### ACP server (`acp`)
+
+Newline-delimited JSON-RPC 2.0 over stdin/stdout, matching the framing ActionUIChat's
+ACP transport (`ACPConnection`) uses. Implements `initialize`, `session/new` (returns a
+`model` select in `configOptions`), `session/prompt` (streams `agent_message_chunk` and,
+for thinking models, `agent_thought_chunk` split out of `<think></think>`), `session/cancel`,
+and `session/set_config_option` for the model. One `ChatSession` per process; its KV cache
+persists across prompts. All logging is on stderr; stdout is JSON-RPC only.
+
+Smoke-test it without the UI:
+
+```
+python3 tools/acp_smoke.py .build/xcode/Build/Products/Debug/mlx-agent
+```
 
 ## Building (IMPORTANT: xcodebuild, not `swift build`)
 

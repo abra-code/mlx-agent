@@ -357,14 +357,16 @@ func usage() {
         mlx-agent - MLX engine spike (Phase 0 + Tier-1 tool gate)
 
         USAGE:
-          mlx-agent gate [--model <dir>]
-          mlx-agent chat [--model <dir>] --prompt <text>
+          mlx-agent acp  [--model <dir>]                  ACP server over stdio (Phase 1: chat)
+          mlx-agent gate [--model <dir>]                  Tier-1 tool-calling gate
+          mlx-agent chat [--model <dir>] --prompt <text>  load + stream one completion
 
         OPTIONS:
           --model <dir>    model directory (default: \(defaultModelDir))
           --prompt <text>  prompt for chat mode
 
         EXAMPLES:
+          mlx-agent acp
           mlx-agent gate
           mlx-agent chat --prompt "Name three cities in Japan."
         """
@@ -382,6 +384,8 @@ let modelDir = option("--model", in: cliArgs) ?? defaultModelDir
 
 do {
     switch mode {
+    case "acp":
+        await ACPServer(modelDir: modelDir).serve()
     case "gate":
         let failures = try await runGate(model: modelDir)
         exit(Int32(failures))
