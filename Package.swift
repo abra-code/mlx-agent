@@ -23,6 +23,8 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.4")),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMajor(from: "1.3.0")),
+        // B3: MCP stdio clients (one per configured server) speak MCP directly - no mcp-proxy.
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.9.0"),
     ],
     targets: [
         .executableTarget(
