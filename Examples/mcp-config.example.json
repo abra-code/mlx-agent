@@ -1,0 +1,25 @@
+{
+  "servers": [
+    {
+      "name": "local",
+      "command": "/absolute/path/to/an/mcp/server",
+      "args": ["--mcp-server", "--some-flag", "value"],
+      "gatedTools": [
+        "write_file",
+        "edit_file",
+        "create_directory",
+        "move_file",
+        "delete_file",
+        "execute_command"
+      ]
+    },
+    {
+      "name": "time",
+      "command": "/absolute/path/to/python3",
+      "args": ["-m", "mcp_server_time", "--local-timezone", "America/New_York"],
+      "env": {
+        "PYTHONPATH": "/absolute/path/to/python/packages"
+      }
+    }
+  ]
+}

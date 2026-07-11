@@ -1,43 +1,59 @@
 # mlx-agent
 
 Native Swift local-LLM agent built on Apple's first-party
-[`mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm). Planned to speak ACP
-(Agent Client Protocol) over stdio to a UI and MCP over stdio to tools; today it
-is the Phase-0 + engine-gate spike for `~/Development/MLXApp` (see that repo's
-`docs/10-development-plan.md`). It does NOT yet speak ACP.
-
-## Status
-
-- Phase 0 acceptance: MET. Loads a local mlx-community model and streams.
-- Engine gate (Tier-1 tool calling): PASSED 5/5 on Qwen3-4B-4bit (matches omlx).
-  Details in `~/Development/MLXApp/docs/09-tier1-results.md`.
-- Phase 1 (ACP chat server): IMPLEMENTED and protocol-validated over stdio
-  (`tools/acp_smoke.py`, 8/8). Remaining: the manual ActionUIChatDemo UI run.
+[`mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm). It speaks
+[ACP](https://agentclientprotocol.com) (Agent Client Protocol) over stdio to a UI and
+[MCP](https://modelcontextprotocol.io) over stdio to tools: a UI drives it with
+`session/prompt`, and in agent mode it runs a tool loop against MCP servers with a
+permission gate before any mutating tool.
 
 ## Modes
 
 ```
-mlx-agent acp  [--model <dir>]                   # ACP server over stdio (Phase 1: chat, no tools)
-mlx-agent gate [--model <dir>]                   # run the 5-case Tier-1 tool-calling gate
-mlx-agent chat [--model <dir>] --prompt <text>   # load + stream one completion
+mlx-agent acp     [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
+mlx-agent oneshot [--model <dir>] --prompt <text> [--mcp-config <json>]
+                  [--auto-permission allow|deny] [guardrails]
+mlx-agent chat    [--model <dir>] --prompt <text>
+mlx-agent gate    [--model <dir>]
 ```
 
-Default model dir: `/Users/tkukielk/Development/MLXApp/models/Qwen3-4B-4bit`.
+- **acp** - ACP server over stdio (chat + agentic tools). See below.
+- **oneshot** - run one agent turn and print it; non-interactive, for scripts and tests.
+  `--auto-permission` answers the permission gate (default `deny`).
+- **chat** - load a model and stream a single completion.
+- **gate** - a self-contained tool-calling correctness check (a handful of fixed cases),
+  useful to catch a regression in the underlying engine without the full ACP stack.
+
+Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
+(60), `--tool-result-bytes <n>` (32768).
 
 ### ACP server (`acp`)
 
-Newline-delimited JSON-RPC 2.0 over stdin/stdout, matching the framing ActionUIChat's
-ACP transport (`ACPConnection`) uses. Implements `initialize`, `session/new` (returns a
-`model` select in `configOptions`), `session/prompt` (streams `agent_message_chunk` and,
-for thinking models, `agent_thought_chunk` split out of `<think></think>`), `session/cancel`,
-and `session/set_config_option` for the model. One `ChatSession` per process; its KV cache
-persists across prompts. All logging is on stderr; stdout is JSON-RPC only.
+Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `session/new`
+(returns a `model` select, plus a `mode` select when tools are configured),
+`session/prompt` (streams `agent_message_chunk` and, for thinking models,
+`agent_thought_chunk` split out of `<think></think>`), `session/cancel`, and
+`session/set_config_option` (switch model, or toggle chat/agent mode). One `ChatSession`
+per process; its KV cache persists across prompts. All logging is on stderr; stdout is
+JSON-RPC only.
 
-Smoke-test it without the UI:
+In agent mode a prompt runs the tool loop: it streams `tool_call` / `tool_call_update` /
+`usage_update`, and sends `session/request_permission` before any gated tool.
+
+Smoke-test the chat path without a UI:
 
 ```
 python3 tools/acp_smoke.py .build/xcode/Build/Products/Debug/mlx-agent
 ```
+
+### Tools (agent mode)
+
+Pass `--mcp-config <path>` to connect to one or more MCP stdio servers and expose their
+tools to the model. The config format is documented in
+[`docs/mcp-config.md`](docs/mcp-config.md) with an example in
+[`Examples/mcp-config.example.json`](Examples/mcp-config.example.json). Tools listed in a
+server's `gatedTools` require user permission before each call; all others dispatch
+directly.
 
 ## Building (IMPORTANT: xcodebuild, not `swift build`)
 
@@ -78,12 +94,7 @@ cd .build/xcode/Build/Products/Debug && ./mlx-agent gate
   integration into an OPT-IN dependency the consumer must supply; the
   `#huggingFaceTokenizerLoader()` macro expands to `Tokenizers.AutoTokenizer`.
   `swift-huggingface` 0.9.0 comes in transitively (the `HuggingFace`/Hub client).
+- `swift-sdk` (MCP) 0.9.0+ - MCP stdio tool clients (one per configured server).
 
 The graph resolves cleanly against mlx-swift-lm's `swift-syntax 602..<604`
 constraint (resolves 603.0.2 with prebuilt macro binaries).
-
-## Not done yet (the actual agent)
-
-ACP server (JSON-RPC over stdio), MCP stdio clients (swift-sdk), the `--oneshot`
-mode the gate should be ported into, prompt-cache persistence, model
-registry/switching, the RAM gate. Tracked in MLXApp `docs/10-development-plan.md`.

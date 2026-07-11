@@ -2,7 +2,6 @@
 import PackageDescription
 
 // mlx-agent - native Swift ACP agent on Apple's first-party mlx-swift-lm.
-// Phase 0 + engine-gate spike (see ~/Development/MLXApp/docs/10-development-plan.md).
 //
 // Dependency notes:
 // - mlx-swift-lm 3.x decoupled swift-transformers into an opt-in integration: the
@@ -23,7 +22,7 @@ let package = Package(
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.4")),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMajor(from: "1.3.0")),
-        // B3: MCP stdio clients (one per configured server) speak MCP directly - no mcp-proxy.
+        // MCP stdio clients (one per configured server) speak MCP directly - no mcp-proxy.
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.9.0"),
     ],
     targets: [
@@ -35,6 +34,8 @@ let package = Package(
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                // MCP stdio tool clients.
+                .product(name: "MCP", package: "swift-sdk"),
             ],
             path: "Sources/mlx-agent"
         )

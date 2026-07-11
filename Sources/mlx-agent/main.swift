@@ -1,20 +1,15 @@
-// mlx-agent - Phase 0 + engine-gate spike
+// mlx-agent - native Swift ACP agent on mlx-swift-lm.
 //
-// This is the seed of the native Swift ACP agent described in
-// ~/Development/MLXApp/docs/10-development-plan.md. It does NOT yet speak ACP.
-// It exists to answer the two questions that gate the whole MLX direction:
+// CLI entry point. Modes:
+//   acp      - Agent Client Protocol server over stdio (chat + agentic tools)
+//   oneshot  - run one agent turn and print it (non-interactive; drives test suites)
+//   chat     - load a model and stream a single completion
+//   gate     - built-in tool-calling correctness check (5 fixed cases)
 //
-//   1. Phase 0 acceptance: does mlx-swift-lm load a local mlx-community model and
-//      stream a coherent completion on this machine, in a signed-able Swift binary?
-//      -> `mlx-agent chat --prompt "..."`
-//
-//   2. Engine gate (Phase 2 folded forward): does mlx-swift-lm's built-in
-//      tool-call machinery (ChatSession tools + toolDispatch + ToolCallProcessor)
-//      clear the Tier-1 correctness bar (5/5 on Qwen3-4B-4bit, matching omlx)?
-//      -> `mlx-agent gate`
-//
-// The five gate cases mirror prototype/tool_smoke_test.py so the Swift result is
-// directly comparable to the omlx / llama-server baselines in docs/09.
+// `gate` is a self-contained diagnostic: it drives ChatSession's tool machinery over a
+// handful of prompts (single tool call, correct args, parallel calls, and a negative
+// "must NOT call a tool" case) and reports pass/fail, so a regression in the underlying
+// engine is caught without the full ACP stack.
 
 import Foundation
 import MLX
@@ -25,12 +20,13 @@ import Tokenizers
 
 // MARK: - Defaults
 
-let defaultModelDir =
-    "/Users/tkukielk/Development/MLXApp/models/Qwen3-4B-4bit"
+// No hardcoded model path: the model directory comes from --model or the
+// MLX_AGENT_MODEL environment variable (see requireModelDir).
+let defaultModelDir = ProcessInfo.processInfo.environment["MLX_AGENT_MODEL"]
 let systemPrompt =
     "You are a helpful assistant. Use the provided tools when they are relevant."
 
-// MARK: - Tool schemas (mirror tool_smoke_test.py TOOLS)
+// MARK: - Tool schemas (gate diagnostic)
 
 func object(_ properties: [String: any Sendable], required: [String]) -> [String: any Sendable] {
     ["type": "object", "properties": properties, "required": required]
@@ -126,7 +122,7 @@ func loadModel(_ dir: String) async throws -> ModelContainer {
         from: url, using: #huggingFaceTokenizerLoader())
 }
 
-// MARK: - chat mode (Phase 0 acceptance)
+// MARK: - chat mode
 
 func runChat(model dir: String, prompt: String) async throws {
     FileHandle.standardError.write(Data("[mlx-agent] loading \(dir) ...\n".utf8))
@@ -160,7 +156,7 @@ func runChat(model dir: String, prompt: String) async throws {
     FileHandle.standardError.write(Data(msg.utf8))
 }
 
-// MARK: - gate mode (Tier-1 tool correctness)
+// MARK: - gate mode (tool-calling correctness)
 
 struct GateCase {
     let name: String
@@ -221,7 +217,6 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
     // Rationale: Qwen3 emits a <think> block BEFORE its <tool_call>; if we checked
     // the cumulative respond() output, that pre-call thinking would falsely satisfy
     // "the model produced a final answer" even if the real follow-up turn was empty.
-    // This mirrors tool_smoke_test.py's separate _multi_turn_followup call.
     let session = ChatSession(
         container,
         instructions: systemPrompt,
@@ -320,7 +315,7 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
 
 func runGate(model dir: String) async throws -> Int {
     print(String(repeating: "=", count: 78))
-    print("mlx-agent Tier-1 tool-calling gate")
+    print("mlx-agent tool-calling gate")
     print("model  : \(dir)")
     print("engine : mlx-swift-lm 3.31.4 (MLXLLM ChatSession + ToolCallProcessor)")
     print(String(repeating: "=", count: 78))
@@ -345,30 +340,110 @@ func runGate(model dir: String) async throws -> Int {
         "\(gateCases().count - failures)/\(gateCases().count) passed;  "
             + "peak GPU memory (full run, load + all cases) = \(mib(peak))")
     print(
-        "gate bar: 5/5 (matches omlx + Qwen3-4B-4bit in docs/09). "
-            + (failures == 0 ? "GATE PASSED - native path confirmed." : "GATE NOT MET - see failures above."))
+        "gate bar: \(gateCases().count)/\(gateCases().count). "
+            + (failures == 0 ? "GATE PASSED." : "GATE NOT MET - see failures above."))
     return failures
+}
+
+// MARK: - oneshot mode (non-interactive single turn)
+
+/// Console delegate: streams the assistant answer to stdout, everything else (thoughts,
+/// tool calls, usage) to stderr, and answers the permission gate from `--auto-permission`.
+final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
+    let autoPermission: PermissionOutcome
+    init(autoPermission: PermissionOutcome) { self.autoPermission = autoPermission }
+
+    private func err(_ s: String) { FileHandle.standardError.write(Data(s.utf8)) }
+
+    func agentEmitText(kind: ThinkSplitter.Kind, _ text: String) {
+        switch kind {
+        case .message: FileHandle.standardOutput.write(Data(text.utf8))
+        case .thought: err(text)  // reasoning to stderr; stdout stays the final answer
+        }
+    }
+    func agentToolCallStarted(id: String, title: String, kind: String, rawInput: String) {
+        err("\n[tool_call] \(title) (\(kind))\n\(rawInput)\n")
+    }
+    func agentToolCallProgress(id: String) { err("[tool_call] running...\n") }
+    func agentToolCallFinished(id: String, status: String, output: String) {
+        err("[tool_call] \(status):\n\(output)\n")
+    }
+    func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome {
+        err("[permission] \(title) -> auto-\(autoPermission)\n")
+        return autoPermission
+    }
+    func agentTurnUsage(totalTokens: Int) { err("[usage] \(totalTokens) tokens\n") }
+}
+
+func runOneshot(
+    model dir: String, prompt: String, mcpConfigPath: String?,
+    guardrails: AgentGuardrails, autoPermission: PermissionOutcome
+) async throws -> Int {
+    let container = try await loadModel(dir)
+    let session = ChatSession(
+        container,
+        instructions: "You are a helpful assistant. Use the provided tools when they are relevant.",
+        generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0))
+
+    var registry: MCPToolRegistry? = nil
+    if let mcpConfigPath {
+        registry = await MCPToolRegistry.build(try MCPConfigLoader.load(mcpConfigPath))
+    }
+
+    let backend = MLXBackend(session)
+    let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+    let delegate = ConsoleAgentDelegate(autoPermission: autoPermission)
+    agent.delegate = delegate  // held by this local for the duration of the turn
+    agent.setToolsEnabled(registry?.toolSpecs.isEmpty == false)
+
+    let outcome = await agent.runTurn([.user(prompt)])
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    registry?.terminateAll()
+
+    switch outcome {
+    case .stop(let reason):
+        FileHandle.standardError.write(Data("[oneshot] stopReason=\(reason)\n".utf8))
+        return 0
+    case .cancelled:
+        FileHandle.standardError.write(Data("[oneshot] cancelled\n".utf8))
+        return 1
+    case .failed(let message):
+        FileHandle.standardError.write(Data("[oneshot] failed: \(message)\n".utf8))
+        return 1
+    }
 }
 
 // MARK: - CLI
 
 func usage() {
     let text = """
-        mlx-agent - MLX engine spike (Phase 0 + Tier-1 tool gate)
+        mlx-agent - native MLX ACP agent (chat + tools)
 
         USAGE:
-          mlx-agent acp  [--model <dir>]                  ACP server over stdio (Phase 1: chat)
-          mlx-agent gate [--model <dir>]                  Tier-1 tool-calling gate
-          mlx-agent chat [--model <dir>] --prompt <text>  load + stream one completion
+          mlx-agent acp     [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
+                                                          ACP server over stdio (chat + agentic tools)
+          mlx-agent oneshot [--model <dir>] --prompt <text> [--mcp-config <json>]
+                            [--auto-permission allow|deny] [guardrails]
+                                                          run one agent turn, print to stdout
+          mlx-agent gate    [--model <dir>]               built-in tool-calling gate
+          mlx-agent chat    [--model <dir>] --prompt <text>  load + stream one completion
 
         OPTIONS:
-          --model <dir>    model directory (default: \(defaultModelDir))
-          --prompt <text>  prompt for chat mode
+          --model <dir>            model directory (or set MLX_AGENT_MODEL; required if neither)
+          --prompt <text>          prompt for chat/oneshot mode
+          --mcp-config <json>      stdio-direct MCP server config (enables tools)
+          --mode chat|agent        initial ACP mode (default: agent if --mcp-config, else chat)
+          --auto-permission <x>    oneshot gate answer: allow | deny (default: deny)
+
+        GUARDRAILS:
+          --max-tool-iters <n>     max tool passes per turn (default: 10)
+          --tool-timeout <sec>     per-tool-call timeout (default: 60)
+          --tool-result-bytes <n>  max tool result bytes fed back (default: 32768)
 
         EXAMPLES:
-          mlx-agent acp
+          mlx-agent acp --mcp-config /path/to/mcp.json
+          mlx-agent oneshot --prompt "Read /etc/hosts" --mcp-config mcp.json --auto-permission allow
           mlx-agent gate
-          mlx-agent chat --prompt "Name three cities in Japan."
         """
     print(text)
 }
@@ -378,23 +453,71 @@ func option(_ name: String, in args: [String]) -> String? {
     return args[i + 1]
 }
 
+func intOption(_ name: String, in args: [String]) -> Int? { option(name, in: args).flatMap(Int.init) }
+func doubleOption(_ name: String, in args: [String]) -> Double? {
+    option(name, in: args).flatMap(Double.init)
+}
+
+func parseGuardrails(_ args: [String]) -> AgentGuardrails {
+    var g = AgentGuardrails()
+    if let v = intOption("--max-tool-iters", in: args) { g.maxToolIterations = max(1, v) }
+    if let v = doubleOption("--tool-timeout", in: args) { g.toolTimeout = max(1, v) }
+    if let v = intOption("--tool-result-bytes", in: args) { g.resultByteBudget = max(256, v) }
+    return g
+}
+
+func parseAutoPermission(_ args: [String]) -> PermissionOutcome {
+    switch option("--auto-permission", in: args)?.lowercased() {
+    case "allow": return .allow
+    case "deny", "reject": return .deny
+    default: return .deny  // safe default: never auto-approve a mutation
+    }
+}
+
 let cliArgs = Array(CommandLine.arguments.dropFirst())
 let mode = cliArgs.first
-let modelDir = option("--model", in: cliArgs) ?? defaultModelDir
+// Model dir comes from --model, else the MLX_AGENT_MODEL environment variable. There is
+// no built-in default: the modes that need a model require one of the two.
+let resolvedModelDir = option("--model", in: cliArgs) ?? defaultModelDir
+
+func requireModelDir() -> String {
+    guard let dir = resolvedModelDir else {
+        FileHandle.standardError.write(
+            Data("no model directory: pass --model <dir> or set MLX_AGENT_MODEL\n".utf8))
+        exit(2)
+    }
+    return dir
+}
 
 do {
     switch mode {
     case "acp":
-        await ACPServer(modelDir: modelDir).serve()
+        await ACPServer(
+            modelDir: requireModelDir(),
+            mcpConfigPath: option("--mcp-config", in: cliArgs),
+            guardrails: parseGuardrails(cliArgs),
+            initialMode: option("--mode", in: cliArgs)
+        ).serve()
+    case "oneshot":
+        guard let prompt = option("--prompt", in: cliArgs) else {
+            FileHandle.standardError.write(Data("oneshot mode requires --prompt <text>\n".utf8))
+            exit(2)
+        }
+        let code = try await runOneshot(
+            model: requireModelDir(), prompt: prompt,
+            mcpConfigPath: option("--mcp-config", in: cliArgs),
+            guardrails: parseGuardrails(cliArgs),
+            autoPermission: parseAutoPermission(cliArgs))
+        exit(Int32(code))
     case "gate":
-        let failures = try await runGate(model: modelDir)
+        let failures = try await runGate(model: requireModelDir())
         exit(Int32(failures))
     case "chat":
         guard let prompt = option("--prompt", in: cliArgs) else {
             FileHandle.standardError.write(Data("chat mode requires --prompt <text>\n".utf8))
             exit(2)
         }
-        try await runChat(model: modelDir, prompt: prompt)
+        try await runChat(model: requireModelDir(), prompt: prompt)
     default:
         usage()
     }

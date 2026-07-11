@@ -1,21 +1,23 @@
-// ACPServer.swift - Phase 1 of the mlx-agent plan (MLXApp docs/10).
+// ACPServer.swift - Agent Client Protocol server over stdio.
 //
-// A minimal Agent Client Protocol server over stdio: newline-delimited JSON-RPC 2.0,
-// mirroring the framing in ActionUIChat's ACPConnection (the authoritative client,
-// validated against OpenCode). Phase 1 is CHAT ONLY - no tools yet. It implements the
-// subset the ActionUIChat ACP transport actually exercises:
+// Newline-delimited JSON-RPC 2.0, matching the framing OpenCode uses (and validated
+// against the ActionUIChat ACP client). Serves both plain chat and agentic tool use;
+// the methods it implements:
 //
 //   initialize                -> { protocolVersion: 1, ... }
-//   session/new               -> { sessionId, configOptions: [ model select ] }
+//   session/new               -> { sessionId, configOptions: [ model, (mode when tools) ] }
 //   session/prompt            -> streams session/update notifications, resolves { stopReason }
 //   session/cancel  (notif)   -> cancels the in-flight turn
-//   session/set_config_option -> switches the model, returns refreshed configOptions
+//   session/set_config_option -> switches the model, or toggles chat/agent mode
 //
-// mlx-swift-lm streams raw text with <think></think> tags and no reasoning separation
-// (verified: MLXLMCommon has no <think> handling), so this server splits those markers
-// into agent_thought_chunk vs agent_message_chunk for the client's folded-reasoning UX.
-// One live ChatSession per process for v1 (KV cache persists across prompts, so the
-// second turn's prefill is cheaper - the plan's Phase-1 acceptance).
+// In agent mode a prompt runs the tool loop (see Agent): it streams tool_call /
+// tool_call_update / usage_update, and sends session/request_permission before any
+// gated tool. Tools come from the MCP servers named in --mcp-config (see MCPClients).
+//
+// mlx-swift-lm streams raw text with <think></think> tags and no reasoning separation,
+// so this server splits those markers into agent_thought_chunk vs agent_message_chunk
+// for the client's folded-reasoning UX. One live ChatSession per process (KV cache
+// persists across prompts, so a follow-up turn's prefill is cheaper).
 //
 // Everything on stdout is JSON-RPC; all logging goes to stderr.
 
@@ -66,28 +68,50 @@ final class ThinkSplitter {
     }
 }
 
-final class ACPServer: @unchecked Sendable {
+final class ACPServer: @unchecked Sendable, AgentDelegate {
 
-    private let chatInstructions = "You are a helpful assistant."
+    private let agentInstructions =
+        "You are a helpful assistant. Use the provided tools when they are relevant."
     private let lock = NSLock()
 
     private var currentModelDir: String
+    private let mcpConfigPath: String?
+    private let guardrails: AgentGuardrails
+    private var mode: String
+
     private var container: ModelContainer?
     private var session: ChatSession?
+    private var backend: MLXBackend?
+    private var agent: Agent?
+    private var registry: MCPToolRegistry?
+    private var registryBuildTask: Task<MCPToolRegistry?, Never>?
+    private var signalSources: [DispatchSourceSignal] = []
     private var sessionID: String?
     private var promptTask: Task<Void, Never>?
     private var stdinBuffer = Data()
     private var doneContinuation: CheckedContinuation<Void, Never>?
     private let writeLock = NSLock()
 
-    init(modelDir: String) {
+    // Outbound request correlation (agent -> client, e.g. session/request_permission).
+    private var outboundCounter = 1000
+    private var pendingPermissions: [Int: CheckedContinuation<PermissionOutcome, Never>] = [:]
+
+    init(
+        modelDir: String, mcpConfigPath: String? = nil,
+        guardrails: AgentGuardrails = .init(), initialMode: String? = nil
+    ) {
         self.currentModelDir = modelDir
+        self.mcpConfigPath = mcpConfigPath
+        self.guardrails = guardrails
+        // Default to agent mode when tools are configured, else chat.
+        self.mode = initialMode ?? (mcpConfigPath != nil ? "agent" : "chat")
     }
 
     // MARK: - Run loop
 
     func serve() async {
         log("ACP server ready (stdio JSON-RPC). initial model: \(currentModelDir)")
+        installSignalHandlers()
         let stdin = FileHandle.standardInput
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             lock.withLock { doneContinuation = cont }
@@ -111,6 +135,15 @@ final class ACPServer: @unchecked Sendable {
     }
 
     private func finish() {
+        // Terminate any MCP server children synchronously so they do not orphan to
+        // launchd when this process goes away (SIGTERM is immediate; disconnect is not).
+        failPendingPermissions(with: .cancel)
+        let reg = lock.withLock { () -> MCPToolRegistry? in
+            let r = registry
+            registry = nil
+            return r
+        }
+        reg?.terminateAll()
         let cont = lock.withLock { () -> CheckedContinuation<Void, Never>? in
             let c = doneContinuation
             doneContinuation = nil
@@ -141,7 +174,13 @@ final class ACPServer: @unchecked Sendable {
             return
         }
         guard let method = msg["method"] as? String else {
-            log("message without method; dropping")
+            // No method: this is a RESPONSE to one of our outbound requests
+            // (session/request_permission). Route it by id to the waiting continuation.
+            if let rid = (msg["id"] as? NSNumber)?.intValue {
+                handlePermissionResponse(id: rid, msg: msg)
+            } else {
+                log("message without method or id; dropping")
+            }
             return
         }
         let params = msg["params"] as? [String: Any] ?? [:]
@@ -192,27 +231,97 @@ final class ACPServer: @unchecked Sendable {
             let container = try await loadModel(dir)
             let session = ChatSession(
                 container,
-                instructions: chatInstructions,
+                instructions: agentInstructions,
                 generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0.7))
+            // Build the MCP tool registry once (spawns the server processes) if configured.
+            let registry = await ensureRegistry()
+            let backend = MLXBackend(session)
+            let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+            agent.delegate = self
+            let modeNow = lock.withLock { mode }
+            agent.setToolsEnabled(modeNow == "agent")
             let sid = "mlx-session-1"
             lock.withLock {
                 self.container = container
                 self.session = session
+                self.backend = backend
+                self.agent = agent
                 self.sessionID = sid
             }
-            log("session ready: \(sid) on \((dir as NSString).lastPathComponent)")
+            let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
+            log(
+                "session ready: \(sid) on \((dir as NSString).lastPathComponent) "
+                    + "[mode=\(modeNow), tools=\(toolCount)]")
             respond(id, ["sessionId": sid, "configOptions": configOptionsJSON()])
         } catch {
             respondError(id, -32000, "session/new failed: \(error.localizedDescription)")
         }
     }
 
-    private func handlePrompt(id: Int?, params: [String: Any]) {
-        let (ready, ourSid) = lock.withLock {
-            (self.session != nil && self.sessionID != nil, self.sessionID)
+    /// Build the MCP registry on first use (idempotent). Concurrent callers share ONE
+    /// build task so two overlapping session/new calls cannot spawn the server processes
+    /// twice (the loser's processes would be untracked and orphan). Returns nil when no
+    /// config was provided or it failed to load; a partial launch (some servers down)
+    /// still returns a usable registry with whatever tools came up.
+    private func ensureRegistry() async -> MCPToolRegistry? {
+        if let existing = lock.withLock({ registry }) { return existing }
+        guard mcpConfigPath != nil else { return nil }
+        let task: Task<MCPToolRegistry?, Never> = lock.withLock {
+            if let inFlight = registryBuildTask { return inFlight }
+            let created = Task { await self.buildRegistry() }
+            registryBuildTask = created
+            return created
         }
-        guard ready, let ourSid else {
+        let built = await task.value
+        lock.withLock { if registry == nil { registry = built } }
+        return built
+    }
+
+    private func buildRegistry() async -> MCPToolRegistry? {
+        guard let path = mcpConfigPath else { return nil }
+        let configs: [MCPServerConfig]
+        do {
+            configs = try MCPConfigLoader.load(path)
+        } catch {
+            log("MCP config load failed: \(error.localizedDescription)")
+            return nil
+        }
+        return await MCPToolRegistry.build(configs)
+    }
+
+    /// Terminate MCP children on SIGTERM/SIGINT so they do not orphan when the client
+    /// kills us rather than closing stdin (the pipe-EOF path goes through finish()).
+    private func installSignalHandlers() {
+        for sig in [SIGTERM, SIGINT] {
+            signal(sig, SIG_IGN)  // disable default terminate so the source can fire
+            let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
+            source.setEventHandler { [weak self] in
+                self?.log("received signal \(sig); terminating MCP servers and exiting")
+                let reg = self?.lock.withLock { () -> MCPToolRegistry? in
+                    let r = self?.registry
+                    self?.registry = nil
+                    return r
+                }
+                (reg ?? nil)?.terminateAll()
+                exit(0)
+            }
+            source.resume()
+            lock.withLock { signalSources.append(source) }
+        }
+    }
+
+    private func handlePrompt(id: Int?, params: [String: Any]) {
+        let (agent, ourSid, busy) = lock.withLock {
+            (self.agent, self.sessionID, self.promptTask != nil)
+        }
+        guard let agent, let ourSid else {
             respondError(id, -32002, "no active session; call session/new first")
+            return
+        }
+        // One turn at a time: the ChatSession/backend is not safe to drive concurrently
+        // (see MLXBackend). Reject rather than corrupt the KV cache with an overlapping run.
+        if busy {
+            respondError(id, -32003, "a prompt is already in progress for this session")
             return
         }
         // ACP carries the target sessionId on every prompt; reject one that isn't ours
@@ -222,42 +331,28 @@ final class ACPServer: @unchecked Sendable {
             return
         }
         let text = Self.promptText(params)
+        // The agent drives the full turn (streaming + tool loop + permission gate) and
+        // reports back through the AgentDelegate methods below. Task.isCancelled inside
+        // runTurn is wired to session/cancel via this promptTask.
         let task = Task { [weak self] in
             guard let self else { return }
-            // Read the (non-Sendable) ChatSession INSIDE the task from self
-            // (@unchecked Sendable, lock-guarded) so it never crosses a task boundary.
-            let (session, sid) = self.lock.withLock { (self.session, self.sessionID) }
-            guard let session, let sid else { return }
             defer { self.lock.withLock { if self.promptTask != nil { self.promptTask = nil } } }
-            let splitter = ThinkSplitter()
-            var genError: String? = nil
-            do {
-                for try await chunk in session.streamResponse(to: text) {
-                    if Task.isCancelled { break }  // fast path; correctness is the post-loop check
-                    for (kind, s) in splitter.feed(chunk) { self.sendUpdate(sid, kind, s) }
-                }
-            } catch is CancellationError {
-                // handled by the isCancelled check below
-            } catch {
-                genError = error.localizedDescription
-                self.log("prompt error: \(error.localizedDescription)")
-            }
-            // Cancellation ends the stream by terminating iteration (often WITHOUT
-            // delivering another chunk), so the in-loop check alone can miss it -
-            // detect it here. Cancellation takes precedence over a generation error.
-            if Task.isCancelled {
+            let outcome = await agent.runTurn([.user(text)])
+            // A turn that ended between a gate and its answer leaves no permission parked,
+            // but be defensive: resolve any stragglers so no continuation leaks.
+            self.failPendingPermissions(with: .cancel)
+            switch outcome {
+            case .cancelled:
                 self.log("turn resolved: stopReason=cancelled")
                 self.respond(id, ["stopReason": "cancelled"])
-            } else if let genError {
-                // Generation failed: reply with a JSON-RPC error, not an out-of-spec
-                // stopReason. ACP's StopReason enum is only end_turn / max_tokens /
-                // max_turn_requests / refusal / cancelled - "error" is not valid.
-                self.respondError(id, -32000, "generation failed: \(genError)")
-            } else {
-                // Clean turn: flush the splitter's held-back tail before resolving.
-                for (kind, s) in splitter.flush() { self.sendUpdate(sid, kind, s) }
-                self.log("turn resolved: stopReason=end_turn")
-                self.respond(id, ["stopReason": "end_turn"])
+            case .failed(let message):
+                // Reply with a JSON-RPC error, not an out-of-spec stopReason. ACP's
+                // StopReason enum has no "error" member.
+                self.log("turn failed: \(message)")
+                self.respondError(id, -32000, "generation failed: \(message)")
+            case .stop(let reason):
+                self.log("turn resolved: stopReason=\(reason)")
+                self.respond(id, ["stopReason": reason])
             }
         }
         lock.withLock { promptTask = task }
@@ -270,6 +365,8 @@ final class ACPServer: @unchecked Sendable {
             return
         }
         log(task == nil ? "cancel: no in-flight turn" : "cancel: cancelling in-flight turn")
+        // Unblock any in-flight permission wait so the loop can observe cancellation.
+        failPendingPermissions(with: .cancel)
         task?.cancel()
     }
 
@@ -280,30 +377,188 @@ final class ACPServer: @unchecked Sendable {
             respondError(id, -32602, "set_config_option requires configId and value")
             return
         }
-        guard configId == "model" else {
-            respondError(id, -32601, "unknown config option: \(configId)")
-            return
-        }
-        guard let target = availableModels().first(where: { $0.value == value }) else {
-            respondError(id, -32602, "unknown model: \(value)")
-            return
-        }
-        do {
-            let container = try await loadModel(target.dir)
-            let session = ChatSession(
-                container,
-                instructions: chatInstructions,
-                generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0.7))
-            lock.withLock {
-                self.container = container
-                self.session = session
-                self.currentModelDir = target.dir
+        switch configId {
+        case "mode":
+            guard value == "chat" || value == "agent" else {
+                respondError(id, -32602, "unknown mode: \(value)")
+                return
             }
-            log("switched model -> \(value)")
+            let agent = lock.withLock { () -> Agent? in
+                self.mode = value
+                return self.agent
+            }
+            agent?.setToolsEnabled(value == "agent")
+            log("mode -> \(value)")
             respond(id, ["configOptions": configOptionsJSON()])
-        } catch {
-            respondError(id, -32000, "model switch failed: \(error.localizedDescription)")
+
+        case "model":
+            guard let target = availableModels().first(where: { $0.value == value }) else {
+                respondError(id, -32602, "unknown model: \(value)")
+                return
+            }
+            do {
+                // Rebuild the session/backend/agent on the new model, but KEEP the MCP
+                // registry (servers are model-independent). Re-apply the current mode.
+                let container = try await loadModel(target.dir)
+                let session = ChatSession(
+                    container,
+                    instructions: agentInstructions,
+                    generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0.7))
+                let registry = lock.withLock { self.registry }
+                let backend = MLXBackend(session)
+                let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+                agent.delegate = self
+                let modeNow = lock.withLock { mode }
+                agent.setToolsEnabled(modeNow == "agent")
+                lock.withLock {
+                    self.container = container
+                    self.session = session
+                    self.backend = backend
+                    self.agent = agent
+                    self.currentModelDir = target.dir
+                }
+                log("switched model -> \(value)")
+                respond(id, ["configOptions": configOptionsJSON()])
+            } catch {
+                respondError(id, -32000, "model switch failed: \(error.localizedDescription)")
+            }
+
+        default:
+            respondError(id, -32601, "unknown config option: \(configId)")
         }
+    }
+
+    // MARK: - Permission round-trip (agent -> client request)
+
+    /// Send session/request_permission and await the client's choice. Parked on a
+    /// continuation keyed by request id; resumed by handlePermissionResponse (or by
+    /// failPendingPermissions on cancel/teardown).
+    func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome {
+        let sid = lock.withLock { sessionID } ?? ""
+        let requestID = lock.withLock { () -> Int in
+            outboundCounter += 1
+            return outboundCounter
+        }
+        return await withCheckedContinuation {
+            (cont: CheckedContinuation<PermissionOutcome, Never>) in
+            lock.withLock { pendingPermissions[requestID] = cont }
+            send([
+                "jsonrpc": "2.0",
+                "id": requestID,
+                "method": "session/request_permission",
+                "params": [
+                    "sessionId": sid,
+                    "toolCall": ["toolCallId": toolCallId, "title": title],
+                    "options": [
+                        ["optionId": "allow", "name": "Allow", "kind": "allow_once"],
+                        ["optionId": "reject", "name": "Reject", "kind": "reject_once"],
+                    ],
+                ],
+            ])
+        }
+    }
+
+    private func handlePermissionResponse(id: Int, msg: [String: Any]) {
+        let cont = lock.withLock { () -> CheckedContinuation<PermissionOutcome, Never>? in
+            let c = pendingPermissions[id]
+            pendingPermissions[id] = nil
+            return c
+        }
+        guard let cont else {
+            log("response for unknown/expired request id \(id); dropping")
+            return
+        }
+        // result: { outcome: { outcome: "selected", optionId } } | { outcome: "cancelled" }
+        var outcome: PermissionOutcome = .cancel
+        if let result = msg["result"] as? [String: Any],
+            let inner = result["outcome"] as? [String: Any]
+        {
+            switch inner["outcome"] as? String {
+            case "selected":
+                outcome = (inner["optionId"] as? String) == "allow" ? .allow : .deny
+            case "cancelled":
+                outcome = .cancel
+            default:
+                outcome = .cancel
+            }
+        } else if msg["error"] != nil {
+            // The client errored on the request: treat as a denial, not a crash.
+            outcome = .deny
+        }
+        cont.resume(returning: outcome)
+    }
+
+    private func failPendingPermissions(with outcome: PermissionOutcome) {
+        let continuations = lock.withLock {
+            () -> [CheckedContinuation<PermissionOutcome, Never>] in
+            let waiting = Array(pendingPermissions.values)
+            pendingPermissions.removeAll()
+            return waiting
+        }
+        for cont in continuations { cont.resume(returning: outcome) }
+    }
+
+    // MARK: - AgentDelegate (streaming)
+
+    func agentEmitText(kind: ThinkSplitter.Kind, _ text: String) {
+        guard let sid = lock.withLock({ sessionID }) else { return }
+        sendUpdate(sid, kind, text)
+    }
+
+    func agentToolCallStarted(id: String, title: String, kind: String, rawInput: String) {
+        guard let sid = lock.withLock({ sessionID }) else { return }
+        send(
+            sessionUpdateEnvelope(
+                sid,
+                [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": id,
+                    "title": title,
+                    "kind": kind,
+                    "status": "pending",
+                    "rawInput": rawInput,
+                ]))
+    }
+
+    func agentToolCallProgress(id: String) {
+        guard let sid = lock.withLock({ sessionID }) else { return }
+        send(
+            sessionUpdateEnvelope(
+                sid,
+                [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": "in_progress",
+                ]))
+    }
+
+    func agentToolCallFinished(id: String, status: String, output: String) {
+        guard let sid = lock.withLock({ sessionID }) else { return }
+        send(
+            sessionUpdateEnvelope(
+                sid,
+                [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": id,
+                    "status": status,
+                    "content": [
+                        ["type": "content", "content": ["type": "text", "text": output]]
+                    ],
+                    "rawOutput": output,
+                ]))
+    }
+
+    func agentTurnUsage(totalTokens: Int) {
+        guard totalTokens > 0, let sid = lock.withLock({ sessionID }) else { return }
+        send(sessionUpdateEnvelope(sid, ["sessionUpdate": "usage_update", "used": totalTokens]))
+    }
+
+    private func sessionUpdateEnvelope(_ sid: String, _ update: [String: Any]) -> [String: Any] {
+        [
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": ["sessionId": sid, "update": update],
+        ]
     }
 
     // MARK: - Model registry
@@ -329,11 +584,16 @@ final class ACPServer: @unchecked Sendable {
     }
 
     private func configOptionsJSON() -> [[String: Any]] {
-        let current = lock.withLock { (currentModelDir as NSString).lastPathComponent }
+        let (current, modeNow, haveTools) = lock.withLock {
+            (
+                (currentModelDir as NSString).lastPathComponent, mode,
+                (registry?.toolSpecs.isEmpty == false)
+            )
+        }
         let choices = availableModels().map {
             ["value": $0.value, "name": $0.value] as [String: Any]
         }
-        return [
+        var options: [[String: Any]] = [
             [
                 "id": "model",
                 "name": "Model",
@@ -343,6 +603,21 @@ final class ACPServer: @unchecked Sendable {
                 "options": choices,
             ]
         ]
+        // Only surface the chat/agent toggle when there are tools to enable.
+        if haveTools {
+            options.append([
+                "id": "mode",
+                "name": "Mode",
+                "category": "mode",
+                "currentValue": modeNow,
+                "type": "select",
+                "options": [
+                    ["value": "chat", "name": "Chat"],
+                    ["value": "agent", "name": "Agent"],
+                ],
+            ])
+        }
+        return options
     }
 
     private static func promptText(_ params: [String: Any]) -> String {
