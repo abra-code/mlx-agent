@@ -107,6 +107,62 @@ func containsCI(_ v: Any?, _ sub: String) -> Bool {
 
 let maxToolCallsPerCase = 8  // guardrail: a misbehaving model cannot loop forever
 
+// MARK: - RAM gate
+
+func gib(_ bytes: Int) -> String { String(format: "%.1f GB", Double(bytes) / 1_073_741_824.0) }
+
+/// Sum the on-disk size of every *.safetensors shard under `dir` (recursively). This is the
+/// weights footprint MLX must hold resident in unified memory - the dominant term in whether a
+/// model fits. Returns 0 if nothing is found (then the gate no-ops rather than guessing).
+func modelWeightBytes(_ dir: URL) -> Int {
+    let fm = FileManager.default
+    guard let en = fm.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+    var total = 0
+    for case let u as URL in en where u.pathExtension == "safetensors" {
+        if let sz = (try? u.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += sz }
+    }
+    return total
+}
+
+/// Hard backstop that refuses a load certain to exhaust unified memory, turning a would-be
+/// OOM-kill of the whole process (no error reaches the client) into a clean, actionable ACP
+/// error. This is intentionally a HIGHER bar than the GUI's advisory 75% warning (which the
+/// user can override with "Load Anyway"): the agent only refuses in the genuinely-doomed
+/// regime, so an overridden soft-warn still loads. Fraction is `MLX_AGENT_MAX_RAM_FRACTION`
+/// (default 0.90); set it to 0 (or any value >= 1) to disable the gate entirely.
+func ramGate(dir: URL) throws {
+    // Honor only a finite, non-negative override; NaN / negative / unparseable falls back to
+    // the safe default so a fat-fingered value never silently defeats the backstop (NaN fails
+    // every comparison, so it would otherwise slip through the guard below and disable the gate).
+    var fraction = 0.90
+    if let p = ProcessInfo.processInfo.environment["MLX_AGENT_MAX_RAM_FRACTION"].flatMap(Double.init),
+        p.isFinite, p >= 0
+    {
+        fraction = p
+    }
+    guard fraction > 0, fraction < 1 else { return }  // a deliberate 0 or >=1 disables the gate
+
+    let weights = modelWeightBytes(dir)
+    guard weights > 0 else { return }  // unknown footprint: don't block on a guess
+
+    let physical = Int(ProcessInfo.processInfo.physicalMemory)
+    guard physical > 0 else { return }
+    let limit = Int(Double(physical) * fraction)
+    guard weights > limit else { return }
+
+    let name = dir.lastPathComponent
+    let pct = Int((fraction * 100).rounded())
+    throw NSError(
+        domain: "mlx-agent", code: 3,
+        userInfo: [
+            NSLocalizedDescriptionKey:
+                "model \"\(name)\" needs ~\(gib(weights)) of weights but this Mac has "
+                + "\(gib(physical)) of unified memory (load limit \(gib(limit)) at \(pct)%). "
+                + "Use a smaller model or a more aggressive quantization. "
+                + "Set MLX_AGENT_MAX_RAM_FRACTION to override."
+        ])
+}
+
 // MARK: - Model loading
 
 func loadModel(_ dir: String) async throws -> ModelContainer {
@@ -116,6 +172,9 @@ func loadModel(_ dir: String) async throws -> ModelContainer {
             domain: "mlx-agent", code: 2,
             userInfo: [NSLocalizedDescriptionKey: "no config.json under \(dir)"])
     }
+    // Refuse a load that cannot fit in unified memory before touching the engine, so the
+    // failure is a clean ACP error rather than an OOM-kill of the whole process.
+    try ramGate(dir: url)
     // Local-directory load: no downloader needed. The tokenizer loader is the
     // opt-in swift-transformers integration (macro expands to AutoTokenizer).
     return try await LLMModelFactory.shared.loadContainer(
