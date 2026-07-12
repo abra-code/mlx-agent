@@ -9,6 +9,8 @@
 //   session/prompt            -> streams session/update notifications, resolves { stopReason }
 //   session/cancel  (notif)   -> cancels the in-flight turn
 //   session/set_config_option -> switches the model, or toggles chat/agent mode
+//   session/prime             -> REPLACES the session context with a supplied transcript
+//                                (client-driven resume/fresh; empty messages = reset)
 //
 // In agent mode a prompt runs the tool loop (see Agent): it streams tool_call /
 // tool_call_update / usage_update, and sends session/request_permission before any
@@ -203,7 +205,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     "authMethods": [],
                     "agentInfo": ["name": "mlx-agent", "version": "0.1"],
                     "agentCapabilities": [
-                        "promptCapabilities": ["audio": false, "image": false, "embeddedContext": false]
+                        "promptCapabilities": ["audio": false, "image": false, "embeddedContext": false],
+                        // Custom extension: this agent accepts session/prime (context replacement
+                        // from a restored transcript). Clients that don't know the key ignore it;
+                        // clients that do gate all priming wire traffic on it.
+                        "sessionPrime": true,
                     ],
                 ])
         case "session/new":
@@ -214,6 +220,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             handleCancel(params: params)
         case "session/set_config_option":
             Task { await self.handleSetConfigOption(id: id, params: params) }
+        case "session/prime":
+            handleSessionPrime(id: id, params: params)
         default:
             if id != nil {
                 respondError(id, -32601, "method not supported by mlx-agent: \(method)")
@@ -229,24 +237,18 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         let dir = lock.withLock { currentModelDir }
         do {
             let container = try await loadModel(dir)
-            let session = ChatSession(
-                container,
-                instructions: agentInstructions,
-                generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0.7))
-            // Build the MCP tool registry once (spawns the server processes) if configured.
+            // Build the MCP tool registry once (spawns the server processes) if configured,
+            // BEFORE the session stack (buildSessionStack reads self.registry).
             let registry = await ensureRegistry()
-            let backend = MLXBackend(session)
-            let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
-            agent.delegate = self
-            let modeNow = lock.withLock { mode }
-            agent.setToolsEnabled(modeNow == "agent")
+            let (session, backend, agent) = buildSessionStack(container: container, history: [])
             let sid = "mlx-session-1"
-            lock.withLock {
+            let modeNow = lock.withLock { () -> String in
                 self.container = container
                 self.session = session
                 self.backend = backend
                 self.agent = agent
                 self.sessionID = sid
+                return mode
             }
             let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
             log(
@@ -256,6 +258,32 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         } catch {
             respondError(id, -32000, "session/new failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Build the session stack on `container`, optionally seeded with prior history
+    /// (session/prime). Keeps the MCP registry (servers are model- and context-independent)
+    /// and re-applies the current mode. History must NOT contain a system message: the
+    /// history initializer prepends `.system(agentInstructions)` itself.
+    private func buildSessionStack(
+        container: ModelContainer, history: [Chat.Message]
+    ) -> (ChatSession, MLXBackend, Agent) {
+        let parameters = GenerateParameters(maxTokens: 4096, temperature: 0.7)
+        let session: ChatSession
+        if history.isEmpty {
+            session = ChatSession(
+                container, instructions: agentInstructions, generateParameters: parameters)
+        } else {
+            session = ChatSession(
+                container, instructions: agentInstructions, history: history,
+                generateParameters: parameters)
+        }
+        let registry = lock.withLock { self.registry }
+        let backend = MLXBackend(session)
+        let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+        agent.delegate = self
+        let modeNow = lock.withLock { mode }
+        agent.setToolsEnabled(modeNow == "agent")
+        return (session, backend, agent)
     }
 
     /// Build the MCP registry on first use (idempotent). Concurrent callers share ONE
@@ -397,19 +425,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 return
             }
             do {
-                // Rebuild the session/backend/agent on the new model, but KEEP the MCP
-                // registry (servers are model-independent). Re-apply the current mode.
+                // Rebuild the session/backend/agent on the new model (context resets, as a
+                // KV cache cannot carry across models); registry and mode are re-applied
+                // by buildSessionStack.
                 let container = try await loadModel(target.dir)
-                let session = ChatSession(
-                    container,
-                    instructions: agentInstructions,
-                    generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0.7))
-                let registry = lock.withLock { self.registry }
-                let backend = MLXBackend(session)
-                let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
-                agent.delegate = self
-                let modeNow = lock.withLock { mode }
-                agent.setToolsEnabled(modeNow == "agent")
+                let (session, backend, agent) = buildSessionStack(container: container, history: [])
                 lock.withLock {
                     self.container = container
                     self.session = session
@@ -426,6 +446,130 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         default:
             respondError(id, -32601, "unknown config option: \(configId)")
         }
+    }
+
+    // MARK: - session/prime (context replacement from a restored transcript)
+
+    /// Replaces the session's conversational context with the supplied messages (empty =
+    /// fresh context). Cheap: reuses the loaded model container and the MCP registry; the
+    /// KV prefill of the primed history happens lazily on the NEXT session/prompt (the
+    /// engine builds [system, history..., user] in one pass), so the first resumed turn
+    /// pays the prefill and its usage_update includes the history tokens.
+    private func handleSessionPrime(id: Int?, params: [String: Any]) {
+        let (container, ourSid) = lock.withLock { (self.container, self.sessionID) }
+        guard let container, let ourSid else {
+            respondError(id, -32002, "no active session; call session/new first")
+            return
+        }
+        if let reqSid = params["sessionId"] as? String, reqSid != ourSid {
+            respondError(id, -32602, "unknown session: \(reqSid)")
+            return
+        }
+        guard let rawMessages = params["messages"] as? [[String: Any]] else {
+            respondError(id, -32602, "session/prime requires messages (an array)")
+            return
+        }
+        let history = Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) }
+        let (session, backend, agent) = buildSessionStack(container: container, history: history)
+        // Refuse to swap the stack under a running turn. Checked inside the same lock
+        // that publishes the swap, so a prompt accepted before us keeps its stack and
+        // we bail; the client's ordering contract (cancel + await resolution before
+        // priming) makes a first -32003 a rare transient it retries once.
+        let busy = lock.withLock { () -> Bool in
+            if promptTask != nil { return true }
+            self.session = session
+            self.backend = backend
+            self.agent = agent
+            return false
+        }
+        if busy {
+            respondError(id, -32003, "cannot prime while a prompt is in progress")
+            return
+        }
+        var wireBytes = 0
+        for m in rawMessages { wireBytes += (m["content"] as? String)?.utf8.count ?? 0 }
+        log("session primed: \(history.count) messages (\(rawMessages.count) supplied, ~\(wireBytes) content bytes)")
+        respond(id, ["primed": history.count])
+    }
+
+    /// Map wire messages ({role, content, toolCalls?, toolCallId?}) to Chat.Message
+    /// history, enforcing template well-formedness so a malformed transcript can never
+    /// surface as a chat-template failure at the NEXT prompt (prefill is lazy): a tool
+    /// message must answer a tool-call id announced by the nearest preceding assistant
+    /// message; orphans are dropped with a log, never fatal. No system role on the wire -
+    /// the agent owns its system prompt.
+    static func primeHistory(
+        from raw: [[String: Any]], log: (String) -> Void
+    ) -> [Chat.Message] {
+        var out: [Chat.Message] = []
+        var openToolCallIDs: Set<String> = []
+        var announcementIndex: Int? = nil   // out-index of the most recent assistant WITH calls
+        var announcementText = ""
+        var announcementAnswered = false
+        for (index, entry) in raw.enumerated() {
+            let role = entry["role"] as? String ?? ""
+            let content = entry["content"] as? String ?? ""
+            switch role {
+            case "user":
+                guard !content.isEmpty else { continue }
+                out.append(.user(content))
+                openToolCallIDs = []
+                announcementIndex = nil
+            case "assistant":
+                let calls = Self.parseToolCalls(entry["toolCalls"], log: log)
+                if content.isEmpty && (calls?.isEmpty ?? true) { continue }
+                out.append(.assistant(content, toolCalls: calls))
+                openToolCallIDs = Set((calls ?? []).compactMap { $0.id })
+                announcementIndex = openToolCallIDs.isEmpty ? nil : out.count - 1
+                announcementText = content
+                announcementAnswered = false
+            case "tool":
+                guard let callID = entry["toolCallId"] as? String, openToolCallIDs.contains(callID)
+                else {
+                    log("prime: dropping orphan tool message at index \(index) (no matching assistant tool call)")
+                    continue
+                }
+                out.append(.tool(content, id: callID))
+                announcementAnswered = true
+            default:
+                log("prime: skipping message with unknown role \"\(role)\" at index \(index)")
+            }
+        }
+        // A TRAILING tool-call announcement with no results after it would leave the
+        // template mid-tool-turn, and prefill is lazy - the failure would surface as a
+        // confusing error on the NEXT prompt, not at prime time. Strip the dangling
+        // calls (keeping the assistant text); drop the message when that leaves nothing.
+        if let index = announcementIndex, index == out.count - 1, !announcementAnswered {
+            log("prime: stripping a trailing unanswered tool-call announcement")
+            out.removeLast()
+            if !announcementText.isEmpty {
+                out.append(.assistant(announcementText))
+            }
+        }
+        return out
+    }
+
+    /// Parse the wire toolCalls array ([{id?, name, arguments?}]) into ToolCalls; entries
+    /// without a name are dropped with a log. Returns nil when absent or empty so plain
+    /// text turns carry no tool metadata.
+    private static func parseToolCalls(_ raw: Any?, log: (String) -> Void) -> [ToolCall]? {
+        guard let entries = raw as? [[String: Any]], !entries.isEmpty else { return nil }
+        var calls: [ToolCall] = []
+        for entry in entries {
+            guard let name = entry["name"] as? String, !name.isEmpty else {
+                log("prime: dropping tool call without a name")
+                continue
+            }
+            // JSON round-trip into the Codable JSONValue argument type (the wire value is
+            // plain JSON, so this cannot lose information; {} on any failure).
+            let rawArguments = (entry["arguments"] as? [String: Any]) ?? [:]
+            let arguments =
+                (try? JSONSerialization.data(withJSONObject: rawArguments))
+                .flatMap { try? JSONDecoder().decode([String: JSONValue].self, from: $0) } ?? [:]
+            calls.append(
+                ToolCall(function: .init(name: name, arguments: arguments), id: entry["id"] as? String))
+        }
+        return calls.isEmpty ? nil : calls
     }
 
     // MARK: - Permission round-trip (agent -> client request)

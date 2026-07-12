@@ -480,7 +480,9 @@ func usage() {
 
         USAGE:
           mlx-agent acp     [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
-                                                          ACP server over stdio (chat + agentic tools)
+                                                          ACP server over stdio (chat + agentic tools);
+                                                          session/prime replaces the session context with a
+                                                          supplied transcript (resume/fresh, see docs/session-prime.md)
           mlx-agent oneshot [--model <dir>] --prompt <text> [--mcp-config <json>]
                             [--auto-permission allow|deny] [guardrails]
                                                           run one agent turn, print to stdout

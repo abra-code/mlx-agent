@@ -69,15 +69,33 @@ class Agent:
         except Exception:
             self.p.kill()
 
+def content_text(content):
+    """Text out of an ACP content value: one ContentBlock dict, or an ARRAY of
+    tool-call content entries ({"type":"content","content":{"type":"text",...}}) -
+    tool_call_update carries the array shape."""
+    if isinstance(content, dict):
+        return content.get("text", "")
+    if isinstance(content, list):
+        out = ""
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            inner = block.get("content")
+            if isinstance(inner, dict):
+                out += inner.get("text", "")
+            else:
+                out += block.get("text", "")
+        return out
+    return ""
+
 def collect_updates(store):
     def handler(msg):
         if msg.get("method") != "session/update":
             return
         up = msg.get("params", {}).get("update", {})
         kind = up.get("sessionUpdate")
-        text = (up.get("content") or {}).get("text", "")
         store.setdefault(kind, "")
-        store[kind] += text
+        store[kind] += content_text(up.get("content"))
     return handler
 
 def main():
@@ -104,6 +122,9 @@ def main():
         r = agent.await_response(rid, timeout=30)
         pv = r.get("result", {}).get("protocolVersion")
         check("initialize", pv == 1, f"protocolVersion={pv}")
+        caps = r.get("result", {}).get("agentCapabilities", {})
+        check("initialize advertises sessionPrime", caps.get("sessionPrime") is True,
+              f"agentCapabilities={sorted(caps)}")
 
         # 2. session/new (loads the model)
         rid = agent.send("session/new", {"cwd": "/tmp", "mcpServers": []})
@@ -160,6 +181,95 @@ def main():
         stop = r.get("result", {}).get("stopReason")
         check("session/cancel resolves the turn as cancelled", stop == "cancelled",
               f"stopReason={stop} after {time.time()-t0:.1f}s")
+
+        # 6. session/prime - resume: replay a fabricated transcript, then require recall.
+        rid = agent.send("session/prime", {
+            "sessionId": sid,
+            "messages": [
+                {"role": "user", "content": "My favorite color is teal. Please remember it."},
+                {"role": "assistant", "content": "Understood: your favorite color is teal."},
+            ],
+        })
+        r = agent.await_response(rid, timeout=30)
+        check("session/prime accepts a transcript", r.get("result", {}).get("primed") == 2,
+              f"result={r.get('result') or r.get('error')}")
+        store4 = {}
+        rid = agent.send("session/prompt", {
+            "sessionId": sid,
+            "prompt": [{"type": "text",
+                        "text": "What is my favorite color? Answer in one short sentence."}],
+        })
+        r = agent.await_response(rid, on_update=collect_updates(store4), timeout=180)
+        msg = store4.get("agent_message_chunk", "")
+        check("primed context is recalled", "teal" in msg.lower(),
+              f"message={msg.strip()[:80]!r}")
+
+        # 7. session/prime - reset: empty messages must clear the context and the next
+        # turn must still run cleanly. (No recall assertion - a model may guess or
+        # refuse; the reset contract is "the call succeeds and the session works".)
+        rid = agent.send("session/prime", {"sessionId": sid, "messages": []})
+        r = agent.await_response(rid, timeout=30)
+        check("session/prime empty resets", r.get("result", {}).get("primed") == 0,
+              f"result={r.get('result') or r.get('error')}")
+        store5 = {}
+        rid = agent.send("session/prompt", {
+            "sessionId": sid,
+            "prompt": [{"type": "text", "text": "In one short sentence, who wrote Hamlet?"}],
+        })
+        r = agent.await_response(rid, on_update=collect_updates(store5), timeout=180)
+        check("post-reset prompt completes", r.get("result", {}).get("stopReason") == "end_turn",
+              f"message={store5.get('agent_message_chunk','').strip()[:60]!r}")
+
+        # 8. session/prime - tool-turn fidelity: replay an assistant tool call + result
+        # (and one orphan tool message that must be dropped), then ask about the result.
+        rid = agent.send("session/prime", {
+            "sessionId": sid,
+            "messages": [
+                {"role": "tool", "content": "orphan - must be dropped", "toolCallId": "tc-none"},
+                {"role": "user", "content": "Read the file /tmp/status.txt and tell me what it says."},
+                {"role": "assistant", "content": "",
+                 "toolCalls": [{"id": "tc-1", "name": "read_file",
+                                "arguments": {"path": "/tmp/status.txt"}}]},
+                {"role": "tool", "content": "{\"content\": \"DEPLOY CODE: ZEBRA-7\"}",
+                 "toolCallId": "tc-1"},
+                {"role": "assistant",
+                 "content": "The file contains the deploy code ZEBRA-7."},
+            ],
+        })
+        r = agent.await_response(rid, timeout=30)
+        check("session/prime tool turns accepted (orphan dropped)",
+              r.get("result", {}).get("primed") == 4,
+              f"result={r.get('result') or r.get('error')}")
+        store6 = {}
+        rid = agent.send("session/prompt", {
+            "sessionId": sid,
+            "prompt": [{"type": "text",
+                        "text": "What deploy code did the file contain? Answer in one short sentence."}],
+        })
+        r = agent.await_response(rid, on_update=collect_updates(store6), timeout=180)
+        msg = store6.get("agent_message_chunk", "")
+        check("primed tool result is recalled", "zebra" in msg.lower(),
+              f"message={msg.strip()[:80]!r}")
+
+        # 8b. A TRAILING unanswered tool-call announcement is stripped (template guard):
+        # only the user message survives.
+        rid = agent.send("session/prime", {
+            "sessionId": sid,
+            "messages": [
+                {"role": "user", "content": "Check the weather in Paris."},
+                {"role": "assistant", "content": "",
+                 "toolCalls": [{"id": "tc-9", "name": "get_weather", "arguments": {}}]},
+            ],
+        })
+        r = agent.await_response(rid, timeout=30)
+        check("trailing unanswered tool call is stripped", r.get("result", {}).get("primed") == 1,
+              f"result={r.get('result') or r.get('error')}")
+
+        # 9. session/prime error paths: wrong session id.
+        rid = agent.send("session/prime", {"sessionId": "no-such-session", "messages": []})
+        r = agent.await_response(rid, timeout=30)
+        check("session/prime rejects unknown session", r.get("error", {}).get("code") == -32602,
+              f"error={r.get('error')}")
 
     except Exception as e:
         print(f"[FAIL] exception: {e!r}")
