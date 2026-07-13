@@ -24,7 +24,12 @@ import Tokenizers
 // No hardcoded model path: the model directory comes from --model or the
 // MLX_AGENT_MODEL environment variable (see requireModelDir).
 let defaultModelDir = ProcessInfo.processInfo.environment["MLX_AGENT_MODEL"]
-let systemPrompt =
+
+/// The system prompt applied when `--system-prompt` is not supplied. Passing
+/// `--system-prompt ""` (an explicitly empty value) selects NO system message at all
+/// (the `.system(...)` turn is skipped); passing any other text uses that text verbatim.
+/// See `resolveSystemPrompt`.
+let defaultSystemPrompt =
     "You are a helpful assistant. Use the provided tools when they are relevant."
 
 // MARK: - Tool schemas (gate diagnostic)
@@ -184,7 +189,7 @@ func loadModel(_ dir: String) async throws -> ModelContainer {
 
 // MARK: - chat mode
 
-func runChat(model dir: String, prompt: String) async throws {
+func runChat(model dir: String, prompt: String, systemPrompt: String?, gen: GenConfig) async throws {
     FileHandle.standardError.write(Data("[mlx-agent] loading \(dir) ...\n".utf8))
     let t0 = Date()
     let container = try await loadModel(dir)
@@ -198,7 +203,7 @@ func runChat(model dir: String, prompt: String) async throws {
     let session = ChatSession(
         container,
         instructions: systemPrompt,
-        generateParameters: GenerateParameters(maxTokens: 1024, temperature: 0))
+        generateParameters: gen.apply(to: GenerateParameters(maxTokens: 1024, temperature: 0)))
 
     var chunkCount = 0
     let g0 = Date()
@@ -279,7 +284,7 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
     // "the model produced a final answer" even if the real follow-up turn was empty.
     let session = ChatSession(
         container,
-        instructions: systemPrompt,
+        instructions: defaultSystemPrompt,
         generateParameters: GenerateParameters(maxTokens: 2048, temperature: 0),
         tools: toolSpecs())
 
@@ -437,13 +442,14 @@ final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
 
 func runOneshot(
     model dir: String, prompt: String, mcpConfigPath: String?,
-    guardrails: AgentGuardrails, autoPermission: PermissionOutcome
+    guardrails: AgentGuardrails, autoPermission: PermissionOutcome,
+    systemPrompt: String?, gen: GenConfig
 ) async throws -> Int {
     let container = try await loadModel(dir)
     let session = ChatSession(
         container,
-        instructions: "You are a helpful assistant. Use the provided tools when they are relevant.",
-        generateParameters: GenerateParameters(maxTokens: 4096, temperature: 0))
+        instructions: systemPrompt,
+        generateParameters: gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0)))
 
     var registry: MCPToolRegistry? = nil
     if let mcpConfigPath {
@@ -578,6 +584,18 @@ func usage() {
           --mcp-config <json>      stdio-direct MCP server config (enables tools)
           --mode chat|agent        initial ACP mode (default: agent if --mcp-config, else chat)
           --auto-permission <x>    oneshot gate answer: allow | deny (default: deny)
+          --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
+                                   message at all (default: helpful-assistant prompt)
+
+        GENERATION (acp/oneshot/chat; an unset flag keeps the per-mode default shown):
+          --temperature <f>        sampling temperature; 0 = greedy/deterministic
+                                   (default: acp 0.7, oneshot/chat 0)
+          --top-p <f>              nucleus sampling cutoff, 0 < p <= 1 (default: 1.0 = off)
+          --max-new-tokens <n>     cap on generated tokens per turn
+                                   (default: acp/oneshot 4096, chat 1024)
+          --seed <n>               RNG seed; inert at temperature 0 (default: unset/random)
+          --repetition-penalty <f> penalty on repeated tokens, ~1.1 curbs greedy loops
+                                   (default: unset/off)
 
         GUARDRAILS:
           --max-tool-iters <n>     max tool passes per turn (default: 10)
@@ -586,6 +604,7 @@ func usage() {
 
         EXAMPLES:
           mlx-agent acp --mcp-config /path/to/mcp.json
+          mlx-agent acp --system-prompt "" --temperature 0 --max-new-tokens 2048
           mlx-agent oneshot --prompt "Read /etc/hosts" --mcp-config mcp.json --auto-permission allow
           mlx-agent gate
         """
@@ -600,6 +619,53 @@ func option(_ name: String, in args: [String]) -> String? {
 func intOption(_ name: String, in args: [String]) -> Int? { option(name, in: args).flatMap(Int.init) }
 func doubleOption(_ name: String, in args: [String]) -> Double? {
     option(name, in: args).flatMap(Double.init)
+}
+
+/// Resolve the system prompt from the CLI:
+///   - flag absent            -> `defaultSystemPrompt` (helpful-assistant)
+///   - `--system-prompt ""`   -> nil (NO system message is prepended at all)
+///   - `--system-prompt <s>`  -> `s` verbatim
+/// The nil case is what a translator wants: TranslateGemma carries its instruction in the
+/// user turn, and a stray "You are a helpful assistant" prefix would pollute every request.
+func resolveSystemPrompt(_ args: [String]) -> String? {
+    guard let provided = option("--system-prompt", in: args) else { return defaultSystemPrompt }
+    return provided.isEmpty ? nil : provided
+}
+
+/// Generation knobs resolved from the CLI. Each field is optional: a nil field means "leave
+/// this mode's built-in default untouched", so a mode a flag does not target keeps its
+/// long-standing behavior. `apply(to:)` overlays only the fields the user actually set.
+struct GenConfig {
+    var temperature: Float?
+    var topP: Float?
+    var maxNewTokens: Int?
+    var seed: UInt64?
+    var repetitionPenalty: Float?
+
+    func apply(to base: GenerateParameters) -> GenerateParameters {
+        var p = base
+        if let temperature { p.temperature = temperature }
+        if let topP { p.topP = topP }
+        if let maxNewTokens { p.maxTokens = maxNewTokens }
+        if let seed { p.seed = seed }
+        if let repetitionPenalty { p.repetitionPenalty = repetitionPenalty }
+        return p
+    }
+}
+
+/// Parse the generation flags. Values are lightly clamped to their sane domains so a
+/// fat-fingered negative can never reach the sampler: temperature/penalty floor at 0,
+/// top-p is confined to (0, 1], and max-new-tokens is at least 1.
+func parseGenConfig(_ args: [String]) -> GenConfig {
+    var c = GenConfig()
+    if let v = doubleOption("--temperature", in: args) { c.temperature = Float(max(0, v)) }
+    if let v = doubleOption("--top-p", in: args) { c.topP = Float(min(1, max(0.0001, v))) }
+    if let v = intOption("--max-new-tokens", in: args) { c.maxNewTokens = max(1, v) }
+    if let v = option("--seed", in: args).flatMap(UInt64.init) { c.seed = v }
+    if let v = doubleOption("--repetition-penalty", in: args) {
+        c.repetitionPenalty = Float(max(0, v))
+    }
+    return c
 }
 
 func parseGuardrails(_ args: [String]) -> AgentGuardrails {
@@ -640,7 +706,9 @@ do {
             modelDir: requireModelDir(),
             mcpConfigPath: option("--mcp-config", in: cliArgs),
             guardrails: parseGuardrails(cliArgs),
-            initialMode: option("--mode", in: cliArgs)
+            initialMode: option("--mode", in: cliArgs),
+            systemPrompt: resolveSystemPrompt(cliArgs),
+            gen: parseGenConfig(cliArgs)
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {
@@ -651,7 +719,9 @@ do {
             model: requireModelDir(), prompt: prompt,
             mcpConfigPath: option("--mcp-config", in: cliArgs),
             guardrails: parseGuardrails(cliArgs),
-            autoPermission: parseAutoPermission(cliArgs))
+            autoPermission: parseAutoPermission(cliArgs),
+            systemPrompt: resolveSystemPrompt(cliArgs),
+            gen: parseGenConfig(cliArgs))
         exit(Int32(code))
     case "gate":
         let failures = try await runGate(model: requireModelDir())
@@ -661,7 +731,10 @@ do {
             FileHandle.standardError.write(Data("chat mode requires --prompt <text>\n".utf8))
             exit(2)
         }
-        try await runChat(model: requireModelDir(), prompt: prompt)
+        try await runChat(
+            model: requireModelDir(), prompt: prompt,
+            systemPrompt: resolveSystemPrompt(cliArgs),
+            gen: parseGenConfig(cliArgs))
     case "tools":
         guard let cfg = option("--mcp-config", in: cliArgs) else {
             FileHandle.standardError.write(Data("tools mode requires --mcp-config <json>\n".utf8))

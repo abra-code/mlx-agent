@@ -27,6 +27,27 @@ mlx-agent gate    [--model <dir>]
 Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
 (60), `--tool-result-bytes <n>` (32768).
 
+### System prompt and generation flags (`acp`, `oneshot`, `chat`)
+
+`--system-prompt <text>` overrides the default helpful-assistant system prompt. An
+explicitly empty value (`--system-prompt ""`) prepends **no** system message at all - the
+mode a translator wants, where the whole instruction is composed into the user turn and a
+stray system prefix would only pollute the request.
+
+The generation flags overlay each mode's built-in defaults; a flag left unset keeps that
+mode's long-standing value. The defaults differ by mode:
+
+| flag | `acp` | `oneshot` | `chat` |
+|---|---|---|---|
+| `--temperature <f>` - sampling temperature; `0` = greedy/deterministic | `0.7` | `0` | `0` |
+| `--max-new-tokens <n>` - cap on tokens generated per turn | `4096` | `4096` | `1024` |
+| `--top-p <f>` - nucleus sampling cutoff, `0 < p <= 1` | `1.0` (off) | `1.0` (off) | `1.0` (off) |
+| `--seed <n>` - RNG seed (inert at `temperature 0`, where argmax has no RNG) | unset | unset | unset |
+| `--repetition-penalty <f>` - penalize repeats; `~1.1` curbs greedy loops | unset (off) | unset (off) | unset (off) |
+
+For example, a deterministic translation server that carries its instruction in the user
+turn runs as `mlx-agent acp --system-prompt "" --temperature 0 --max-new-tokens 2048`.
+
 ### ACP server (`acp`)
 
 Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `session/new`

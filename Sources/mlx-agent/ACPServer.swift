@@ -72,8 +72,10 @@ final class ThinkSplitter {
 
 final class ACPServer: @unchecked Sendable, AgentDelegate {
 
-    private let agentInstructions =
-        "You are a helpful assistant. Use the provided tools when they are relevant."
+    // Resolved once from the CLI (see resolveSystemPrompt): nil means NO system message is
+    // prepended - the mode a translator uses, where the instruction lives in the user turn.
+    private let systemPrompt: String?
+    private let gen: GenConfig
     private let lock = NSLock()
 
     private var currentModelDir: String
@@ -100,11 +102,14 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     init(
         modelDir: String, mcpConfigPath: String? = nil,
-        guardrails: AgentGuardrails = .init(), initialMode: String? = nil
+        guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
+        systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init()
     ) {
         self.currentModelDir = modelDir
         self.mcpConfigPath = mcpConfigPath
         self.guardrails = guardrails
+        self.systemPrompt = systemPrompt
+        self.gen = gen
         // Default to agent mode when tools are configured, else chat.
         self.mode = initialMode ?? (mcpConfigPath != nil ? "agent" : "chat")
     }
@@ -263,18 +268,21 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// Build the session stack on `container`, optionally seeded with prior history
     /// (session/prime). Keeps the MCP registry (servers are model- and context-independent)
     /// and re-applies the current mode. History must NOT contain a system message: the
-    /// history initializer prepends `.system(agentInstructions)` itself.
+    /// session prepends `.system(systemPrompt)` itself when `systemPrompt` is non-nil (a nil
+    /// prompt prepends nothing - the translator path). The default acp parameters (0.7 /
+    /// 4096) are overlaid with any --temperature/--top-p/--max-new-tokens/--seed/
+    /// --repetition-penalty the CLI supplied.
     private func buildSessionStack(
         container: ModelContainer, history: [Chat.Message]
     ) -> (ChatSession, MLXBackend, Agent) {
-        let parameters = GenerateParameters(maxTokens: 4096, temperature: 0.7)
+        let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
         let session: ChatSession
         if history.isEmpty {
             session = ChatSession(
-                container, instructions: agentInstructions, generateParameters: parameters)
+                container, instructions: systemPrompt, generateParameters: parameters)
         } else {
             session = ChatSession(
-                container, instructions: agentInstructions, history: history,
+                container, instructions: systemPrompt, history: history,
                 generateParameters: parameters)
         }
         let registry = lock.withLock { self.registry }
