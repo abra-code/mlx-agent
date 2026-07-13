@@ -26,6 +26,13 @@ let package = Package(
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.9.0"),
     ],
     targets: [
+        // Foundation-only chunker for the map mode. Split into its own target so its logic
+        // can be unit-tested with swift-testing WITHOUT linking MLX/Metal (which only builds
+        // via xcodebuild). `swift test` builds just this library and its tests.
+        .target(
+            name: "Chunking",
+            path: "Sources/Chunking"
+        ),
         .executableTarget(
             name: "mlx-agent",
             dependencies: [
@@ -36,8 +43,14 @@ let package = Package(
                 .product(name: "Tokenizers", package: "swift-transformers"),
                 // MCP stdio tool clients.
                 .product(name: "MCP", package: "swift-sdk"),
+                "Chunking",
             ],
             path: "Sources/mlx-agent"
-        )
+        ),
+        .testTarget(
+            name: "ChunkingTests",
+            dependencies: ["Chunking"],
+            path: "Tests/ChunkingTests"
+        ),
     ]
 )

@@ -171,7 +171,7 @@ func ramGate(dir: URL) throws {
 
 // MARK: - Model loading
 
-func loadModel(_ dir: String) async throws -> ModelContainer {
+func loadModel(_ dir: String, extraEOSTokens: Set<String> = []) async throws -> ModelContainer {
     let url = URL(fileURLWithPath: dir)
     guard FileManager.default.fileExists(atPath: url.appending(component: "config.json").path) else {
         throw NSError(
@@ -181,18 +181,28 @@ func loadModel(_ dir: String) async throws -> ModelContainer {
     // Refuse a load that cannot fit in unified memory before touching the engine, so the
     // failure is a clean ACP error rather than an OOM-kill of the whole process.
     try ramGate(dir: url)
-    // Local-directory load: no downloader needed. The tokenizer loader is the
-    // opt-in swift-transformers integration (macro expands to AutoTokenizer).
-    return try await LLMModelFactory.shared.loadContainer(
-        from: url, using: #huggingFaceTokenizerLoader())
+    // Local-directory load: no downloader needed. We build a ResolvedModelConfiguration by
+    // hand (rather than the loadContainer(from:using:) directory convenience, which hardcodes
+    // empty extraEOSTokens) so a caller-supplied stop token is unioned into the generation
+    // stop set at runtime - fixing a model whose generation_config.json omits one (e.g. a
+    // Gemma conversion missing <end_of_turn>) WITHOUT mutating the downloaded files. The
+    // tokenizer loader is the opt-in swift-transformers integration (macro -> AutoTokenizer).
+    var resolved = ResolvedModelConfiguration(directory: url)
+    resolved.extraEOSTokens = extraEOSTokens
+    let context = try await LLMModelFactory.shared._load(
+        configuration: resolved, tokenizerLoader: #huggingFaceTokenizerLoader())
+    return LLMModelFactory.shared._wrap(context)
 }
 
 // MARK: - chat mode
 
-func runChat(model dir: String, prompt: String, systemPrompt: String?, gen: GenConfig) async throws {
+func runChat(
+    model dir: String, prompt: String, systemPrompt: String?, gen: GenConfig,
+    extraEOSTokens: Set<String>
+) async throws {
     FileHandle.standardError.write(Data("[mlx-agent] loading \(dir) ...\n".utf8))
     let t0 = Date()
-    let container = try await loadModel(dir)
+    let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
     let loadDt = Date().timeIntervalSince(t0)
     let afterLoad = MLX.Memory.snapshot()
     FileHandle.standardError.write(
@@ -378,7 +388,7 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
         note: "ok: \(named[0].function.name)(\(argsDict(named[0])))\(parallelNote)", latency: dt)
 }
 
-func runGate(model dir: String) async throws -> Int {
+func runGate(model dir: String, extraEOSTokens: Set<String>) async throws -> Int {
     print(String(repeating: "=", count: 78))
     print("mlx-agent tool-calling gate")
     print("model  : \(dir)")
@@ -386,7 +396,7 @@ func runGate(model dir: String) async throws -> Int {
     print(String(repeating: "=", count: 78))
 
     let baseline = MLX.Memory.snapshot()
-    let container = try await loadModel(dir)
+    let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
     let afterLoad = MLX.Memory.snapshot()
     print("loaded; model active memory ~= \(mib(afterLoad.activeMemory - baseline.activeMemory))")
     print(String(repeating: "-", count: 78))
@@ -443,9 +453,9 @@ final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
 func runOneshot(
     model dir: String, prompt: String, mcpConfigPath: String?,
     guardrails: AgentGuardrails, autoPermission: PermissionOutcome,
-    systemPrompt: String?, gen: GenConfig
+    systemPrompt: String?, gen: GenConfig, extraEOSTokens: Set<String>
 ) async throws -> Int {
-    let container = try await loadModel(dir)
+    let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
     let session = ChatSession(
         container,
         instructions: systemPrompt,
@@ -573,6 +583,17 @@ func usage() {
                                                           run one agent turn, print to stdout
           mlx-agent gate    [--model <dir>]               built-in tool-calling gate
           mlx-agent chat    [--model <dir>] --prompt <text>  load + stream one completion
+          mlx-agent map     --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+                                                          long-lived, spool-driven document map:
+                                                          loads once, watches <spool>/job.json,
+                                                          applies the job's per-chunk message
+                                                          template ({{chunk}} placeholder)
+                                                          independently to each chunk of the input;
+                                                          output stitch (-> result.txt) reassembles
+                                                          one document, collect (-> results.jsonl)
+                                                          emits a per-chunk record. Translation,
+                                                          proofread, rewrite, redact, classify,
+                                                          extract are all just message templates.
           mlx-agent tools   --mcp-config <json>           launch the configured MCP servers and
                                                           dump their tool surface (exposed names,
                                                           descriptions, schemas, gating) as JSON;
@@ -581,9 +602,13 @@ func usage() {
         OPTIONS:
           --model <dir>            model directory (or set MLX_AGENT_MODEL; required if neither)
           --prompt <text>          prompt for chat/oneshot mode
+          --spool <dir>            spool directory for map mode (job.json in, status/result out)
           --mcp-config <json>      stdio-direct MCP server config (enables tools)
           --mode chat|agent        initial ACP mode (default: agent if --mcp-config, else chat)
           --auto-permission <x>    oneshot gate answer: allow | deny (default: deny)
+          --extra-eos-token <t>    extra generation stop token, unioned into the model's stop set
+                                   at load (repeatable); e.g. "<end_of_turn>" for a Gemma
+                                   conversion whose generation_config.json omits it
           --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
                                    message at all (default: helpful-assistant prompt)
 
@@ -630,6 +655,24 @@ func doubleOption(_ name: String, in args: [String]) -> Double? {
 func resolveSystemPrompt(_ args: [String]) -> String? {
     guard let provided = option("--system-prompt", in: args) else { return defaultSystemPrompt }
     return provided.isEmpty ? nil : provided
+}
+
+/// Collect every `--extra-eos-token <token>` occurrence (the flag is repeatable). Each token
+/// is unioned into the model's generation stop set at load time (see loadModel). Empty values
+/// are ignored. Generic: useful for any model whose conversion shipped a broken stop set.
+func parseExtraEOSTokens(_ args: [String]) -> Set<String> {
+    var out: Set<String> = []
+    var i = 0
+    while i < args.count {
+        if args[i] == "--extra-eos-token", i + 1 < args.count {
+            let token = args[i + 1]
+            if !token.isEmpty { out.insert(token) }
+            i += 2
+        } else {
+            i += 1
+        }
+    }
+    return out
 }
 
 /// Generation knobs resolved from the CLI. Each field is optional: a nil field means "leave
@@ -699,6 +742,8 @@ func requireModelDir() -> String {
     return dir
 }
 
+let extraEOSTokens = parseExtraEOSTokens(cliArgs)
+
 do {
     switch mode {
     case "acp":
@@ -708,7 +753,8 @@ do {
             guardrails: parseGuardrails(cliArgs),
             initialMode: option("--mode", in: cliArgs),
             systemPrompt: resolveSystemPrompt(cliArgs),
-            gen: parseGenConfig(cliArgs)
+            gen: parseGenConfig(cliArgs),
+            extraEOSTokens: extraEOSTokens
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {
@@ -721,10 +767,10 @@ do {
             guardrails: parseGuardrails(cliArgs),
             autoPermission: parseAutoPermission(cliArgs),
             systemPrompt: resolveSystemPrompt(cliArgs),
-            gen: parseGenConfig(cliArgs))
+            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens)
         exit(Int32(code))
     case "gate":
-        let failures = try await runGate(model: requireModelDir())
+        let failures = try await runGate(model: requireModelDir(), extraEOSTokens: extraEOSTokens)
         exit(Int32(failures))
     case "chat":
         guard let prompt = option("--prompt", in: cliArgs) else {
@@ -734,7 +780,17 @@ do {
         try await runChat(
             model: requireModelDir(), prompt: prompt,
             systemPrompt: resolveSystemPrompt(cliArgs),
-            gen: parseGenConfig(cliArgs))
+            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens)
+    case "map":
+        guard let spool = option("--spool", in: cliArgs) else {
+            FileHandle.standardError.write(
+                Data("map mode requires --spool <dir>\n".utf8))
+            exit(2)
+        }
+        await MapServer(
+            modelDir: requireModelDir(), spoolDir: spool,
+            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens
+        ).run()
     case "tools":
         guard let cfg = option("--mcp-config", in: cliArgs) else {
             FileHandle.standardError.write(Data("tools mode requires --mcp-config <json>\n".utf8))

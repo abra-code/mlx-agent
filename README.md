@@ -10,17 +10,19 @@ permission gate before any mutating tool.
 ## Modes
 
 ```
-mlx-agent acp     [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
-mlx-agent oneshot [--model <dir>] --prompt <text> [--mcp-config <json>]
-                  [--auto-permission allow|deny] [guardrails]
-mlx-agent chat    [--model <dir>] --prompt <text>
-mlx-agent gate    [--model <dir>]
+mlx-agent acp       [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
+mlx-agent oneshot   [--model <dir>] --prompt <text> [--mcp-config <json>]
+                    [--auto-permission allow|deny] [guardrails]
+mlx-agent chat      [--model <dir>] --prompt <text>
+mlx-agent translate --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+mlx-agent gate      [--model <dir>]
 ```
 
 - **acp** - ACP server over stdio (chat + agentic tools). See below.
 - **oneshot** - run one agent turn and print it; non-interactive, for scripts and tests.
   `--auto-permission` answers the permission gate (default `deny`).
 - **chat** - load a model and stream a single completion.
+- **translate** - long-lived, spool-driven translator. See below.
 - **gate** - a self-contained tool-calling correctness check (a handful of fixed cases),
   useful to catch a regression in the underlying engine without the full ACP stack.
 
@@ -47,6 +49,83 @@ mode's long-standing value. The defaults differ by mode:
 
 For example, a deterministic translation server that carries its instruction in the user
 turn runs as `mlx-agent acp --system-prompt "" --temperature 0 --max-new-tokens 2048`.
+
+### Extra stop tokens (`--extra-eos-token`, all model-loading modes)
+
+`--extra-eos-token <token>` (repeatable) unions a token into the model's generation stop
+set at load time, without editing the downloaded model files. It exists because some
+converted checkpoints ship a `generation_config.json` with a broken/omitted `eos_token_id`
+- e.g. an instruction-tuned Gemma conversion that emits `<end_of_turn>` (id 106) to end a
+turn but never lists it as EOS, so generation runs to `--max-new-tokens` every time.
+Passing `--extra-eos-token "<end_of_turn>"` restores a clean stop. Harmless if the model's
+stop set is already correct (a set union). Implemented by carrying the token through
+`ModelConfiguration.extraEOSTokens`, which the engine converts to a token id and adds to
+the stop set at generation time.
+
+### Map server (`map`)
+
+A long-lived, file-spool-driven **map over document chunks**: it loads the model once, then
+applies one prompt independently to each chunk of a long input dropped into a spool
+directory - `map(f, chunks)`, where `f` is a per-chunk LLM call. Each chunk generates with a
+fresh cache (stateless, no cross-chunk context), so the operation is element-wise and
+order-independent. Translation, proofreading, rewriting, redaction, normalization,
+per-chunk classification/extraction, and the map phase of map-reduce summarization are all
+just different **message templates** - the task lives in the job, not in the agent.
+
+Unlike the other modes it **bypasses `ChatSession`** (whose message content must be a plain
+`String`) and drives generation directly, so a job can carry **structured content** - e.g. a
+translation template's `{type, source_lang_code, target_lang_code, text}` - and render it
+against the model's own unmodified chat template.
+
+```
+mlx-agent map --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+```
+
+The job carries a chat-message template with a `{{chunk}}` placeholder; per chunk the server
+substitutes the chunk text for `{{chunk}}` (at the parsed-object level, so no escaping is
+needed), applies the model's template, and generates. Two output modes:
+
+- **stitch** (default) - reassemble the per-chunk outputs into one document, preserving the
+  verbatim inter-chunk separators. For text->text transforms (translate, proofread, rewrite,
+  redact, normalize) where the result is a new version of the same document.
+- **collect** - emit one record per chunk instead of stitching. For text->data maps
+  (classify, tag, extract) or when the caller does its own reduce/reassembly (e.g.
+  map-reduce summarization).
+
+Spool protocol (writes are atomic - temp file + rename - except the append-only jsonl):
+
+- **in** `job.json` - `{"epoch": N, "text": "...", "budget_tokens": 1200, "output":
+  "stitch"|"collect", "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}`.
+  Producers write it via atomic rename; a new job is one with a higher `epoch`.
+  `budget_tokens` (default 1200) caps the per-chunk source token count.
+- **in** `stop` - an empty flag file; requests cancellation of the current job. Checked
+  between chunks and during generation (an in-flight chunk is cancelled).
+- **out** `status.json` - `{"state": loading|ready|mapping|done|cancelled|error, "epoch": N,
+  "chunk": k, "total": N, "message": "..."}`.
+- **out** `result.txt` (stitch) - the accumulated stitched output so far (grows per chunk).
+- **out** `results.jsonl` (collect) - one `{"index", "source", "output", "sep"}` object per
+  line, appended as each chunk finishes. `concat(source + sep)` over the records reproduces
+  the input, so a caller can reassemble or align outputs itself.
+
+The source is chunked with the **real tokenizer** (token-accurate) on paragraph then
+sentence boundaries, hard-splitting only pathological runs; inter-chunk separators are
+preserved verbatim so paragraph structure at chunk boundaries survives exactly. The server
+exits when the spool directory disappears (owner quit) or stdin hits EOF (parent death).
+
+**Example - a deterministic translator** (the canonical stitch instantiation): write a
+`job.json` with
+
+```json
+{"epoch": 1, "text": "...", "output": "stitch",
+ "messages": [{"role": "user",
+   "content": [{"type": "text", "source_lang_code": "de", "target_lang_code": "en",
+                "text": "{{chunk}}"}]}]}
+```
+
+against `mlx-agent map --model <dir> --spool <dir> --extra-eos-token "<end_of_turn>"
+--temperature 0 --max-new-tokens 2048`. A string-content instruct model instead takes e.g.
+`"messages": [{"role": "user", "content": "Correct the grammar; output only the corrected
+text:\n\n{{chunk}}"}]`.
 
 ### ACP server (`acp`)
 

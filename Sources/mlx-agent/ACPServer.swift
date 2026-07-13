@@ -76,6 +76,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // prepended - the mode a translator uses, where the instruction lives in the user turn.
     private let systemPrompt: String?
     private let gen: GenConfig
+    // Extra generation stop tokens unioned in at model-load time (see loadModel).
+    private let extraEOSTokens: Set<String>
     private let lock = NSLock()
 
     private var currentModelDir: String
@@ -103,13 +105,15 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     init(
         modelDir: String, mcpConfigPath: String? = nil,
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
-        systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init()
+        systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
+        extraEOSTokens: Set<String> = []
     ) {
         self.currentModelDir = modelDir
         self.mcpConfigPath = mcpConfigPath
         self.guardrails = guardrails
         self.systemPrompt = systemPrompt
         self.gen = gen
+        self.extraEOSTokens = extraEOSTokens
         // Default to agent mode when tools are configured, else chat.
         self.mode = initialMode ?? (mcpConfigPath != nil ? "agent" : "chat")
     }
@@ -241,7 +245,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private func handleNewSession(id: Int?) async {
         let dir = lock.withLock { currentModelDir }
         do {
-            let container = try await loadModel(dir)
+            let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
             // Build the MCP tool registry once (spawns the server processes) if configured,
             // BEFORE the session stack (buildSessionStack reads self.registry).
             let registry = await ensureRegistry()
@@ -436,7 +440,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 // Rebuild the session/backend/agent on the new model (context resets, as a
                 // KV cache cannot carry across models); registry and mode are re-applied
                 // by buildSessionStack.
-                let container = try await loadModel(target.dir)
+                let container = try await loadModel(target.dir, extraEOSTokens: extraEOSTokens)
                 let (session, backend, agent) = buildSessionStack(container: container, history: [])
                 lock.withLock {
                     self.container = container
