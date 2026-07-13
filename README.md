@@ -97,7 +97,9 @@ Spool protocol (writes are atomic - temp file + rename - except the append-only 
 - **in** `job.json` - `{"epoch": N, "text": "...", "budget_tokens": 1200, "output":
   "stitch"|"collect", "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}`.
   Producers write it via atomic rename; a new job is one with a higher `epoch`.
-  `budget_tokens` (default 1200) caps the per-chunk source token count.
+  `budget_tokens` (default 1200) caps the per-chunk source token count. In place of inline
+  `text`, a job may set `"text_file": "<name>"` to read the source from that file in the spool
+  dir (basename only) - handy for a shell producer avoiding JSON-encoding, and for large inputs.
 - **in** `stop` - an empty flag file; requests cancellation of the current job. Checked
   between chunks and during generation (an in-flight chunk is cancelled).
 - **out** `status.json` - `{"state": loading|ready|mapping|done|cancelled|error, "epoch": N,

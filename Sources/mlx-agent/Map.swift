@@ -83,9 +83,18 @@ final class MapServer {
     // MARK: Run loop
 
     func run() async {
-        // Parent death: stdin closes -> exit immediately (nothing to clean up but ourselves).
-        FileHandle.standardInput.readabilityHandler = { handle in
-            if handle.availableData.isEmpty { exit(0) }
+        // Parent-death detection via stdin EOF, but ONLY when stdin is a pipe - i.e. the parent
+        // holds the write end and its close is a real death signal. A daemon spawned by a shell
+        // handler gets /dev/null (or a closed) stdin, which reads as instant EOF; installing the
+        // handler there would kill us on launch. That case relies on the spool-directory-gone
+        // check in the poll loop instead.
+        var stdinStat = stat()
+        if fstat(FileHandle.standardInput.fileDescriptor, &stdinStat) == 0,
+            (stdinStat.st_mode & S_IFMT) == S_IFIFO
+        {
+            FileHandle.standardInput.readabilityHandler = { handle in
+                if handle.availableData.isEmpty { exit(0) }
+            }
         }
 
         let label = (modelDir as NSString).lastPathComponent
@@ -367,9 +376,21 @@ final class MapServer {
             let epoch = (obj["epoch"] as? NSNumber)?.intValue
         else { return .none }
         // From here the job has an identity (epoch); a structural problem is a producer mistake
-        // we surface as an error rather than dropping silently.
-        guard let text = obj["text"] as? String else {
-            return .invalid(epoch: epoch, reason: "job has no \"text\" string")
+        // we surface as an error rather than dropping silently. The source text is either inline
+        // ("text") or in a spool file ("text_file") - the latter lets a shell producer avoid
+        // JSON-encoding arbitrary content and handles large inputs cleanly. text_file is confined
+        // to the spool dir (basename only) so it cannot escape via a path.
+        let text: String
+        if let inline = obj["text"] as? String {
+            text = inline
+        } else if let name = obj["text_file"] as? String, !name.isEmpty,
+            let data = try? Data(
+                contentsOf: spoolDir.appending(component: (name as NSString).lastPathComponent)),
+            let fromFile = String(data: data, encoding: .utf8)
+        {
+            text = fromFile
+        } else {
+            return .invalid(epoch: epoch, reason: "job has no \"text\" or readable \"text_file\"")
         }
         guard let messages = obj["messages"] as? [[String: Any]], !messages.isEmpty,
             let messagesData = try? JSONSerialization.data(withJSONObject: messages)
