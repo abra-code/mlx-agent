@@ -5,6 +5,7 @@
 //   oneshot  - run one agent turn and print it (non-interactive; drives test suites)
 //   chat     - load a model and stream a single completion
 //   gate     - built-in tool-calling correctness check (5 fixed cases)
+//   tools    - launch the --mcp-config servers, dump their tool surface as JSON (no model)
 //
 // `gate` is a self-contained diagnostic: it drives ChatSession's tool machinery over a
 // handful of prompts (single tool call, correct args, parallel calls, and a negative
@@ -472,6 +473,84 @@ func runOneshot(
     }
 }
 
+// MARK: - tools mode (MCP tool-surface dump)
+
+/// Launch every server in --mcp-config exactly as a session would - same MCPServer.launch
+/// handshake (initialize + tools/list, 30s bound) and the same exposed-name collision rule
+/// as MCPToolRegistry.build - then dump the resulting tool surface as JSON on stdout and
+/// shut the children down. No model is loaded. This is the introspection backend for GUI
+/// inspectors: `exposedName` is the function name the model would actually see, `gated`
+/// marks tools that require a permission round-trip before dispatch, and a server that
+/// fails its handshake is reported with status "error" instead of being silently absent.
+func runToolsDump(mcpConfigPath: String) async -> Int {
+    let configs: [MCPServerConfig]
+    do {
+        configs = try MCPConfigLoader.load(mcpConfigPath)
+    } catch {
+        FileHandle.standardError.write(
+            Data("mlx-agent tools: \(error.localizedDescription)\n".utf8))
+        return 1
+    }
+
+    var claimed: Set<String> = []  // exposed names, first server wins the bare name
+    var serversOut: [[String: Any]] = []
+    var launched: [MCPServer] = []
+
+    for config in configs {
+        var entry: [String: Any] = [
+            "name": config.name,
+            "command": config.command,
+            "args": config.args,
+        ]
+        do {
+            let server = try await MCPServer.launch(config)
+            launched.append(server)
+            var toolsOut: [[String: Any]] = []
+            for tool in server.tools {
+                // Same rule as MCPToolRegistry.build: first claim keeps the bare name,
+                // later collisions are exposed as "<server>__<tool>".
+                let exposed =
+                    claimed.contains(tool.name) ? "\(config.name)__\(tool.name)" : tool.name
+                if claimed.contains(exposed) { continue }  // double collision: absent, as in build
+                claimed.insert(exposed)
+                var t: [String: Any] = [
+                    "name": tool.name,
+                    "exposedName": exposed,
+                    "description": tool.description ?? "",
+                    "gated": config.gatedTools.contains(tool.name),
+                ]
+                // MCP.Value is Codable; round-trip the JSON-Schema into a plain JSON tree.
+                if let data = try? JSONEncoder().encode(tool.inputSchema),
+                    let obj = try? JSONSerialization.jsonObject(with: data)
+                {
+                    t["inputSchema"] = obj
+                }
+                toolsOut.append(t)
+            }
+            entry["status"] = "ok"
+            entry["tools"] = toolsOut
+        } catch {
+            entry["status"] = "error"
+            entry["error"] = error.localizedDescription
+            entry["tools"] = [[String: Any]]()
+        }
+        serversOut.append(entry)
+    }
+
+    for server in launched { await server.shutdown() }
+
+    guard
+        let data = try? JSONSerialization.data(
+            withJSONObject: ["servers": serversOut], options: [.prettyPrinted, .sortedKeys])
+    else {
+        FileHandle.standardError.write(Data("mlx-agent tools: could not serialize dump\n".utf8))
+        return 1
+    }
+    FileHandle.standardOutput.write(data)
+    FileHandle.standardOutput.write(Data("\n".utf8))
+    return 0
+}
+
 // MARK: - CLI
 
 func usage() {
@@ -488,6 +567,10 @@ func usage() {
                                                           run one agent turn, print to stdout
           mlx-agent gate    [--model <dir>]               built-in tool-calling gate
           mlx-agent chat    [--model <dir>] --prompt <text>  load + stream one completion
+          mlx-agent tools   --mcp-config <json>           launch the configured MCP servers and
+                                                          dump their tool surface (exposed names,
+                                                          descriptions, schemas, gating) as JSON;
+                                                          loads no model
 
         OPTIONS:
           --model <dir>            model directory (or set MLX_AGENT_MODEL; required if neither)
@@ -579,6 +662,12 @@ do {
             exit(2)
         }
         try await runChat(model: requireModelDir(), prompt: prompt)
+    case "tools":
+        guard let cfg = option("--mcp-config", in: cliArgs) else {
+            FileHandle.standardError.write(Data("tools mode requires --mcp-config <json>\n".utf8))
+            exit(2)
+        }
+        exit(Int32(await runToolsDump(mcpConfigPath: cfg)))
     default:
         usage()
     }

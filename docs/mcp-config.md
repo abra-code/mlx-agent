@@ -42,6 +42,11 @@ the model. The set of servers is described by a JSON file passed with `--mcp-con
   directly.
 - A server that fails to launch or hand-shake is logged and skipped; its tools are simply
   absent (one broken server does not disable the agent).
+- `mlx-agent tools --mcp-config <json>` introspects a config without loading a model:
+  it spawns the servers, performs the same handshake and exposed-name collision rules,
+  prints the resulting tool surface (exposed names, descriptions, input schemas, gating,
+  per-server handshake status) as JSON on stdout, and shuts the servers down. GUI
+  inspectors (MLXChat's "Inspect MCP Servers" window) consume this dump.
 
 ## Guardrails
 
