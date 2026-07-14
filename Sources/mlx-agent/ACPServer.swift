@@ -704,9 +704,13 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 ]))
     }
 
-    func agentTurnUsage(totalTokens: Int) {
+    func agentTurnUsage(totalTokens: Int, tokensPerSecond: Double) {
         guard totalTokens > 0, let sid = lock.withLock({ sessionID }) else { return }
-        send(sessionUpdateEnvelope(sid, ["sessionUpdate": "usage_update", "used": totalTokens]))
+        var update: [String: Any] = ["sessionUpdate": "usage_update", "used": totalTokens]
+        if tokensPerSecond > 0 {
+            update["tokensPerSecond"] = (tokensPerSecond * 10).rounded() / 10
+        }
+        send(sessionUpdateEnvelope(sid, update))
     }
 
     private func sessionUpdateEnvelope(_ sid: String, _ update: [String: Any]) -> [String: Any] {

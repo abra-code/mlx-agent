@@ -447,7 +447,13 @@ final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
         err("[permission] \(title) -> auto-\(autoPermission)\n")
         return autoPermission
     }
-    func agentTurnUsage(totalTokens: Int) { err("[usage] \(totalTokens) tokens\n") }
+    func agentTurnUsage(totalTokens: Int, tokensPerSecond: Double) {
+        if tokensPerSecond > 0 {
+            err(String(format: "[usage] %d tokens, %.1f tok/s\n", totalTokens, tokensPerSecond))
+        } else {
+            err("[usage] \(totalTokens) tokens\n")
+        }
+    }
 }
 
 func runOneshot(

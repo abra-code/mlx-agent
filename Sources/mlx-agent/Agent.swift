@@ -42,7 +42,7 @@ protocol AgentDelegate: AnyObject, Sendable {
     /// Gated-tool approval. Returns .allow to run, .deny to reject (result fed back to
     /// the model), .cancel to abort the whole turn.
     func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome
-    func agentTurnUsage(totalTokens: Int)
+    func agentTurnUsage(totalTokens: Int, tokensPerSecond: Double)
 }
 
 // MARK: - Turn outcome
@@ -81,6 +81,8 @@ final class Agent: @unchecked Sendable {
         var iteration = 0
         var dupCache: [String: String] = [:]
         var totalTokens = 0
+        var genTokens = 0       // output tokens across this turn's model responses
+        var genTime = 0.0       // decode time across them, for tokens/sec
         let splitter = ThinkSplitter()
 
         while true {
@@ -91,7 +93,9 @@ final class Agent: @unchecked Sendable {
                 delegate?.agentEmitText(
                     kind: .message,
                     "\n[reached the tool-call limit of \(guardrails.maxToolIterations); stopping]\n")
-                delegate?.agentTurnUsage(totalTokens: totalTokens)
+                delegate?.agentTurnUsage(
+                    totalTokens: totalTokens,
+                    tokensPerSecond: genTime > 0 ? Double(genTokens) / genTime : 0)
                 return .stop(reason: "max_turn_requests")
             }
             iteration += 1
@@ -108,6 +112,8 @@ final class Agent: @unchecked Sendable {
                         pendingCalls.append(call)
                     } else if let info = gen.info {
                         totalTokens += info.promptTokenCount + info.generationTokenCount
+                        genTokens += info.generationTokenCount
+                        genTime += info.generateTime
                     }
                 }
             } catch is CancellationError {
@@ -121,7 +127,9 @@ final class Agent: @unchecked Sendable {
 
             if pendingCalls.isEmpty {
                 for (kind, seg) in splitter.flush() { delegate?.agentEmitText(kind: kind, seg) }
-                delegate?.agentTurnUsage(totalTokens: totalTokens)
+                delegate?.agentTurnUsage(
+                    totalTokens: totalTokens,
+                    tokensPerSecond: genTime > 0 ? Double(genTokens) / genTime : 0)
                 return .stop(reason: "end_turn")
             }
 

@@ -67,11 +67,11 @@ private final class JobMeter: @unchecked Sendable {
         self.outEstimate = totalInputTokens   // 1:1 seed; refined by the observed out/in ratio
     }
 
-    func beginChunk(_ i: Int) { lock.lock(); chunkIndex = i; liveChunkOut = 0; lock.unlock() }
-    func liveToken() { lock.lock(); liveChunkOut += 1; lock.unlock() }
+    func beginChunk(_ i: Int) { lock.lock(); defer { lock.unlock() }; chunkIndex = i; liveChunkOut = 0 }
+    func liveToken() { lock.lock(); defer { lock.unlock() }; liveChunkOut += 1 }
 
     func endChunk(inputTokens: Int, outputTokens: Int) {
-        lock.lock()
+        lock.lock(); defer { lock.unlock() }
         completedIn += inputTokens
         completedOut += outputTokens
         liveChunkOut = 0
@@ -80,7 +80,6 @@ private final class JobMeter: @unchecked Sendable {
             let remainingIn = max(0, totalInputTokens - completedIn)
             outEstimate = completedOut + Int((ratio * Double(remainingIn)).rounded())
         }
-        lock.unlock()
     }
 
     /// (chunks completed so far, output tokens done, estimated total output tokens).
