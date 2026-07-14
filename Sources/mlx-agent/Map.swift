@@ -27,7 +27,9 @@
 //                   "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}
 //        stop       empty flag file; requests cancellation of the current job
 //   out: status.json {"state": loading|ready|mapping|done|cancelled|error,
-//                     "epoch": N, "chunk": k, "total": N, "message": "..."}
+//                     "epoch": N, "chunk": k, "total": N, "message": "...",
+//                     // progress metrics (present on ready/mapping/done as available):
+//                     "tok_per_sec": F, "tokens_done": D, "tokens_total": T, "eta_sec": S}
 //        result.txt   (stitch) accumulated stitched output so far
 //        results.jsonl (collect) one {"index","source","output","sep"} object per line
 //
@@ -39,7 +41,57 @@ import MLXLMCommon
 import Tokenizers
 import Chunking
 
-final class MapServer {
+/// Live progress for one map job, shared between the generation loop (which writes token counts)
+/// and a background reporter task (which reads them and writes tok/s + ETA into status.json).
+/// Lock-guarded so the two can touch it without a data race.
+private final class JobMeter: @unchecked Sendable {
+    let jobStart: Date
+    let epoch: Int
+    let totalChunks: Int
+    let totalInputTokens: Int
+    let primedRate: Double
+
+    private let lock = NSLock()
+    private var chunkIndex = 0     // 0-based chunk currently generating (== chunks completed)
+    private var completedIn = 0    // input tokens of finished chunks
+    private var completedOut = 0   // exact output tokens of finished chunks
+    private var liveChunkOut = 0   // approximate output tokens in the in-flight chunk
+    private var outEstimate: Int   // estimated total output tokens (refined once chunks finish)
+
+    init(jobStart: Date, epoch: Int, totalChunks: Int, totalInputTokens: Int, primedRate: Double) {
+        self.jobStart = jobStart
+        self.epoch = epoch
+        self.totalChunks = totalChunks
+        self.totalInputTokens = totalInputTokens
+        self.primedRate = primedRate
+        self.outEstimate = totalInputTokens   // 1:1 seed; refined by the observed out/in ratio
+    }
+
+    func beginChunk(_ i: Int) { lock.lock(); chunkIndex = i; liveChunkOut = 0; lock.unlock() }
+    func liveToken() { lock.lock(); liveChunkOut += 1; lock.unlock() }
+
+    func endChunk(inputTokens: Int, outputTokens: Int) {
+        lock.lock()
+        completedIn += inputTokens
+        completedOut += outputTokens
+        liveChunkOut = 0
+        if completedIn > 0 {
+            let ratio = Double(completedOut) / Double(completedIn)
+            let remainingIn = max(0, totalInputTokens - completedIn)
+            outEstimate = completedOut + Int((ratio * Double(remainingIn)).rounded())
+        }
+        lock.unlock()
+    }
+
+    /// (chunks completed so far, output tokens done, estimated total output tokens).
+    func snapshot() -> (chunkIndex: Int, tokensDone: Int, totalOut: Int) {
+        lock.lock(); defer { lock.unlock() }
+        let done = completedOut + liveChunkOut
+        return (chunkIndex, done, max(outEstimate, done))
+    }
+}
+
+final class MapServer: @unchecked Sendable {
     private enum Output { case stitch, collect }
 
     /// A map request read from the spool.
@@ -51,6 +103,13 @@ final class MapServer {
         let messagesData: Data  // JSON of the `messages` template (carries {{chunk}})
     }
 
+    /// One chunk's generation result plus the exact decode stats for tok/s.
+    private struct ChunkResult {
+        let text: String
+        let genTokens: Int
+        let genTime: Double
+    }
+
     // Placeholder the job's message template must contain; replaced with each chunk's text.
     private static let placeholder = "{{chunk}}"
 
@@ -58,6 +117,10 @@ final class MapServer {
     private let spoolDir: URL
     private let gen: GenConfig
     private let extraEOSTokens: Set<String>
+
+    // Decode speed (tokens/sec) measured by a warmup generation right after load; the fallback
+    // rate for an upfront ETA before a job has produced any tokens. 0 if priming failed.
+    private var primedRate: Double = 0
 
     private let jobURL: URL
     private let statusURL: URL
@@ -107,8 +170,12 @@ final class MapServer {
             log("model load failed: \(error.localizedDescription)")
             return
         }
-        writeStatus(state: "ready", message: "Ready - \(label)")
-        log("ready on \(label); watching \(spoolDir.path)")
+        // Warm the Metal kernels and measure decode speed, so the first real job has an upfront
+        // ETA and the UI can show a comparable tok/s figure for the loaded model.
+        primedRate = await primeAndMeasure(container: container)
+        writeStatus(
+            state: "ready", tokPerSec: primedRate > 0 ? primedRate : nil, message: "Ready - \(label)")
+        log(String(format: "ready on %@ (%.1f tok/s); watching %@", label, primedRate, spoolDir.path))
 
         var lastEpoch: Int? = nil
         while spoolExists() {
@@ -168,54 +235,106 @@ final class MapServer {
             return
         }
 
-        // Chunk with the real tokenizer (one actor hop for the whole split).
-        let chunks = await container.perform { context in
-            Chunker.make(job.text, budget: job.budget) {
+        // Chunk with the real tokenizer, capturing each chunk's INPUT token count (for the ETA's
+        // total-work estimate). One actor hop for the whole split + counts.
+        let (chunks, inTokens): ([Chunk], [Int]) = await container.perform { context in
+            let cs = Chunker.make(job.text, budget: job.budget) {
                 context.tokenizer.encode(text: $0).count
             }
+            let counts = cs.map { context.tokenizer.encode(text: $0.text).count }
+            return (cs, counts)
         }
 
         let total = chunks.count
+        let totalIn = inTokens.reduce(0, +)
         let params = gen.apply(to: GenerateParameters(maxTokens: 2048, temperature: 0))
         var accumulated = ""
+        var sumGenTokens = 0
+        var sumGenTime = 0.0
+
+        let meter = JobMeter(
+            jobStart: Date(), epoch: job.epoch, totalChunks: total,
+            totalInputTokens: totalIn, primedRate: primedRate)
+
         writeStatus(
             state: "mapping", epoch: job.epoch, chunk: 0, total: total,
+            tokPerSec: primedRate > 0 ? primedRate : nil, tokensDone: 0, tokensTotal: totalIn,
+            etaSec: primedRate > 0 ? Int((Double(totalIn) / primedRate).rounded()) : nil,
             message: "Mapping 0 of \(total)")
-        log("job \(job.epoch): \(job.output == .stitch ? "stitch" : "collect"), \(total) chunk(s)")
+        log("job \(job.epoch): \(job.output == .stitch ? "stitch" : "collect"), \(total) chunk(s), \(totalIn) input tokens")
+
+        // Background reporter: turns the live token count into tok/s + ETA in status.json ~2x/s,
+        // so the UI counts down smoothly instead of only jumping at chunk boundaries. It is the
+        // SOLE writer of the running "mapping" status; process() writes only the terminal state
+        // (done/cancelled/error) AFTER stopping it, so a stale tick can never land after "done".
+        //
+        // Rate = an EMA of the RECENT-window token rate, seeded with the primed decode speed. The
+        // window (tokens since the last tick) reflects the true decode speed rather than the
+        // since-start rate, which the one-time prompt prefill drags far down on the first tick;
+        // seeding with the primed speed keeps that first tick from spiking the ETA.
+        let reporter = Task { [self] in
+            var emaRate = meter.primedRate
+            var prevTokens = 0
+            var prevTime = meter.jobStart
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if Task.isCancelled { break }
+                let now = Date()
+                let s = meter.snapshot()
+                let dt = now.timeIntervalSince(prevTime)
+                let dTok = s.tokensDone - prevTokens
+                if dt > 0.05 && dTok > 0 {
+                    let inst = Double(dTok) / dt
+                    emaRate = emaRate > 0 ? 0.6 * emaRate + 0.4 * inst : inst
+                }
+                prevTokens = s.tokensDone
+                prevTime = now
+                let rate = emaRate > 0 ? emaRate : meter.primedRate
+                let eta = rate > 0 ? Int((Double(max(0, s.totalOut - s.tokensDone)) / rate).rounded()) : nil
+                self.writeStatus(
+                    state: "mapping", epoch: meter.epoch, chunk: s.chunkIndex, total: meter.totalChunks,
+                    tokPerSec: rate > 0 ? rate : nil, tokensDone: s.tokensDone, tokensTotal: s.totalOut,
+                    etaSec: eta, message: "Mapping \(s.chunkIndex) of \(meter.totalChunks)")
+            }
+        }
+        func stopReporter() async { reporter.cancel(); _ = await reporter.value }
 
         for (i, chunk) in chunks.enumerated() {
             if stopRequested() {
+                await stopReporter()
                 writeStatus(
-                    state: "cancelled", epoch: job.epoch, chunk: i, total: total,
-                    message: "Cancelled")
+                    state: "cancelled", epoch: job.epoch, chunk: i, total: total, message: "Cancelled")
                 log("job \(job.epoch): cancelled before chunk \(i + 1)")
                 return
             }
-            let output: String
+            meter.beginChunk(i)
+            let result: ChunkResult
             do {
-                output = try await generate(
+                result = try await generate(
                     chunk: chunk.text, messagesData: job.messagesData,
-                    params: params, container: container)
+                    params: params, container: container, meter: meter)
             } catch {
+                await stopReporter()
                 writeStatus(
                     state: "error", epoch: job.epoch, chunk: i, total: total,
                     message: "Generation failed: \(error.localizedDescription)")
                 log("job \(job.epoch): chunk \(i + 1) error: \(error.localizedDescription)")
                 return
             }
+            meter.endChunk(inputTokens: inTokens[i], outputTokens: result.genTokens)
+            sumGenTokens += result.genTokens
+            sumGenTime += result.genTime
             switch job.output {
             case .stitch:
-                accumulated += output + chunk.sep
+                accumulated += result.text + chunk.sep
                 writeText(accumulated, to: resultTxtURL)
             case .collect:
                 appendRecord(
-                    ["index": i, "source": chunk.text, "output": output, "sep": chunk.sep])
+                    ["index": i, "source": chunk.text, "output": result.text, "sep": chunk.sep])
             }
-            writeStatus(
-                state: "mapping", epoch: job.epoch, chunk: i + 1, total: total,
-                message: "Mapping \(i + 1) of \(total)")
             // A stop that arrived mid-chunk (generate() cancelled/drained) lands here.
             if stopRequested() {
+                await stopReporter()
                 writeStatus(
                     state: "cancelled", epoch: job.epoch, chunk: i + 1, total: total,
                     message: "Cancelled")
@@ -223,9 +342,15 @@ final class MapServer {
                 return
             }
         }
+        await stopReporter()
+        let decodeRate = sumGenTime > 0 ? Double(sumGenTokens) / sumGenTime : primedRate
         writeStatus(
-            state: "done", epoch: job.epoch, chunk: total, total: total, message: "Done")
-        log("job \(job.epoch): done")
+            state: "done", epoch: job.epoch, chunk: total, total: total,
+            tokPerSec: decodeRate > 0 ? decodeRate : nil, tokensDone: sumGenTokens,
+            tokensTotal: sumGenTokens, etaSec: 0, message: "Done")
+        log(String(
+            format: "job %d: done - %d tokens in %.1fs (%.1f tok/s)",
+            job.epoch, sumGenTokens, sumGenTime, decodeRate))
     }
 
     /// Generate one chunk's output: render the job's message template with the chunk text
@@ -237,11 +362,12 @@ final class MapServer {
     /// fully finished before this closure returns and releases the mutex - the next job's
     /// generation can never overlap a still-running decode.
     private func generate(
-        chunk: String, messagesData: Data, params: GenerateParameters, container: ModelContainer
-    ) async throws -> String {
+        chunk: String, messagesData: Data, params: GenerateParameters,
+        container: ModelContainer, meter: JobMeter
+    ) async throws -> ChunkResult {
         let stopURL = self.stopURL
         let stride = self.stopCheckStride
-        return try await container.perform { context -> String in
+        return try await container.perform { context -> ChunkResult in
             let messages = try Self.renderMessages(messagesData, chunk: chunk)
             let tokens = try context.tokenizer.applyChatTemplate(messages: messages)
             let iterator = try TokenIterator(
@@ -253,9 +379,22 @@ final class MapServer {
                 tokenizer: context.tokenizer,
                 iterator: iterator)
             var out = ""
+            var pieces = 0     // fallback token count if no .info arrives (e.g. cancellation)
+            var genTokens = 0
+            var genTime = 0.0
             var seen = 0
             for await event in stream {
-                if case .chunk(let piece) = event { out += piece }
+                switch event {
+                case .chunk(let piece):
+                    out += piece
+                    pieces += 1
+                    meter.liveToken()   // live count for the ETA reporter
+                case .info(let info):
+                    genTokens = info.generationTokenCount
+                    genTime = info.generateTime
+                default:
+                    break
+                }
                 seen += 1
                 // Cancel (do NOT break): keep consuming so the decode task observes cancellation
                 // and finishes before we leave this closure and drop the model mutex.
@@ -265,7 +404,40 @@ final class MapServer {
                     task.cancel()
                 }
             }
-            return out.trimmingCharacters(in: .whitespacesAndNewlines)
+            return ChunkResult(
+                text: out.trimmingCharacters(in: .whitespacesAndNewlines),
+                genTokens: genTokens > 0 ? genTokens : pieces, genTime: genTime)
+        }
+    }
+
+    /// Warm the Metal kernels and measure the model's decode speed (tokens/sec) with a short
+    /// throwaway generation. Runs right after load so the first real job has an upfront ETA and
+    /// the UI can show a comparable tok/s figure. Uses a raw-token prompt (not the chat template)
+    /// because a generic map model may reject a plain-string chat message, and a small fixed
+    /// maxTokens so priming stays quick regardless of the job's --max-new-tokens. Returns 0 on
+    /// any failure - the ETA then just falls back to the live rate once a job produces tokens.
+    private func primeAndMeasure(container: ModelContainer) async -> Double {
+        let params = GenerateParameters(maxTokens: 64, temperature: 0)
+        return await container.perform { context -> Double in
+            let prompt = context.tokenizer.encode(text: "The")
+            guard !prompt.isEmpty else { return 0 }
+            do {
+                let iterator = try TokenIterator(
+                    input: LMInput(tokens: MLXArray(prompt)), model: context.model,
+                    cache: nil, parameters: params)
+                let (stream, _) = generateTask(
+                    promptTokenCount: prompt.count,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator)
+                var rate = 0.0
+                for await event in stream {
+                    if case .info(let info) = event { rate = info.tokensPerSecond }
+                }
+                return rate
+            } catch {
+                return 0
+            }
         }
     }
 
@@ -425,12 +597,18 @@ final class MapServer {
     }
 
     private func writeStatus(
-        state: String, epoch: Int? = nil, chunk: Int? = nil, total: Int? = nil, message: String
+        state: String, epoch: Int? = nil, chunk: Int? = nil, total: Int? = nil,
+        tokPerSec: Double? = nil, tokensDone: Int? = nil, tokensTotal: Int? = nil,
+        etaSec: Int? = nil, message: String
     ) {
         var obj: [String: Any] = ["state": state, "message": message]
         if let epoch { obj["epoch"] = epoch }
         if let chunk { obj["chunk"] = chunk }
         if let total { obj["total"] = total }
+        if let tokPerSec { obj["tok_per_sec"] = (tokPerSec * 10).rounded() / 10 }
+        if let tokensDone { obj["tokens_done"] = tokensDone }
+        if let tokensTotal { obj["tokens_total"] = tokensTotal }
+        if let etaSec { obj["eta_sec"] = etaSec }
         if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) {
             try? data.write(to: statusURL, options: .atomic)
         }
