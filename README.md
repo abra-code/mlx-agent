@@ -158,6 +158,16 @@ Smoke-test the chat path without a UI:
 python3 tools/acp_smoke.py .build/xcode/Build/Products/Debug/mlx-agent
 ```
 
+`tools/acp_tool_leak.py` covers what `acp_smoke.py` structurally cannot: it drives a turn
+that CALLS A TOOL and asserts no raw model markers (harmony `<|channel|>...`, `<think>`)
+reach the visible message. Both regressions it guards only manifest across a tool call, so
+they are invisible to a chat-only run. It needs a server and an MCP config:
+
+```
+python3 tools/acp_tool_leak.py .build/xcode/Build/Products/Debug/mlx-agent \
+  --base-url http://127.0.0.1:8080/v1 --mcp-config /path/to/mcp-config.json
+```
+
 ### Tools (agent mode)
 
 Pass `--mcp-config <path>` to connect to one or more MCP stdio servers and expose their
@@ -212,13 +222,19 @@ Run:
 cd .build/xcode/Build/Products/Debug && ./mlx-agent gate
 ```
 
-Tests (`Chunking` only - no MLX, no Metal, ~0.01s):
+Tests (`Chunking` + `AgentText` - no MLX, no Metal, ~0.01s):
 
 ```
-xcodebuild -project mlx-agent.xcodeproj -scheme ChunkingTests \
+xcodebuild -project mlx-agent.xcodeproj -scheme UnitTests \
   -destination 'platform=macOS,arch=arm64' \
   -skipPackagePluginValidation -skipMacroValidation test
 ```
+
+Both are Foundation-only libraries, deliberately kept OUT of the MLX-linking `mlx-agent`
+target so their logic is testable without a Metal build. That is the bar for putting pure
+logic in its own target: `ThinkSplitter` lived in `ACPServer.swift`, was therefore
+untestable in seconds, and shipped a bug for it. Anything that does not need MLX belongs
+in a library target with tests.
 
 ### Code coverage: never ship an instrumented binary
 

@@ -18,6 +18,7 @@
 // (prints to stdout, auto-answers).
 
 import Foundation
+import AgentText
 import MLXLMCommon
 
 // MARK: - Guardrails
@@ -89,7 +90,6 @@ final class Agent: @unchecked Sendable {
             if Task.isCancelled { return .cancelled }
 
             if iteration >= guardrails.maxToolIterations {
-                for (kind, seg) in splitter.flush() { delegate?.agentEmitText(kind: kind, seg) }
                 delegate?.agentEmitText(
                     kind: .message,
                     "\n[reached the tool-call limit of \(guardrails.maxToolIterations); stopping]\n")
@@ -102,15 +102,20 @@ final class Agent: @unchecked Sendable {
 
             var pendingCalls: [ToolCall] = []
             do {
-                for try await gen in backend.stream(messages) {
+                for try await event in backend.stream(messages) {
                     if Task.isCancelled { return .cancelled }
-                    if let chunk = gen.chunk {
+                    switch event {
+                    case .text(let chunk):
                         for (kind, seg) in splitter.feed(chunk) {
                             delegate?.agentEmitText(kind: kind, seg)
                         }
-                    } else if let call = gen.toolCall {
+                    case .reasoning(let text):
+                        // Already classified by the server: straight to thought, never
+                        // through the splitter (see BackendEvent).
+                        delegate?.agentEmitText(kind: .thought, text)
+                    case .toolCall(let call):
                         pendingCalls.append(call)
-                    } else if let info = gen.info {
+                    case .info(let info):
                         totalTokens += info.promptTokenCount + info.generationTokenCount
                         genTokens += info.generationTokenCount
                         genTime += info.generateTime
@@ -121,12 +126,20 @@ final class Agent: @unchecked Sendable {
             } catch {
                 return .failed(error.localizedDescription)
             }
+
+            // This pass's stream is over, so no further chunk can complete a marker that
+            // straddled a chunk boundary: whatever the splitter is still holding is final
+            // text and must go out NOW. Doing this only at end-of-turn (the old behaviour)
+            // stranded the tail whenever the pass ended in a tool call, and it resurfaced
+            // glued to the front of the next pass's answer. `inThink` survives on purpose -
+            // a <think> block may span a tool call.
+            for (kind, seg) in splitter.flush() { delegate?.agentEmitText(kind: kind, seg) }
+
             messages = []  // consumed by the backend; next input is tool results (if any)
 
             if Task.isCancelled { return .cancelled }
 
             if pendingCalls.isEmpty {
-                for (kind, seg) in splitter.flush() { delegate?.agentEmitText(kind: kind, seg) }
                 delegate?.agentTurnUsage(
                     totalTokens: totalTokens,
                     tokensPerSecond: genTime > 0 ? Double(genTokens) / genTime : 0)

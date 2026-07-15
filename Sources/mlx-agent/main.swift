@@ -13,6 +13,7 @@
 // engine is caught without the full ACP stack.
 
 import Foundation
+import AgentText
 import MLX
 import MLXLLM
 import MLXLMCommon

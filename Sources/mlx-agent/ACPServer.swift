@@ -16,59 +16,20 @@
 // tool_call_update / usage_update, and sends session/request_permission before any
 // gated tool. Tools come from the MCP servers named in --mcp-config (see MCPClients).
 //
-// mlx-swift-lm streams raw text with <think></think> tags and no reasoning separation,
-// so this server splits those markers into agent_thought_chunk vs agent_message_chunk
-// for the client's folded-reasoning UX. One live ChatSession per process (KV cache
-// persists across prompts, so a follow-up turn's prefill is cheaper).
+// Reasoning reaches the client as agent_thought_chunk rather than agent_message_chunk, so
+// it folds away in the UI. The two backends separate it differently: the MLX path streams
+// raw text with inline <think></think> tags that ThinkSplitter (see the AgentText target)
+// classifies, while llama-server classifies it for us into `reasoning_content`. One live
+// ChatSession per process (KV cache persists across prompts, so a follow-up turn's
+// prefill is cheaper).
 //
 // Everything on stdout is JSON-RPC; all logging goes to stderr.
 
 import Foundation
+import AgentText
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
-
-/// Splits a raw model stream into thought (inside <think>...</think>) and message
-/// (everything else) segments, tolerating markers that straddle chunk boundaries.
-final class ThinkSplitter {
-    enum Kind { case thought, message }
-    private var buffer = ""
-    private var inThink = false
-    private let open = "<think>"
-    private let close = "</think>"
-    private var keep: Int { max(open.count, close.count) - 1 }
-
-    func feed(_ s: String) -> [(Kind, String)] {
-        buffer += s
-        var out: [(Kind, String)] = []
-        while true {
-            let marker = inThink ? close : open
-            if let r = buffer.range(of: marker) {
-                let before = String(buffer[buffer.startIndex..<r.lowerBound])
-                if !before.isEmpty { out.append((inThink ? .thought : .message, before)) }
-                buffer.removeSubrange(buffer.startIndex..<r.upperBound)
-                inThink.toggle()
-            } else {
-                // Hold back a short tail that could be the prefix of a marker.
-                if buffer.count > keep {
-                    let end = buffer.index(buffer.endIndex, offsetBy: -keep)
-                    let emit = String(buffer[buffer.startIndex..<end])
-                    if !emit.isEmpty { out.append((inThink ? .thought : .message, emit)) }
-                    buffer = String(buffer[end...])
-                }
-                break
-            }
-        }
-        return out
-    }
-
-    func flush() -> [(Kind, String)] {
-        guard !buffer.isEmpty else { return [] }
-        let seg: (Kind, String) = (inThink ? .thought : .message, buffer)
-        buffer = ""
-        return [seg]
-    }
-}
 
 /// Which engine generates. Chosen once at launch (`--backend`), never at runtime: the two
 /// have different lifecycles - the MLX path loads a model container into this process and

@@ -56,12 +56,21 @@ packages:
 
 targets:
   # Foundation-only chunker for the map mode. Its own target so its logic can be tested
-  # WITHOUT linking MLX/Metal - see the ChunkingTests scheme, which builds only this.
+  # WITHOUT linking MLX/Metal - see the UnitTests scheme, which builds neither.
   Chunking:
     type: library.static
     platform: macOS
     sources:
       - Sources/Chunking
+
+  # Foundation-only text classification (ThinkSplitter). Same rationale as Chunking: it is
+  # pure string logic, so keeping it out of the MLX-linking tool target is what makes it
+  # testable in seconds rather than after a full Metal build.
+  AgentText:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/AgentText
 
   mlx-agent:
     type: tool
@@ -70,6 +79,7 @@ targets:
       - Sources/mlx-agent
     dependencies:
       - target: Chunking
+      - target: AgentText
       # mlx-swift-lm 3.x decoupled swift-transformers into an opt-in integration: the
       # MLXHuggingFace macros expand to code referencing Tokenizers, so the CONSUMER must
       # supply it. That is why swift-transformers is here though mlx-swift-lm does not
@@ -102,6 +112,17 @@ targets:
         # coverage - that stays on the schemes, see the header.)
         GENERATE_INFOPLIST_FILE: YES
 
+  AgentTextTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/AgentTextTests
+    dependencies:
+      - target: AgentText
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   # Ships the tool. This is what the applet's binary is built from.
   mlx-agent:
@@ -118,14 +139,17 @@ schemes:
     archive:
       config: Debug
 
-  # Fast, MLX-free unit tests: depends only on Chunking, so neither MLX nor the Metal
-  # toolchain is compiled. This is what `swift test` used to give us.
-  ChunkingTests:
+  # Fast, MLX-free unit tests: every target here depends only on Foundation-only libraries,
+  # so neither MLX nor the Metal toolchain is compiled. This is what `swift test` used to
+  # give us. Add a test bundle to BOTH lists below when adding one.
+  UnitTests:
     build:
       targets:
         ChunkingTests: [test]
+        AgentTextTests: [test]
     test:
       config: Debug
       gatherCoverageData: false
       targets:
         - ChunkingTests
+        - AgentTextTests

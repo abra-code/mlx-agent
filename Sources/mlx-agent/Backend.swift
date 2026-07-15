@@ -15,8 +15,30 @@
 //   OpenAIBackend - a remote OpenAI-compatible /chat/completions endpoint (llama-server).
 
 import Foundation
-import MLXLLM
 import MLXLMCommon
+import MLXLLM
+
+/// What one model pass emits. This is MLXLMCommon's `Generation` plus the one case it has
+/// no room for: reasoning the SERVER already separated out.
+///
+/// `Generation` is a closed public enum (`chunk` / `toolCall` / `info`), so `.reasoning`
+/// cannot be added to it. The distinction has to survive the trip to Agent, because the
+/// two kinds of reasoning arrive with different certainty:
+///   .text      - raw model output. May carry inline <think> markers; ThinkSplitter has to
+///                parse it to find out, and a marker may straddle chunk boundaries.
+///   .reasoning - llama-server ALREADY classified this (`reasoning_content`). It must
+///                bypass ThinkSplitter: re-parsing text that is known to be reasoning would
+///                let a literal "</think>" inside it close the block early and spill the
+///                remainder into the visible answer - the very bug class this all exists to
+///                prevent.
+enum BackendEvent: Sendable {
+    /// Raw model text, to be classified by ThinkSplitter.
+    case text(String)
+    /// Text the backend knows is reasoning; goes straight to thought.
+    case reasoning(String)
+    case toolCall(ToolCall)
+    case info(GenerateCompletionInfo)
+}
 
 /// The generation seam the agent loop runs against.
 protocol GenerationBackend: AnyObject, Sendable {
@@ -28,7 +50,7 @@ protocol GenerationBackend: AnyObject, Sendable {
     /// until the model stops. Tool calls surface as `.toolCall` items - the CALLER
     /// (Agent.runTurn) dispatches them and feeds `.tool(...)` results back on the next
     /// call. The backend preserves conversational state (KV cache) across calls.
-    func stream(_ messages: [Chat.Message]) -> AsyncThrowingStream<Generation, Error>
+    func stream(_ messages: [Chat.Message]) -> AsyncThrowingStream<BackendEvent, Error>
 
     /// Reset conversational state, keeping configuration (instructions/tools).
     func clear() async
@@ -54,8 +76,29 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
         set { session.tools = newValue }
     }
 
-    func stream(_ messages: [Chat.Message]) -> AsyncThrowingStream<Generation, Error> {
-        session.streamDetails(to: messages)
+    /// The library's `Generation` values, relabelled as `BackendEvent`. This path never
+    /// yields `.reasoning`: mlx-swift-lm streams raw text, so any <think> markers are
+    /// inline and it is ThinkSplitter's job to find them.
+    func stream(_ messages: [Chat.Message]) -> AsyncThrowingStream<BackendEvent, Error> {
+        let upstream = session.streamDetails(to: messages)
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    for try await generation in upstream {
+                        switch generation {
+                        case .chunk(let text): continuation.yield(.text(text))
+                        case .toolCall(let call): continuation.yield(.toolCall(call))
+                        case .info(let info): continuation.yield(.info(info))
+                        @unknown default: break
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     func clear() async {
@@ -223,7 +266,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
 
     // MARK: - Streaming
 
-    func stream(_ new: [Chat.Message]) -> AsyncThrowingStream<Generation, Error> {
+    func stream(_ new: [Chat.Message]) -> AsyncThrowingStream<BackendEvent, Error> {
         lock.withLock {
             flushAbandonedTextLocked()   // an abandoned answer lands BEFORE this pass's input
             messages.append(contentsOf: new)
@@ -255,11 +298,11 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
         }
     }
 
-    /// One model pass: POST the running conversation, parse the SSE frames into Generation
-    /// values, and append the assistant turn (text + any tool calls) to `messages` before
-    /// returning, so the next pass carries it.
+    /// One model pass: POST the running conversation, parse the SSE frames into
+    /// BackendEvent values, and append the assistant turn (text + any tool calls) to
+    /// `messages` before returning, so the next pass carries it.
     private func runStream(
-        continuation: AsyncThrowingStream<Generation, Error>.Continuation, handle: URLTaskHandle
+        continuation: AsyncThrowingStream<BackendEvent, Error>.Continuation, handle: URLTaskHandle
     ) async throws {
         let request = try buildRequest()
         let started = Date()
@@ -283,7 +326,12 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
             throw Self.error("llama-server returned HTTP \(http.statusCode): \(body)")
         }
 
-        var text = ""                      // accumulated assistant content, <think> tags VERBATIM
+        // Accumulated assistant content. Reasoning is deliberately NOT part of it: with
+        // reasoning_format "auto" the server hands reasoning over separately, and the
+        // history we send back should carry the answer the model committed to, not its
+        // scratchpad. (Keeping it in would re-feed a previous turn's <|channel|>analysis
+        // back through the chat template as ordinary assistant content.)
+        var text = ""
         var calls = ToolCallAccumulator()
         var usage: (prompt: Int, completion: Int)? = nil
         var firstToken: Date? = nil
@@ -312,13 +360,22 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
             }
             guard let choice = (frame["choices"] as? [[String: Any]])?.first else { continue }
             if let delta = choice["delta"] as? [String: Any] {
+                // Reasoning the server split out for us (`reasoning_content`; some servers
+                // spell it `reasoning`). Streamed to the client as thought, but kept OUT of
+                // `text` - see the declaration of `text` above.
+                let reasoning = (delta["reasoning_content"] as? String)
+                    ?? (delta["reasoning"] as? String)
+                if let reasoning, !reasoning.isEmpty {
+                    if firstToken == nil { firstToken = Date() }
+                    continuation.yield(.reasoning(reasoning))
+                }
                 if let chunk = delta["content"] as? String, !chunk.isEmpty {
                     if firstToken == nil { firstToken = Date() }
                     text += chunk
                     // Publish as we go: if this pass never reaches its commit below, the
                     // next one flushes this text instead of losing it.
                     lock.withLock { abandonedText = text }
-                    continuation.yield(.chunk(chunk))
+                    continuation.yield(.text(chunk))
                 }
                 if let raw = delta["tool_calls"] as? [[String: Any]] {
                     if firstToken == nil { firstToken = Date() }
@@ -368,9 +425,16 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
             "messages": wire,
             "stream": true,
             "stream_options": ["include_usage": true],
-            // Raw <think> tags in delta.content: ThinkSplitter already routes them to
-            // agent_thought_chunk, and KV-cache parity wants them kept in the history.
-            "reasoning_format": "none",
+            // Let the server separate reasoning into `reasoning_content` (we forward it as
+            // .reasoning). NOT "none": that leaves reasoning inline in content as RAW
+            // markers, and the markers are per-family - gpt-oss emits harmony
+            // (<|channel|>analysis<|message|>...<|end|>), which ThinkSplitter does not know
+            // and would render verbatim in the answer. llama-server already has a parser per
+            // family, so this is its job, not ours. Measured on llama-server 9553: tool_calls
+            // are parsed identically under "none" and "auto" - only reasoning placement
+            // differs. The MLX backend has no server to do this and still relies on
+            // ThinkSplitter.
+            "reasoning_format": "auto",
             "temperature": Self.round6(parameters.temperature),
         ]
         if let maxTokens = parameters.maxTokens { body["max_tokens"] = maxTokens }

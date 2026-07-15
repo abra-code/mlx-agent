@@ -15,6 +15,20 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "981EF93A726A4AC29F24A634"
+               BuildableName = "AgentTextTests.xctest"
+               BlueprintName = "AgentTextTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "93BD050B09E36500AF89B48A"
                BuildableName = "ChunkingTests.xctest"
                BlueprintName = "ChunkingTests"
@@ -32,9 +46,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "93BD050B09E36500AF89B48A"
-            BuildableName = "ChunkingTests.xctest"
-            BlueprintName = "ChunkingTests"
+            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
+            BuildableName = "AgentTextTests.xctest"
+            BlueprintName = "AgentTextTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -47,6 +61,17 @@
                BlueprintIdentifier = "93BD050B09E36500AF89B48A"
                BuildableName = "ChunkingTests.xctest"
                BlueprintName = "ChunkingTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "981EF93A726A4AC29F24A634"
+               BuildableName = "AgentTextTests.xctest"
+               BlueprintName = "AgentTextTests"
                ReferencedContainer = "container:mlx-agent.xcodeproj">
             </BuildableReference>
          </TestableReference>
@@ -67,9 +92,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "93BD050B09E36500AF89B48A"
-            BuildableName = "ChunkingTests.xctest"
-            BlueprintName = "ChunkingTests"
+            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
+            BuildableName = "AgentTextTests.xctest"
+            BlueprintName = "AgentTextTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -83,9 +108,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "93BD050B09E36500AF89B48A"
-            BuildableName = "ChunkingTests.xctest"
-            BlueprintName = "ChunkingTests"
+            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
+            BuildableName = "AgentTextTests.xctest"
+            BlueprintName = "AgentTextTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
