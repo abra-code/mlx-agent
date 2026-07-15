@@ -457,22 +457,29 @@ final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
 }
 
 func runOneshot(
-    model dir: String, prompt: String, mcpConfigPath: String?,
+    engine: EngineSpec, prompt: String, mcpConfigPath: String?,
     guardrails: AgentGuardrails, autoPermission: PermissionOutcome,
     systemPrompt: String?, gen: GenConfig, extraEOSTokens: Set<String>
 ) async throws -> Int {
-    let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
-    let session = ChatSession(
-        container,
-        instructions: systemPrompt,
-        generateParameters: gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0)))
+    let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0))
+    let backend: GenerationBackend
+    switch engine {
+    case .mlx(let dir):
+        let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
+        backend = MLXBackend(
+            ChatSession(container, instructions: systemPrompt, generateParameters: parameters))
+    case .openai(let baseURL):
+        // No model to load and no RAM gate to run: the weights live in llama-server.
+        try await OpenAIBackend.waitForHealth(baseURL: baseURL)
+        backend = OpenAIBackend(
+            baseURL: baseURL, parameters: parameters, systemPrompt: systemPrompt)
+    }
 
     var registry: MCPToolRegistry? = nil
     if let mcpConfigPath {
         registry = await MCPToolRegistry.build(try MCPConfigLoader.load(mcpConfigPath))
     }
 
-    let backend = MLXBackend(session)
     let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
     let delegate = ConsoleAgentDelegate(autoPermission: autoPermission)
     agent.delegate = delegate  // held by this local for the duration of the turn
@@ -580,11 +587,13 @@ func usage() {
         mlx-agent - native MLX ACP agent (chat + tools)
 
         USAGE:
-          mlx-agent acp     [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
+          mlx-agent acp     [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                            [--mcp-config <json>] [--mode chat|agent] [guardrails]
                                                           ACP server over stdio (chat + agentic tools);
                                                           session/prime replaces the session context with a
                                                           supplied transcript (resume/fresh, see docs/session-prime.md)
-          mlx-agent oneshot [--model <dir>] --prompt <text> [--mcp-config <json>]
+          mlx-agent oneshot [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                            --prompt <text> [--mcp-config <json>]
                             [--auto-permission allow|deny] [guardrails]
                                                           run one agent turn, print to stdout
           mlx-agent gate    [--model <dir>]               built-in tool-calling gate
@@ -606,7 +615,16 @@ func usage() {
                                                           loads no model
 
         OPTIONS:
-          --model <dir>            model directory (or set MLX_AGENT_MODEL; required if neither)
+          --backend mlx|openai     generation engine for acp/oneshot (default: mlx).
+                                   mlx    = in-process mlx-swift-lm on a safetensors --model
+                                   openai = a remote OpenAI-compatible --base-url (llama-server);
+                                            no model is loaded here and the RAM gate is skipped
+          --base-url <url>         OpenAI-compatible endpoint root, required by --backend openai
+                                   (e.g. http://127.0.0.1:8099/v1); its /health is checked at
+                                   session/new. The MODEL is whatever that server was launched
+                                   with - it is not switchable from here.
+          --model <dir>            model directory (or set MLX_AGENT_MODEL; required by the
+                                   mlx backend and by gate/chat/map)
           --prompt <text>          prompt for chat/oneshot mode
           --spool <dir>            spool directory for map mode (job.json in, status/result out)
           --mcp-config <json>      stdio-direct MCP server config (enables tools)
@@ -635,6 +653,7 @@ func usage() {
 
         EXAMPLES:
           mlx-agent acp --mcp-config /path/to/mcp.json
+          mlx-agent acp --backend openai --base-url http://127.0.0.1:8099/v1 --mcp-config mcp.json
           mlx-agent acp --system-prompt "" --temperature 0 --max-new-tokens 2048
           mlx-agent oneshot --prompt "Read /etc/hosts" --mcp-config mcp.json --auto-permission allow
           mlx-agent gate
@@ -748,13 +767,39 @@ func requireModelDir() -> String {
     return dir
 }
 
+/// Resolve `--backend mlx|openai` (default mlx) into the engine the acp/oneshot modes run.
+/// The model directory is required ONLY by the mlx path - resolving the engine before
+/// asking for it is what lets `--backend openai` run with no --model at all (its weights
+/// live in llama-server, which the applet owns).
+func resolveEngine(_ args: [String]) -> EngineSpec {
+    switch option("--backend", in: args)?.lowercased() ?? "mlx" {
+    case "mlx":
+        return .mlx(modelDir: requireModelDir())
+    case "openai":
+        guard let raw = option("--base-url", in: args), let url = URL(string: raw),
+            url.scheme != nil, url.host != nil
+        else {
+            FileHandle.standardError.write(
+                Data(
+                    "--backend openai requires --base-url <url>, e.g. http://127.0.0.1:8099/v1\n"
+                        .utf8))
+            exit(2)
+        }
+        return .openai(baseURL: url)
+    case let other:
+        FileHandle.standardError.write(
+            Data("unknown --backend \"\(other)\": expected mlx or openai\n".utf8))
+        exit(2)
+    }
+}
+
 let extraEOSTokens = parseExtraEOSTokens(cliArgs)
 
 do {
     switch mode {
     case "acp":
         await ACPServer(
-            modelDir: requireModelDir(),
+            engine: resolveEngine(cliArgs),
             mcpConfigPath: option("--mcp-config", in: cliArgs),
             guardrails: parseGuardrails(cliArgs),
             initialMode: option("--mode", in: cliArgs),
@@ -768,7 +813,7 @@ do {
             exit(2)
         }
         let code = try await runOneshot(
-            model: requireModelDir(), prompt: prompt,
+            engine: resolveEngine(cliArgs), prompt: prompt,
             mcpConfigPath: option("--mcp-config", in: cliArgs),
             guardrails: parseGuardrails(cliArgs),
             autoPermission: parseAutoPermission(cliArgs),

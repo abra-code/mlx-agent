@@ -94,6 +94,10 @@ def collect_updates(store):
             return
         up = msg.get("params", {}).get("update", {})
         kind = up.get("sessionUpdate")
+        # usage_update carries token counters, not content: keep the whole update.
+        if kind == "usage_update":
+            store["_usage"] = up
+            return
         store.setdefault(kind, "")
         store[kind] += content_text(up.get("content"))
     return handler
@@ -101,8 +105,13 @@ def collect_updates(store):
 def main():
     if len(sys.argv) < 2:
         print("usage: acp_smoke.py /path/to/mlx-agent [--model <dir>]")
+        print("       acp_smoke.py /path/to/mlx-agent --backend openai --base-url <url>")
         sys.exit(2)
-    argv = [sys.argv[1], "acp"] + sys.argv[2:]
+    passthrough = sys.argv[2:]
+    argv = [sys.argv[1], "acp"] + passthrough
+    # The openai backend talks to a server the applet owns, so it exposes no model picker
+    # (see ACPServer.configOptionsJSON); the expectations below flip accordingly.
+    openai = "openai" in passthrough
     agent = Agent(argv)
     fails = 0
 
@@ -134,10 +143,14 @@ def main():
         opts = res.get("configOptions", [])
         model_opt = next((o for o in opts if o.get("id") == "model"), None)
         check("session/new", isinstance(sid, str) and bool(sid), f"sessionId={sid}")
-        check("configOptions has model select",
-              model_opt is not None and model_opt.get("type") == "select"
-              and len(model_opt.get("options", [])) >= 1,
-              f"current={model_opt.get('currentValue') if model_opt else None}")
+        if openai:
+            check("configOptions omits the applet-managed model select",
+                  model_opt is None, f"ids={[o.get('id') for o in opts]}")
+        else:
+            check("configOptions has model select",
+                  model_opt is not None and model_opt.get("type") == "select"
+                  and len(model_opt.get("options", [])) >= 1,
+                  f"current={model_opt.get('currentValue') if model_opt else None}")
 
         # 3. session/prompt - streamed
         store = {}
@@ -152,6 +165,9 @@ def main():
               f"message={msg_text.strip()[:80]!r}")
         check("session/prompt stopReason", stop == "end_turn", f"stopReason={stop}")
         check("answer mentions Paris", "paris" in msg_text.lower(), "")
+        usage = store.get("_usage") or {}
+        check("session/prompt reports usage", isinstance(usage.get("used"), int)
+              and usage["used"] > 0, f"usage={usage}")
         if "agent_thought_chunk" in store:
             print(f"       (thought captured, {len(store['agent_thought_chunk'])} chars - folded reasoning path works)")
 
@@ -270,6 +286,33 @@ def main():
         r = agent.await_response(rid, timeout=30)
         check("session/prime rejects unknown session", r.get("error", {}).get("code") == -32602,
               f"error={r.get('error')}")
+
+        # 10. Priming UNDER a running turn must be refused rather than swapping the stack
+        # out from under it. Both requests are dispatched from the same stdin reader, so
+        # the prime provably arrives while the prompt task is live.
+        prompt_id = agent.send("session/prompt", {
+            "sessionId": sid,
+            "prompt": [{"type": "text",
+                        "text": "Count slowly from 1 to 300, one number per line."}],
+        })
+        prime_id = agent.send("session/prime", {
+            "sessionId": sid,
+            "messages": [{"role": "user", "content": "too late"}],
+        })
+        r = agent.await_response(prime_id, timeout=60)
+        check("session/prime is refused during a prompt", r.get("error", {}).get("code") == -32003,
+              f"error={r.get('error')}")
+        agent.send("session/cancel", {"sessionId": sid}, notify=True)
+        agent.await_response(prompt_id, timeout=60)  # drain the turn before moving on
+
+        # 11. The model is applet-managed on the openai backend: llama-server is restarted
+        # by the applet, so a model switch here must be refused, not silently accepted.
+        if openai:
+            rid = agent.send("session/set_config_option",
+                             {"sessionId": sid, "configId": "model", "value": "anything"})
+            r = agent.await_response(rid, timeout=30)
+            check("model switch refused on the openai backend",
+                  r.get("error", {}).get("code") == -32601, f"error={r.get('error')}")
 
     except Exception as e:
         print(f"[FAIL] exception: {e!r}")

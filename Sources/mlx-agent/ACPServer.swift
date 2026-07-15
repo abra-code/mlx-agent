@@ -70,6 +70,15 @@ final class ThinkSplitter {
     }
 }
 
+/// Which engine generates. Chosen once at launch (`--backend`), never at runtime: the two
+/// have different lifecycles - the MLX path loads a model container into this process and
+/// can switch models on the fly, while the openai path talks to a server the APPLET owns
+/// (it launches, restarts and reaps llama-server), so model choice is not ours to make.
+enum EngineSpec: Sendable {
+    case mlx(modelDir: String)
+    case openai(baseURL: URL)
+}
+
 final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // Resolved once from the CLI (see resolveSystemPrompt): nil means NO system message is
@@ -80,14 +89,19 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private let extraEOSTokens: Set<String>
     private let lock = NSLock()
 
+    /// openai: the endpoint root. nil selects the MLX path - the ONE branch condition, set
+    /// in init and never mutated, so no lock is needed to read it.
+    private let openaiBaseURL: URL?
+    /// MLX path only; "" on the openai backend (the applet decides what llama-server serves).
     private var currentModelDir: String
     private let mcpConfigPath: String?
     private let guardrails: AgentGuardrails
     private var mode: String
 
+    // MLX-only: the loaded weights and the session driving them.
     private var container: ModelContainer?
     private var session: ChatSession?
-    private var backend: MLXBackend?
+    private var backend: GenerationBackend?
     private var agent: Agent?
     private var registry: MCPToolRegistry?
     private var registryBuildTask: Task<MCPToolRegistry?, Never>?
@@ -103,12 +117,19 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private var pendingPermissions: [Int: CheckedContinuation<PermissionOutcome, Never>] = [:]
 
     init(
-        modelDir: String, mcpConfigPath: String? = nil,
+        engine: EngineSpec, mcpConfigPath: String? = nil,
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
         systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
         extraEOSTokens: Set<String> = []
     ) {
-        self.currentModelDir = modelDir
+        switch engine {
+        case .mlx(let modelDir):
+            self.currentModelDir = modelDir
+            self.openaiBaseURL = nil
+        case .openai(let baseURL):
+            self.currentModelDir = ""
+            self.openaiBaseURL = baseURL
+        }
         self.mcpConfigPath = mcpConfigPath
         self.guardrails = guardrails
         self.systemPrompt = systemPrompt
@@ -121,7 +142,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // MARK: - Run loop
 
     func serve() async {
-        log("ACP server ready (stdio JSON-RPC). initial model: \(currentModelDir)")
+        if let openaiBaseURL {
+            log("ACP server ready (stdio JSON-RPC). backend: openai at \(openaiBaseURL.absoluteString)")
+        } else {
+            log("ACP server ready (stdio JSON-RPC). initial model: \(currentModelDir)")
+        }
         installSignalHandlers()
         let stdin = FileHandle.standardInput
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -243,6 +268,40 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // MARK: - Handlers
 
     private func handleNewSession(id: Int?) async {
+        if let openaiBaseURL {
+            await handleNewSessionOpenAI(id: id, baseURL: openaiBaseURL)
+        } else {
+            await handleNewSessionMLX(id: id)
+        }
+    }
+
+    /// openai: nothing to load - the applet already launched llama-server on a pinned port.
+    /// Health-check it so a dead server is ONE clean error here rather than a failure on
+    /// every prompt, then build the registry + stack exactly as the MLX path does.
+    private func handleNewSessionOpenAI(id: Int?, baseURL: URL) async {
+        do {
+            try await OpenAIBackend.waitForHealth(baseURL: baseURL)
+        } catch {
+            respondError(id, -32000, "session/new failed: \(error.localizedDescription)")
+            return
+        }
+        let registry = await ensureRegistry()
+        let (backend, agent) = buildOpenAIStack(baseURL: baseURL, history: [])
+        let sid = "mlx-session-1"
+        let modeNow = lock.withLock { () -> String in
+            self.backend = backend
+            self.agent = agent
+            self.sessionID = sid
+            return mode
+        }
+        let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
+        log(
+            "session ready: \(sid) on openai backend \(baseURL.absoluteString) "
+                + "[mode=\(modeNow), tools=\(toolCount)]")
+        respond(id, ["sessionId": sid, "configOptions": configOptionsJSON()])
+    }
+
+    private func handleNewSessionMLX(id: Int?) async {
         let dir = lock.withLock { currentModelDir }
         do {
             let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
@@ -296,6 +355,24 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         let modeNow = lock.withLock { mode }
         agent.setToolsEnabled(modeNow == "agent")
         return (session, backend, agent)
+    }
+
+    /// The openai counterpart of buildSessionStack: no container, no ChatSession - the
+    /// backend holds the conversation itself. Same generation defaults (0.7 / 4096 overlaid
+    /// with the CLI's --temperature etc.), same registry + mode re-application.
+    private func buildOpenAIStack(
+        baseURL: URL, history: [Chat.Message]
+    ) -> (OpenAIBackend, Agent) {
+        let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
+        let backend = OpenAIBackend(
+            baseURL: baseURL, parameters: parameters, systemPrompt: systemPrompt,
+            seedHistory: history)
+        let registry = lock.withLock { self.registry }
+        let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+        agent.delegate = self
+        let modeNow = lock.withLock { mode }
+        agent.setToolsEnabled(modeNow == "agent")
+        return (backend, agent)
     }
 
     /// Build the MCP registry on first use (idempotent). Concurrent callers share ONE
@@ -432,6 +509,14 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respond(id, ["configOptions": configOptionsJSON()])
 
         case "model":
+            // The applet owns llama-server, so it restarts the server to change models and
+            // deliberately does NOT re-inject the transport - the conversation array here
+            // survives, which IS the desired continue-with-a-new-model semantics. Nothing
+            // for us to switch, and silently succeeding would be a lie.
+            if openaiBaseURL != nil {
+                respondError(id, -32601, "model is applet-managed on the openai backend")
+                return
+            }
             guard let target = availableModels().first(where: { $0.value == value }) else {
                 respondError(id, -32602, "unknown model: \(value)")
                 return
@@ -469,7 +554,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// pays the prefill and its usage_update includes the history tokens.
     private func handleSessionPrime(id: Int?, params: [String: Any]) {
         let (container, ourSid) = lock.withLock { (self.container, self.sessionID) }
-        guard let container, let ourSid else {
+        guard let ourSid else {
             respondError(id, -32002, "no active session; call session/new first")
             return
         }
@@ -482,7 +567,21 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
         let history = Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) }
-        let (session, backend, agent) = buildSessionStack(container: container, history: history)
+        // Rebuild the stack around the restored history. The openai backend needs nothing
+        // but the history itself; the MLX one additionally needs its loaded weights.
+        let session: ChatSession?
+        let backend: GenerationBackend
+        let agent: Agent
+        if let openaiBaseURL {
+            let (b, a) = buildOpenAIStack(baseURL: openaiBaseURL, history: history)
+            (session, backend, agent) = (nil, b, a)
+        } else if let container {
+            let (s, b, a) = buildSessionStack(container: container, history: history)
+            (session, backend, agent) = (s, b, a)
+        } else {
+            respondError(id, -32002, "no active session; call session/new first")
+            return
+        }
         // Refuse to swap the stack under a running turn. Checked inside the same lock
         // that publishes the swap, so a prompt accepted before us keeps its stack and
         // we bail; the client's ordering contract (cancel + await resolution before
@@ -750,19 +849,22 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 (registry?.toolSpecs.isEmpty == false)
             )
         }
-        let choices = availableModels().map {
-            ["value": $0.value, "name": $0.value] as [String: Any]
-        }
-        var options: [[String: Any]] = [
-            [
+        var options: [[String: Any]] = []
+        // No model option on the openai backend: the applet picks the gguf and restarts
+        // llama-server itself, so offering a picker here would be a dead control.
+        if openaiBaseURL == nil {
+            let choices = availableModels().map {
+                ["value": $0.value, "name": $0.value] as [String: Any]
+            }
+            options.append([
                 "id": "model",
                 "name": "Model",
                 "category": "model",
                 "currentValue": current,
                 "type": "select",
                 "options": choices,
-            ]
-        ]
+            ])
+        }
         // Only surface the chat/agent toggle when there are tools to enable.
         if haveTools {
             options.append([
