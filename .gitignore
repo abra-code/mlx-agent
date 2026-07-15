@@ -1,6 +1,12 @@
 .build/
 .swiftpm/
-*.xcodeproj
+# mlx-agent.xcodeproj IS committed - it is generated from project.yml by `xcodegen generate`,
+# but it carries the two shared schemes (both with coverage off) and the resolved dependency
+# pins (project.xcworkspace/xcshareddata/swiftpm/Package.resolved), so it has to be in the
+# repo. Only the per-user state inside it is ignored.
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 DerivedData/
 .DS_Store
 Private/

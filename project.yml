@@ -1,0 +1,131 @@
+# mlx-agent - XcodeGen manifest. Regenerate with: xcodegen generate
+#
+# This is the SINGLE source of truth for targets, dependencies, pins and build settings.
+# There is no Package.swift: MLX's Metal shaders cannot be built by SwiftPM's command line
+# (see README "Building"), so the build has to go through xcodebuild anyway - and a package
+# plus a project meant two dependency graphs and two Package.resolved files that could drift.
+#
+# SETTINGS DO NOT REACH THE SPM PACKAGE TARGETS. READ THIS BEFORE ADDING ANY:
+# Everything under `settings:` here applies to OUR targets only. The package dependencies build
+# as their own generated projects (e.g. target 'mlx-swift_Cmlx' from project 'mlx-swift') and
+# take their settings from their own manifests - measured, not assumed. So a setting added here
+# to influence a dependency is inert: it will resolve in `-showBuildSettings`, look applied, and
+# do nothing. (Only an xcodebuild command-line override reaches package targets, and that is not
+# available to Xcode GUI builds - so it is not a fix either.)
+#
+# CODE COVERAGE is the case that bit us, and it is the exception that proves the rule: coverage
+# is a SCHEME-level setting, so it DOES apply to the whole build graph - every dependency as well
+# as our own targets. Control it ONLY on the schemes below (both pin gatherCoverageData: false).
+# Do not try to control it with `settings:`: per-target settings never reach the package targets,
+# so you get a MIXED binary (deps instrumented, product not) - worse than either extreme, because
+# the partial size drop reads as success. Verify the shipped binary with:
+#     otool -l <binary> | grep -c __llvm_prf_cnts     # must be 0
+# NOT with `nm | grep __llvm_prf`: nm reports 0 for a small instrumented binary (false clean).
+name: mlx-agent
+
+options:
+  minimumXcodeGenVersion: "2.45.0"
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "14.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    # arm64-only: mlx-agent is Metal/MLX and never runs on Intel (the universal OMC applet
+    # that embeds it is thinned at packaging time).
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+
+packages:
+  # Pins mirror the graph that Package.resolved held; keep them and README's "Dependency pins"
+  # in step. mlx-swift is upToNextMinor to match what mlx-swift-lm expects.
+  mlx-swift-lm:
+    url: https://github.com/ml-explore/mlx-swift-lm
+    majorVersion: 3.31.4
+  mlx-swift:
+    url: https://github.com/ml-explore/mlx-swift
+    minorVersion: 0.31.4
+  swift-transformers:
+    url: https://github.com/huggingface/swift-transformers
+    majorVersion: 1.3.0
+  swift-sdk:
+    url: https://github.com/modelcontextprotocol/swift-sdk
+    majorVersion: 0.9.0
+
+targets:
+  # Foundation-only chunker for the map mode. Its own target so its logic can be tested
+  # WITHOUT linking MLX/Metal - see the ChunkingTests scheme, which builds only this.
+  Chunking:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/Chunking
+
+  mlx-agent:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/mlx-agent
+    dependencies:
+      - target: Chunking
+      # mlx-swift-lm 3.x decoupled swift-transformers into an opt-in integration: the
+      # MLXHuggingFace macros expand to code referencing Tokenizers, so the CONSUMER must
+      # supply it. That is why swift-transformers is here though mlx-swift-lm does not
+      # depend on it.
+      - package: mlx-swift-lm
+        product: MLXLLM
+      - package: mlx-swift-lm
+        product: MLXLMCommon
+      - package: mlx-swift-lm
+        product: MLXHuggingFace
+      - package: mlx-swift
+        product: MLX
+      - package: swift-transformers
+        product: Tokenizers
+      # MCP stdio tool clients (one per configured server) speak MCP directly - no mcp-proxy.
+      - package: swift-sdk
+        product: MCP
+
+  ChunkingTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/ChunkingTests
+    dependencies:
+      - target: Chunking
+    settings:
+      base:
+        # A unit-test BUNDLE must be code-signed and therefore needs an Info.plist; the tool
+        # target does not. Let Xcode synthesize it rather than checking one in. (Unrelated to
+        # coverage - that stays on the schemes, see the header.)
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  # Ships the tool. This is what the applet's binary is built from.
+  mlx-agent:
+    build:
+      targets:
+        mlx-agent: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: false
+    profile:
+      config: Debug
+    archive:
+      config: Debug
+
+  # Fast, MLX-free unit tests: depends only on Chunking, so neither MLX nor the Metal
+  # toolchain is compiled. This is what `swift test` used to give us.
+  ChunkingTests:
+    build:
+      targets:
+        ChunkingTests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - ChunkingTests
