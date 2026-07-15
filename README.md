@@ -16,6 +16,8 @@ mlx-agent oneshot   [--model <dir>] --prompt <text> [--mcp-config <json>]
 mlx-agent chat      [--model <dir>] --prompt <text>
 mlx-agent translate --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
 mlx-agent gate      [--model <dir>]
+mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
+                    [--prefill-step <n>]
 ```
 
 - **acp** - ACP server over stdio (chat + agentic tools). See below.
@@ -25,6 +27,14 @@ mlx-agent gate      [--model <dir>]
 - **translate** - long-lived, spool-driven translator. See below.
 - **gate** - a self-contained tool-calling correctness check (a handful of fixed cases),
   useful to catch a regression in the underlying engine without the full ACP stack.
+- **bench** - inference speed benchmark using the methodology of Apple's M5 MLX post
+  (machinelearning.apple.com/research/exploring-llms-mlx-m5): a 4096-token prompt, 128
+  generated tokens, warmup plus 3 timed runs; reports TTFT, prefill tok/s, generation
+  tok/s, and peak GPU memory, plus a `RESULT_JSON:` line for machine comparison.
+  `tools/bench_reference.sh` wraps it with the reference model (Qwen3-8B-4bit) for
+  running across machines. Numbers are only comparable on AC power on a COOL machine:
+  a fanless Air throttles the GPU by ~40% for minutes after a sustained CPU load
+  (e.g. a build).
 
 Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
 (60), `--tool-result-bytes <n>` (32768).

@@ -613,6 +613,15 @@ func usage() {
                                                           dump their tool surface (exposed names,
                                                           descriptions, schemas, gating) as JSON;
                                                           loads no model
+          mlx-agent bench   --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
+                            [--prefill-step <n>]
+                                                          inference benchmark (Apple's M5 post
+                                                          methodology: 4096-token prompt, 128
+                                                          generated tokens; reports TTFT, prefill
+                                                          and generation tok/s, peak memory;
+                                                          --prefill-step overrides the library's
+                                                          512-token prompt chunking; 2048 matches
+                                                          mlx_lm's default, measured equal on M5)
 
         OPTIONS:
           --backend mlx|openai     generation engine for acp/oneshot (default: mlx).
@@ -848,6 +857,15 @@ do {
             exit(2)
         }
         exit(Int32(await runToolsDump(mcpConfigPath: cfg)))
+    case "bench":
+        let code = try await runBench(
+            model: requireModelDir(),
+            promptTokens: max(1, intOption("--prompt-tokens", in: cliArgs) ?? 4096),
+            genTokens: max(1, intOption("--gen-tokens", in: cliArgs) ?? 128),
+            runs: max(1, intOption("--runs", in: cliArgs) ?? 3),
+            prefillStep: intOption("--prefill-step", in: cliArgs).map { max(64, $0) },
+            extraEOSTokens: extraEOSTokens)
+        exit(Int32(code))
     default:
         usage()
     }
