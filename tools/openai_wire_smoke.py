@@ -36,10 +36,15 @@ script = []                 # queued responses, one per call
 def sse(chunks):
     return "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
 
-def tool_call_response():
-    """An assistant turn that emits one tool call, split across deltas like llama-server."""
+def tool_call_response(preamble="Let me check. "):
+    """An assistant turn that emits one tool call, split across deltas like llama-server.
+
+    `preamble=""` is the realistic text-less announcement (models routinely call a tool with
+    no preamble). It matters: with no text, an announcement stripped as unanswered loses its
+    whole message, so the turn's user message ends up adjacent to the next one.
+    """
     return sse([
-        {"choices": [{"delta": {"content": "Let me check. "}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": preamble}, "finish_reason": None}]},
         {"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": "call_abc", "type": "function",
              "function": {"name": "get_current_time", "arguments": ""}}]}, "finish_reason": None}]},
@@ -57,6 +62,10 @@ def text_response(text="Done."):
         {"choices": [{"delta": {}, "finish_reason": "stop"}],
          "usage": {"prompt_tokens": 10, "completion_tokens": 3}},
     ])
+
+def error_response():
+    """A 500 with a JSON body: what a llama-server being restarted under us looks like."""
+    return ("HTTP_ERROR", 500, '{"error":{"message":"model is being reloaded"}}')
 
 def slow_text_response():
     """Streams forever, a token at a time, so a cancel lands mid-answer."""
@@ -84,6 +93,13 @@ class Handler(BaseHTTPRequestHandler):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         requests_seen.append(json.loads(body))
         payload = script.pop(0) if script else text_response()
+        if isinstance(payload, tuple) and payload[0] == "HTTP_ERROR":
+            _, status, text = payload
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(text.encode())
+            return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -122,8 +138,11 @@ def main():
         sid = agent.await_response(agent.send("session/new", {"cwd": "/tmp", "mcpServers": []}),
                                    timeout=30)["result"]["sessionId"]
 
-        # Turn 1: the model announces a tool call; the cap ends the turn right after dispatch.
-        script.append(tool_call_response())
+        # Turn 1: the model announces a tool call with NO text preamble, and the cap ends the
+        # turn right after dispatch. Text-less is the harder case: the stripped announcement
+        # keeps nothing, so the assistant message disappears and only the normalization below
+        # stops this turn's user message from colliding with the next one.
+        script.append(tool_call_response(preamble=""))
         r = agent.await_response(agent.send("session/prompt", {
             "sessionId": sid, "prompt": [{"type": "text", "text": "what time is it?"}]}),
             on_update=collect_updates({}), timeout=60)
@@ -208,6 +227,76 @@ def main():
                   f"roles={roles}")
         finally:
             agent3.close()
+
+        # A turn that fails BEFORE producing a single token (the server 500s mid-session -
+        # what an applet-driven llama-server restart looks like) leaves nothing to flush, so
+        # only user-turn normalization keeps the next request well-formed.
+        requests_seen.clear()
+        script.append(error_response())
+        agent4 = Agent([sys.argv[1], "acp", "--backend", "openai", "--base-url", base])
+        try:
+            agent4.await_response(agent4.send("initialize", {"protocolVersion": 1}), timeout=30)
+            sid4 = agent4.await_response(agent4.send("session/new", {"cwd": "/tmp", "mcpServers": []}),
+                                         timeout=30)["result"]["sessionId"]
+            r = agent4.await_response(agent4.send("session/prompt", {
+                "sessionId": sid4, "prompt": [{"type": "text", "text": "first try"}]}),
+                on_update=collect_updates({}), timeout=60)
+            check("a zero-token server error fails the turn cleanly",
+                  "error" in r, f"got={list(r)}")
+            script.append(text_response("Hello."))
+            r = agent4.await_response(agent4.send("session/prompt", {
+                "sessionId": sid4, "prompt": [{"type": "text", "text": "second try"}]}),
+                on_update=collect_updates({}), timeout=60)
+            check("the next prompt still works after a failed turn",
+                  r.get("result", {}).get("stopReason") == "end_turn",
+                  f"stopReason={r.get('result', {}).get('stopReason')}")
+            roles = [m.get("role") for m in requests_seen[-1]["messages"]]
+            check("a zero-token failure leaves no two user turns in a row",
+                  not any(roles[i] == "user" and roles[i + 1] == "user"
+                          for i in range(len(roles) - 1)),
+                  f"roles={roles}")
+            merged = requests_seen[-1]["messages"][-1]["content"]
+            check("merging keeps both user messages", "first try" in merged and "second try" in merged,
+                  f"content={merged!r}")
+        finally:
+            agent4.close()
+
+        # session/prime accepts a PARTIALLY answered announcement (2 calls, 1 answered) and
+        # passes it through mid-transcript. Stripping the array wholesale would strand the
+        # answered tool message as an orphan - as malformed as the dangling announcement.
+        requests_seen.clear()
+        script.append(text_response("Sure."))
+        agent5 = Agent([sys.argv[1], "acp", "--backend", "openai", "--base-url", base])
+        try:
+            agent5.await_response(agent5.send("initialize", {"protocolVersion": 1}), timeout=30)
+            sid5 = agent5.await_response(agent5.send("session/new", {"cwd": "/tmp", "mcpServers": []}),
+                                         timeout=30)["result"]["sessionId"]
+            agent5.await_response(agent5.send("session/prime", {
+                "sessionId": sid5,
+                "messages": [
+                    {"role": "user", "content": "do two things"},
+                    {"role": "assistant", "content": "working",
+                     "toolCalls": [{"id": "tc-a", "name": "read_file", "arguments": {"path": "/a"}},
+                                   {"id": "tc-b", "name": "read_file", "arguments": {"path": "/b"}}]},
+                    {"role": "tool", "content": "A", "toolCallId": "tc-a"},
+                ]}), timeout=30)
+            agent5.await_response(agent5.send("session/prompt", {
+                "sessionId": sid5, "prompt": [{"type": "text", "text": "and now?"}]}),
+                on_update=collect_updates({}), timeout=60)
+            msgs = requests_seen[-1]["messages"]
+            orphans = [i for i, m in enumerate(msgs) if m.get("role") == "tool"
+                       and not (i > 0 and msgs[i - 1].get("tool_calls")
+                                and any(c.get("id") == m.get("tool_call_id")
+                                        for c in msgs[i - 1]["tool_calls"]))]
+            check("a partially answered announcement leaves no orphan tool message",
+                  not orphans, f"roles={[m.get('role') for m in msgs]}")
+            assistant = next((m for m in msgs if m.get("tool_calls")), None)
+            check("the answered call survives, the unanswered one is dropped",
+                  assistant is not None
+                  and [c["id"] for c in assistant["tool_calls"]] == ["tc-a"],
+                  f"tool_calls={assistant.get('tool_calls') if assistant else None}")
+        finally:
+            agent5.close()
 
     except Exception as e:
         print(f"[FAIL] exception: {e!r}")

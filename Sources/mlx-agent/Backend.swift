@@ -360,7 +360,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
 
     private func buildRequest() throws -> URLRequest {
         let (wire, specs) = lock.withLock {
-            (Self.wireMessages(messages), toolSpecs)
+            (Self.wireMessages(messages, log: { self.log($0) }), toolSpecs)
         }
         var body: [String: Any] = [
             // llama-server serves whatever model it was launched with; any id is accepted.
@@ -397,7 +397,9 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
     ///
     /// Normalizing HERE rather than on `messages` is forced by the library: `Chat.Message`'s
     /// tool storage is fileprivate, so the calls are only readable once serialized.
-    static func wireMessages(_ messages: [Chat.Message]) -> [[String: Any]] {
+    static func wireMessages(
+        _ messages: [Chat.Message], log: (String) -> Void = { _ in }
+    ) -> [[String: Any]] {
         let generator = DefaultMessageGenerator()
         let raw = messages.map { message -> [String: Any] in
             var out = generator.generate(message: message) as [String: Any]
@@ -415,30 +417,40 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
             }
             return out
         }
-        return stripUnansweredToolCalls(raw)
+        // Order matters: the strip can DELETE a text-less announcement, which is one of the
+        // ways two user turns end up adjacent - so merge after it, not before.
+        return mergeAdjacentUserTurns(stripUnansweredToolCalls(raw, log: log))
     }
 
-    /// Drop `tool_calls` that no following tool message answers, keeping the assistant's
-    /// text (and dropping the message when that leaves nothing) - exactly the rule
-    /// `ACPServer.primeHistory` enforces on a restored transcript, applied to the LIVE
-    /// conversation for the same reason: an announcement with no results leaves the chat
-    /// template mid-tool-turn, and llama-server renders that template server-side on every
-    /// single turn, so a strict template (Mistral-family `raise_exception`) would hard-fail
-    /// every subsequent prompt in the session, not just the turn that caused it.
+    /// Drop every `tool_calls` entry that no following tool message answers, keeping the
+    /// announcement's answered entries and its text (and dropping the message when that
+    /// leaves nothing) - the rule `ACPServer.primeHistory` enforces on a restored
+    /// transcript, applied to the LIVE conversation for the same reason: an announcement
+    /// with no results leaves the chat template mid-tool-turn, and llama-server renders that
+    /// template server-side on every single turn, so a strict template (Mistral-family
+    /// `raise_exception`) would hard-fail every subsequent prompt in the session, not just
+    /// the turn that caused it.
     ///
     /// This state is reachable and NOT a race: `Agent.runTurn` dispatches tool calls but
     /// only feeds the results back on its NEXT `stream(_:)` call, and it has exits that
     /// never make that call - the tool-iteration cap, a permission cancel, and a
     /// session/cancel landing during dispatch. All three are non-fatal, so the session
     /// lives on carrying the dangling announcement.
-    static func stripUnansweredToolCalls(_ raw: [[String: Any]]) -> [[String: Any]] {
+    ///
+    /// Filtering PER ENTRY rather than dropping the whole array matters for the partially
+    /// answered shape (2 calls announced, 1 answered), which `primeHistory` accepts and
+    /// passes through mid-transcript: dropping the array wholesale would leave the answered
+    /// tool message behind as an ORPHAN - the mirror image of the bug this exists to
+    /// prevent, and just as malformed.
+    static func stripUnansweredToolCalls(
+        _ raw: [[String: Any]], log: (String) -> Void = { _ in }
+    ) -> [[String: Any]] {
         var out: [[String: Any]] = []
         for (index, message) in raw.enumerated() {
             guard let entries = message["tool_calls"] as? [[String: Any]], !entries.isEmpty else {
                 out.append(message)
                 continue
             }
-            let announced = Set(entries.compactMap { $0["id"] as? String })
             // The answers are the contiguous run of tool messages right after this one.
             var answered: Set<String> = []
             var scan = index + 1
@@ -446,15 +458,50 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
                 if let id = raw[scan]["tool_call_id"] as? String { answered.insert(id) }
                 scan += 1
             }
-            if announced.isSubset(of: answered) && !announced.isEmpty {
+            // An entry with no id can never be answered (a tool message correlates by id),
+            // so it is unanswerable by construction and goes with the rest.
+            let kept = entries.filter { ($0["id"] as? String).map(answered.contains) ?? false }
+            if kept.count == entries.count {
                 out.append(message)
                 continue
             }
-            var stripped = message
-            stripped["tool_calls"] = nil
-            if let content = stripped["content"] as? String, !content.isEmpty {
-                out.append(stripped)
+            log("stripping \(entries.count - kept.count) unanswered tool call(s) from the wire history")
+            var fixed = message
+            let content = (fixed["content"] as? String) ?? ""
+            if kept.isEmpty {
+                fixed["tool_calls"] = nil
+                if !content.isEmpty { out.append(fixed) }
+            } else {
+                fixed["tool_calls"] = kept
+                out.append(fixed)
             }
+        }
+        return out
+    }
+
+    /// Collapse consecutive user turns into one, joined by a blank line.
+    ///
+    /// A pass that produced NO content leaves nothing for `flushAbandonedTextLocked` to
+    /// flush, so the conversation can genuinely hold two user turns in a row: the server
+    /// refused the connection (the applet restarting llama-server to switch models is
+    /// exactly this), Stop landed during prefill before the first token, or a text-less
+    /// tool-call announcement hit the iteration cap and lost its message to the strip above.
+    /// All three are ordinary, and all three produce a role sequence a strict template
+    /// rejects. Merging keeps every word the user typed; dropping either turn would not.
+    static func mergeAdjacentUserTurns(_ raw: [[String: Any]]) -> [[String: Any]] {
+        var out: [[String: Any]] = []
+        for message in raw {
+            if (message["role"] as? String) == "user",
+                let previous = out.last, (previous["role"] as? String) == "user"
+            {
+                var merged = previous
+                let a = (previous["content"] as? String) ?? ""
+                let b = (message["content"] as? String) ?? ""
+                merged["content"] = a.isEmpty ? b : (b.isEmpty ? a : a + "\n\n" + b)
+                out[out.count - 1] = merged
+                continue
+            }
+            out.append(message)
         }
         return out
     }
