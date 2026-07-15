@@ -155,7 +155,7 @@ In agent mode a prompt runs the tool loop: it streams `tool_call` / `tool_call_u
 Smoke-test the chat path without a UI:
 
 ```
-python3 tools/acp_smoke.py .build/xcode/Build/Products/Debug/mlx-agent
+python3 tools/acp_smoke.py build/Build/Products/Debug/mlx-agent
 ```
 
 `tools/acp_tool_leak.py` covers what `acp_smoke.py` structurally cannot: it drives a turn
@@ -164,7 +164,7 @@ reach the visible message. Both regressions it guards only manifest across a too
 they are invisible to a chat-only run. It needs a server and an MCP config:
 
 ```
-python3 tools/acp_tool_leak.py .build/xcode/Build/Products/Debug/mlx-agent \
+python3 tools/acp_tool_leak.py build/Build/Products/Debug/mlx-agent \
   --base-url http://127.0.0.1:8080/v1 --mcp-config /path/to/mcp-config.json
 ```
 
@@ -208,18 +208,18 @@ Build:
 ```
 xcodebuild -project mlx-agent.xcodeproj -scheme mlx-agent \
   -destination 'platform=macOS,arch=arm64' -configuration Debug \
-  -derivedDataPath .build/xcode \
+  -derivedDataPath build \
   -skipPackagePluginValidation -skipMacroValidation build
 ```
 
 The `-skip...` flags trust the `CudaBuild` package plugin and the swift-syntax
 macros (otherwise xcodebuild blocks on a validation prompt). The binary lands at
-`.build/xcode/Build/Products/Debug/mlx-agent` with the metallib bundle beside it.
+`build/Build/Products/Debug/mlx-agent` with the metallib bundle beside it.
 
 Run:
 
 ```
-cd .build/xcode/Build/Products/Debug && ./mlx-agent gate
+cd build/Build/Products/Debug && ./mlx-agent gate
 ```
 
 Tests (`Chunking` + `AgentText` - no MLX, no Metal, ~0.01s):

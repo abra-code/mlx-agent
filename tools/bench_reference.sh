@@ -42,11 +42,11 @@ fi
 [[ -f "$MODEL_DIR/config.json" ]] || { echo "no config.json in $MODEL_DIR"; exit 1; }
 echo "[bench] model: $MODEL_DIR"
 
-BIN=.build/xcode/Build/Products/Release/mlx-agent
+BIN=build/Build/Products/Release/mlx-agent
 if [[ ! -x "$BIN" ]]; then
     echo "[bench] building mlx-agent (Release, xcodebuild - see README)..."
     xcodebuild -scheme mlx-agent -destination 'platform=macOS,arch=arm64' \
-        -derivedDataPath .build/xcode -configuration Release \
+        -derivedDataPath build -configuration Release \
         -skipPackagePluginValidation -skipMacroValidation build | tail -1
 fi
 

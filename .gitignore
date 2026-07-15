@@ -1,4 +1,8 @@
-.build/
+# xcodebuild's -derivedDataPath. Deliberately NOT hidden (it was .build/ while this was a
+# SwiftPM package): the build output is large, is what every consumer script reaches into,
+# and hiding it made three build locations easy to lose track of. Every script and the
+# README pass `-derivedDataPath build`, so products land in build/Build/Products/<config>/.
+build/
 .swiftpm/
 # mlx-agent.xcodeproj IS committed - it is generated from project.yml by `xcodegen generate`,
 # but it carries the two shared schemes (both with coverage off) and the resolved dependency
