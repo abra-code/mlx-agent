@@ -145,7 +145,8 @@ Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `sess
 (returns a `model` select, plus a `mode` select when tools are configured),
 `session/prompt` (streams `agent_message_chunk` and, for thinking models,
 `agent_thought_chunk` split out of `<think></think>`), `session/cancel`, and
-`session/set_config_option` (switch model, or toggle chat/agent mode). One `ChatSession`
+`session/set_config_option` (switch model; mode is accepted but no longer advertised, so no
+client shows a chat/agent picker - agentic-ness is decided by --mcp-config at spawn). One `ChatSession`
 per process; its KV cache persists across prompts. All logging is on stderr; stdout is
 JSON-RPC only.
 

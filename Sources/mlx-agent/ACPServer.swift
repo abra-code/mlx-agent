@@ -5,10 +5,10 @@
 // the methods it implements:
 //
 //   initialize                -> { protocolVersion: 1, ... }
-//   session/new               -> { sessionId, configOptions: [ model, (mode when tools) ] }
+//   session/new               -> { sessionId, configOptions: [ model (mlx backend only) ] }
 //   session/prompt            -> streams session/update notifications, resolves { stopReason }
 //   session/cancel  (notif)   -> cancels the in-flight turn
-//   session/set_config_option -> switches the model, or toggles chat/agent mode
+//   session/set_config_option -> switches the model (mode is accepted but never advertised)
 //   session/prime             -> REPLACES the session context with a supplied transcript
 //                                (client-driven resume/fresh; empty messages = reset)
 //
@@ -826,20 +826,21 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 "options": choices,
             ])
         }
-        // Only surface the chat/agent toggle when there are tools to enable.
-        if haveTools {
-            options.append([
-                "id": "mode",
-                "name": "Mode",
-                "category": "mode",
-                "currentValue": modeNow,
-                "type": "select",
-                "options": [
-                    ["value": "chat", "name": "Chat"],
-                    ["value": "agent", "name": "Agent"],
-                ],
-            ])
-        }
+        // NO chat/agent mode picker. It is deliberately not advertised, so no client renders
+        // it: whether a session is agentic is decided ONCE, before the agent is spawned, by
+        // whether the host passes --mcp-config (the host's own "use tools" choice). "Chat
+        // mode" IS an empty MCP config - same transport, no tools - so a second, live control
+        // for the same question could only disagree with the first.
+        //
+        // It also could not honour the promise it made. The picker only ever appeared when
+        // tools were ALREADY spawned (`haveTools`), so it could not turn a chat session
+        // agentic - the servers were not there to enable. All it could do was mute tools the
+        // user had explicitly asked for, which is not a decision worth a permanent control.
+        //
+        // `mode` survives internally as the agent's expression of that startup choice
+        // (init: --mcp-config present -> "agent"), and `session/set_config_option` still
+        // accepts it for any other ACP client. Only the affordance is gone.
+        _ = (modeNow, haveTools)
         return options
     }
 
