@@ -30,6 +30,7 @@
 
 import Foundation
 import AgentText
+import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
@@ -68,10 +69,42 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private var backend: GenerationBackend?
     private var agent: Agent?
     private var registry: MCPToolRegistry?
+
+    // MLX idle-unload: mirror llama-server's --sleep-idle-seconds on the in-process MLX path.
+    // After `idleUnloadSeconds` with no prompt, the model weights are released and MLX's buffer
+    // cache is returned to the OS; the next prompt reloads the model and re-prefills context from
+    // `mlxTranscript`. Only meaningful on the MLX path - the openai path holds no weights here
+    // (llama-server does its own idle sleep, and the OpenAIBackend keeps only a tiny messages
+    // array). 0 disables. The timer lives on `idleQueue` and is only ever touched from it.
+    private let idleUnloadSeconds: TimeInterval
+    private let idleQueue = DispatchQueue(label: "com.abracode.mlx-agent.idle")
+    private var idleTimer: DispatchSourceTimer?
+    // True once the model has been idle-unloaded: the session is still "live" (sessionID set,
+    // registry up) but `container`/`agent` are nil, so the next prompt reloads instead of being
+    // rejected as "no active session".
+    private var idleUnloaded = false
+    // A shadow of the conversation as clean (user, assistant) text turns, kept ONLY so an
+    // idle-unload can rebuild the ChatSession's context on reload. ChatSession's message history
+    // is private and collapses into an opaque KV cache after the first turn, so it cannot be read
+    // back - hence this parallel record, the same thing the OpenAIBackend keeps explicitly and
+    // llama-server's own idle-sleep relies on the client resending. Text turns only: intra-turn
+    // tool calls/results are not replayed, so after an idle reload the model keeps the
+    // conversation but not the exact tool outputs (documented trade, appended only on a clean
+    // .stop so a cancelled/failed turn never enters the replayed context). Reset to the primed
+    // history on session/prime and to [] on session/new.
+    private var mlxTranscript: [Chat.Message] = []
+    // Accumulates THIS turn's assistant answer (kind == .message only, never .thought) so it can
+    // be appended to `mlxTranscript` at turn end. Written from agentEmitText, read/reset under lock.
+    private var assistantTurnBuffer = ""
     private var registryBuildTask: Task<MCPToolRegistry?, Never>?
     private var signalSources: [DispatchSourceSignal] = []
     private var sessionID: String?
     private var promptTask: Task<Void, Never>?
+    // Claimed under `lock` the instant a prompt is accepted, and held until `promptTask` is
+    // committed (the Task exists only after its closure is built, so there is a gap between the
+    // busy-check and `promptTask = task`). Without it, `idleFired` or `session/prime` could see
+    // `promptTask == nil` in that gap and unload/swap the stack mid-turn. Both treat it as busy.
+    private var promptStarting = false
     private var stdinBuffer = Data()
     private var doneContinuation: CheckedContinuation<Void, Never>?
     private let writeLock = NSLock()
@@ -136,8 +169,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         engine: EngineSpec, mcpConfigPath: String? = nil,
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
         systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
-        extraEOSTokens: Set<String> = []
+        extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = 600
     ) {
+        self.idleUnloadSeconds = idleUnloadSeconds
         switch engine {
         case .mlx(let modelDir):
             self.currentModelDir = modelDir
@@ -201,7 +235,95 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             doneContinuation = nil
             return c
         }
+        cancelIdleTimer()
         cont?.resume()
+    }
+
+    // MARK: - MLX idle-unload
+
+    /// (Re)arm the idle-unload timer. No-op unless this is the MLX path, unloading is enabled,
+    /// a model is actually loaded, and no prompt is running. Safe to call at every turn/session
+    /// boundary. Must be called WITHOUT `lock` (it takes `lock` to sample state, then hops to
+    /// `idleQueue` to touch the timer). A stale arm is harmless: `idleFired` re-checks under lock.
+    private func rearmIdleTimerIfIdle() {
+        guard openaiBaseURL == nil, idleUnloadSeconds > 0 else { return }
+        let shouldArm = lock.withLock { self.container != nil && self.promptTask == nil }
+        let interval = idleUnloadSeconds
+        idleQueue.async { [weak self] in
+            guard let self else { return }
+            self.idleTimer?.cancel()
+            self.idleTimer = nil
+            guard shouldArm else { return }
+            let timer = DispatchSource.makeTimerSource(queue: self.idleQueue)
+            timer.schedule(deadline: .now() + interval)
+            timer.setEventHandler { [weak self] in self?.idleFired() }
+            self.idleTimer = timer
+            timer.resume()
+        }
+    }
+
+    /// Cancel any pending idle-unload (activity arrived, or we are shutting down).
+    private func cancelIdleTimer() {
+        idleQueue.async { [weak self] in
+            self?.idleTimer?.cancel()
+            self?.idleTimer = nil
+        }
+    }
+
+    /// Fired on `idleQueue` after `idleUnloadSeconds` of no prompts. Releases the model weights
+    /// (keeping the MCP registry and the shadow transcript) and returns MLX's buffer cache to the
+    /// OS. A no-op if a prompt slipped in or the model is already unloaded - the promptTask guard
+    /// is what guarantees we never unload mid-turn.
+    private func idleFired() {
+        // Snapshot the footprint while the weights are STILL loaded: dropping the container moves
+        // them from MLX's active memory into its buffer cache, so a snapshot taken afterwards
+        // would read ~0 active and hide what we freed. active+cache is the real resident total.
+        let before = MLX.Memory.snapshot()
+        let dir: String? = lock.withLock {
+            // promptStarting covers the gap before promptTask is committed: never unload with a
+            // turn running OR about to run.
+            guard self.promptTask == nil, !self.promptStarting, self.container != nil else {
+                return nil
+            }
+            self.container = nil
+            self.session = nil
+            self.backend = nil
+            self.agent = nil
+            self.idleUnloaded = true
+            return self.currentModelDir
+        }
+        guard let dir else { return }
+        idleTimer = nil
+        // The container refs are gone, so the weights are now in MLX's buffer cache; clearCache
+        // returns that cache to the OS instead of holding it for the next allocation.
+        MLX.GPU.clearCache()
+        let after = MLX.Memory.snapshot()
+        let beforeMiB = (before.activeMemory + before.cacheMemory) / 1_048_576
+        let afterMiB = (after.activeMemory + after.cacheMemory) / 1_048_576
+        log(
+            "idle-unload: released \((dir as NSString).lastPathComponent) after "
+                + "\(Int(idleUnloadSeconds))s idle; resident \(beforeMiB)MiB -> \(afterMiB)MiB")
+    }
+
+    /// Reload the model after an idle-unload and rebuild the session stack around the shadow
+    /// transcript, so the conversation continues with its context intact. Mirrors the MLX branch
+    /// of session/prime (same buildSessionStack, same registry, same mode); the re-prefill cost is
+    /// paid here, on the first prompt after idle. Throws if the model fails to (re)load.
+    private func reloadAfterIdle() async throws -> Agent {
+        let (dir, history) = lock.withLock { (self.currentModelDir, self.mlxTranscript) }
+        log(
+            "idle-reload: loading \((dir as NSString).lastPathComponent), "
+                + "replaying \(history.count) messages")
+        let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
+        let (session, backend, agent) = buildSessionStack(container: container, history: history)
+        lock.withLock {
+            self.container = container
+            self.session = session
+            self.backend = backend
+            self.agent = agent
+            self.idleUnloaded = false
+        }
+        return agent
     }
 
     private static func splitLines(buffer: inout Data, appending data: Data) -> [String] {
@@ -334,10 +456,13 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 self.backend = backend
                 self.agent = agent
                 self.sessionID = sid
+                self.idleUnloaded = false
+                self.mlxTranscript = []   // fresh conversation: nothing to replay on a later reload
                 // See handleNewSessionOpenAI: standing permissions are per session, not per process.
                 resetSessionPermissionsLocked()
                 return mode
             }
+            rearmIdleTimerIfIdle()
             let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
             log(
                 "session ready: \(sid) on \((dir as NSString).lastPathComponent) "
@@ -448,36 +573,86 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     private func handlePrompt(id: Int?, params: [String: Any]) {
-        let (agent, ourSid, busy) = lock.withLock {
-            (self.agent, self.sessionID, self.promptTask != nil)
+        // One turn at a time: the ChatSession/backend is not safe to drive concurrently (see
+        // MLXBackend). Claim the slot ATOMICALLY with the busy-check - see promptStarting.
+        let (agent, ourSid, unloaded, busy) = lock.withLock {
+            () -> (Agent?, String?, Bool, Bool) in
+            let busy = self.promptTask != nil || self.promptStarting
+            if !busy { self.promptStarting = true }
+            return (self.agent, self.sessionID, self.idleUnloaded, busy)
         }
-        guard let agent, let ourSid else {
-            respondError(id, -32002, "no active session; call session/new first")
-            return
-        }
-        // One turn at a time: the ChatSession/backend is not safe to drive concurrently
-        // (see MLXBackend). Reject rather than corrupt the KV cache with an overlapping run.
         if busy {
             respondError(id, -32003, "a prompt is already in progress for this session")
+            return
+        }
+        // From here the claim (promptStarting) is held; every early return MUST release it.
+        func releaseClaim() { lock.withLock { self.promptStarting = false } }
+        // idleUnloaded means the session is live but its model was released to save RAM: the
+        // agent is nil yet the prompt is valid, so reload rather than reject. A nil agent that is
+        // NOT idle-unloaded is a genuine "no session yet".
+        guard let ourSid, agent != nil || unloaded else {
+            releaseClaim()
+            respondError(id, -32002, "no active session; call session/new first")
             return
         }
         // ACP carries the target sessionId on every prompt; reject one that isn't ours
         // rather than silently answering for the wrong session.
         if let reqSid = params["sessionId"] as? String, reqSid != ourSid {
+            releaseClaim()
             respondError(id, -32602, "unknown session: \(reqSid)")
             return
         }
         let text = Self.promptText(params)
+        // Activity: stop any pending idle-unload before the turn starts. The claim already
+        // blocks a queued idle event from unloading, and the timer is re-armed at turn end.
+        cancelIdleTimer()
         // The agent drives the full turn (streaming + tool loop + permission gate) and
         // reports back through the AgentDelegate methods below. Task.isCancelled inside
         // runTurn is wired to session/cancel via this promptTask.
         let task = Task { [weak self] in
             guard let self else { return }
-            defer { self.lock.withLock { if self.promptTask != nil { self.promptTask = nil } } }
-            let outcome = await agent.runTurn([.user(text)])
+            defer {
+                self.lock.withLock {
+                    if self.promptTask != nil { self.promptTask = nil }
+                    self.promptStarting = false
+                }
+                self.rearmIdleTimerIfIdle()
+            }
+            // Reload the model if it was idle-unloaded, then use the freshly rebuilt agent.
+            let live: Agent
+            if unloaded {
+                do {
+                    live = try await self.reloadAfterIdle()
+                } catch {
+                    self.log("idle-reload failed: \(error.localizedDescription)")
+                    self.respondError(
+                        id, -32000, "model reload failed: \(error.localizedDescription)")
+                    return
+                }
+            } else if let agent {
+                live = agent
+            } else {
+                self.respondError(id, -32002, "no active session; call session/new first")
+                return
+            }
+            // Fresh buffer for this turn's assistant answer (see mlxTranscript).
+            self.lock.withLock { self.assistantTurnBuffer = "" }
+            let outcome = await live.runTurn([.user(text)])
             // A turn that ended between a gate and its answer leaves no permission parked,
             // but be defensive: resolve any stragglers so no continuation leaks.
             self.failPendingPermissions(with: .cancel)
+            // Extend the shadow transcript ONLY on a clean stop and ONLY on the MLX path - it is
+            // solely a reload aid, so a cancelled/failed turn (which the user interrupted or which
+            // errored) must not enter the replayed context. A turn that produced no answer text
+            // (e.g. tool-only, since tool exchanges are not replayed) is skipped whole so the
+            // user/assistant pairing never carries an empty assistant message into prefill.
+            if self.openaiBaseURL == nil, case .stop = outcome {
+                self.lock.withLock {
+                    guard !self.assistantTurnBuffer.isEmpty else { return }
+                    self.mlxTranscript.append(.user(text))
+                    self.mlxTranscript.append(.assistant(self.assistantTurnBuffer, toolCalls: nil))
+                }
+            }
             switch outcome {
             case .cancelled:
                 self.log("turn resolved: stopReason=cancelled")
@@ -492,7 +667,20 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 self.respond(id, ["stopReason": reason])
             }
         }
-        lock.withLock { promptTask = task }
+        // Publish the task ONLY if the turn is still starting. This class is not an actor, so the
+        // Task above can begin (and, on a fast-fail path like a reload that throws, FINISH - defer
+        // included) on another thread before this line runs. If the child's defer already cleared
+        // the claim, `promptStarting` is false here and we must NOT store the now-dead task:
+        // doing so would strand `promptTask` non-nil with nothing left to clear it, permanently
+        // wedging prompts/idle-unload/prime. Serve dispatch is serialized (readabilityHandler), so
+        // no other turn can claim between the child's defer and this line - `promptStarting` true
+        // here means unambiguously our still-running turn.
+        lock.withLock {
+            if promptStarting {
+                promptTask = task
+                promptStarting = false
+            }
+        }
     }
 
     private func handleCancel(params: [String: Any]) {
@@ -553,7 +741,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     self.backend = backend
                     self.agent = agent
                     self.currentModelDir = target.dir
+                    // Context resets with the model, so the reload shadow does too.
+                    self.mlxTranscript = []
+                    self.idleUnloaded = false
                 }
+                rearmIdleTimerIfIdle()
                 log("switched model -> \(value)")
                 respond(id, ["configOptions": configOptionsJSON()])
             } catch {
@@ -587,11 +779,15 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
         let history = Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) }
-        // Rebuild the stack around the restored history. The openai backend needs nothing
-        // but the history itself; the MLX one additionally needs its loaded weights.
+        // Rebuild the stack around the restored history. The openai backend needs nothing but
+        // the history itself; the MLX one additionally needs its loaded weights - and if those
+        // were idle-unloaded, we do NOT reload here: prime just records the new context as the
+        // reload shadow and leaves the model unloaded, so the next prompt reloads with it (the
+        // KV prefill is lazy anyway). `container` was captured at the top, so a concurrent
+        // idle-unload cannot free its buffers while this holds the strong ref.
         let session: ChatSession?
-        let backend: GenerationBackend
-        let agent: Agent
+        let backend: GenerationBackend?
+        let agent: Agent?
         if let openaiBaseURL {
             let (b, a) = buildOpenAIStack(baseURL: openaiBaseURL, history: history)
             (session, backend, agent) = (nil, b, a)
@@ -599,18 +795,26 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             let (s, b, a) = buildSessionStack(container: container, history: history)
             (session, backend, agent) = (s, b, a)
         } else {
-            respondError(id, -32002, "no active session; call session/new first")
-            return
+            // MLX, idle-unloaded: no weights to build on. Recorded below; next prompt reloads.
+            (session, backend, agent) = (nil, nil, nil)
         }
         // Refuse to swap the stack under a running turn. Checked inside the same lock
         // that publishes the swap, so a prompt accepted before us keeps its stack and
         // we bail; the client's ordering contract (cancel + await resolution before
         // priming) makes a first -32003 a rare transient it retries once.
         let busy = lock.withLock { () -> Bool in
-            if promptTask != nil { return true }
+            if promptTask != nil || promptStarting { return true }
             self.session = session
             self.backend = backend
             self.agent = agent
+            if openaiBaseURL == nil {
+                // Keep MLX reload state consistent with the rebuilt stack: a prime with the model
+                // loaded is (re)loaded; one with it idle-unloaded stays unloaded (agent nil), and
+                // either way `mlxTranscript` becomes the new context to replay on the next reload.
+                self.container = (agent != nil) ? container : nil
+                self.idleUnloaded = (agent == nil)
+                self.mlxTranscript = history
+            }
             // Priming REPLACES the conversation, so it replaces the consent context with it.
             // This is the clear that actually fires in production - see the helper. Inside the
             // busy check on purpose: a prime that bails leaves the running turn's stack alone,
@@ -622,6 +826,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respondError(id, -32003, "cannot prime while a prompt is in progress")
             return
         }
+        rearmIdleTimerIfIdle()
         var wireBytes = 0
         for m in rawMessages { wireBytes += (m["content"] as? String)?.utf8.count ?? 0 }
         log("session primed: \(history.count) messages (\(rawMessages.count) supplied, ~\(wireBytes) content bytes)")
@@ -845,7 +1050,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // MARK: - AgentDelegate (streaming)
 
     func agentEmitText(kind: ThinkSplitter.Kind, _ text: String) {
-        guard let sid = lock.withLock({ sessionID }) else { return }
+        let sid: String? = lock.withLock {
+            // Capture the answer (not the reasoning) for the reload shadow on the MLX path.
+            if kind == .message, self.openaiBaseURL == nil { self.assistantTurnBuffer += text }
+            return self.sessionID
+        }
+        guard let sid else { return }
         sendUpdate(sid, kind, text)
     }
 

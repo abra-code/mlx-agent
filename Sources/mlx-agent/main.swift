@@ -819,7 +819,10 @@ do {
             initialMode: option("--mode", in: cliArgs),
             systemPrompt: resolveSystemPrompt(cliArgs),
             gen: parseGenConfig(cliArgs),
-            extraEOSTokens: extraEOSTokens
+            extraEOSTokens: extraEOSTokens,
+            // MLX-only idle-unload (mirrors llama-server --sleep-idle-seconds). Default 600s; 0
+            // disables. Ignored on the openai backend (llama-server does its own idle sleep).
+            idleUnloadSeconds: option("--idle-unload-seconds", in: cliArgs).flatMap(Double.init) ?? 600
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {
