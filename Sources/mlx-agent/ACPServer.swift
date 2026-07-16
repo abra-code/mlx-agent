@@ -75,7 +75,59 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // Outbound request correlation (agent -> client, e.g. session/request_permission).
     private var outboundCounter = 1000
-    private var pendingPermissions: [Int: CheckedContinuation<PermissionOutcome, Never>] = [:]
+    /// The parked continuation, the tool it is about, and the session epoch it was asked under:
+    /// handlePermissionResponse needs the tool name to record an "always" choice, and the
+    /// response carries only the request id.
+    /// Keeping the name here rather than parsing it back out of the title is deliberate - the
+    /// title is display text and would silently stop matching the moment it is reworded.
+    private struct PendingPermission {
+        let cont: CheckedContinuation<PermissionOutcome, Never>
+        let toolName: String
+        let epoch: Int
+    }
+    private var pendingPermissions: [Int: PendingPermission] = [:]
+
+    /// Bumped every time the session is replaced (session/new AND session/prime). A permission
+    /// request parked under the old session can still be answered after the swap; without this
+    /// its "always" choice would be recorded into the NEW session's grants, resurrecting consent
+    /// the clear just dropped. `sessionID` cannot serve as the stamp - it is the same literal
+    /// ("mlx-session-1") for every session, so it compares equal across a swap and would defend
+    /// nothing.
+    private var sessionEpoch = 0
+
+    // Session-scoped "always" decisions, keyed by EXPOSED tool name (the registry's unique key -
+    // see MCPClients.routes, which disambiguates collisions across servers). Cleared by
+    // resetSessionPermissions() on EVERY session replacement - see there for why session/prime
+    // is the one that actually matters. Deliberately NOT persisted and NOT path-scoped:
+    //
+    //  - Not path-scoped, because the sandbox already answers "where". replay's kernel sandbox
+    //    plus its allowed-dir list is the spatial boundary; a second path system here would be a
+    //    competing source of truth that the kernel would overrule, i.e. a UI that lies.
+    //    This layer only answers "whether", which is why the tool name is the whole key.
+    //  - Not persisted, because the mcp-config (and thus the sandbox) is generated per window and
+    //    frozen at spawn, so a grant made here can never widen under the session that made it.
+    //    A grant that outlived the window would inherit whatever sandbox a LATER window is given -
+    //    the user would have consented to a narrow boundary and silently received a wider one.
+    //    Session scope also needs no revoke UI: closing the window is the revoke.
+    //
+    private var alwaysAllowed: Set<String> = []
+    private var alwaysRejected: Set<String> = []
+
+    /// Drop every standing permission and invalidate any parked request. MUST be called with
+    /// `lock` held, inside the same critical section that publishes the session swap, so no
+    /// in-flight dispatch can read a grant belonging to the session that just ended.
+    ///
+    /// Called from session/new AND session/prime. **prime is the one that matters**: the
+    /// shipping client (ChatView) sends session/new exactly once per transport spawn, in
+    /// start(); New Chat and every sidebar switch go through session/prime, and `prime []` is
+    /// the documented reset. Clearing only on session/new would make the clear dead code in
+    /// production and quietly turn "session-scoped" into "process-scoped" - a grant made in one
+    /// conversation would still be standing in the next.
+    private func resetSessionPermissionsLocked() {
+        alwaysAllowed.removeAll()
+        alwaysRejected.removeAll()
+        sessionEpoch &+= 1
+    }
 
     init(
         engine: EngineSpec, mcpConfigPath: String? = nil,
@@ -253,6 +305,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             self.backend = backend
             self.agent = agent
             self.sessionID = sid
+            // A new conversation is a new consent context: standing permissions do not survive it.
+            resetSessionPermissionsLocked()
             return mode
         }
         let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
@@ -277,6 +331,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 self.backend = backend
                 self.agent = agent
                 self.sessionID = sid
+                // See handleNewSessionOpenAI: standing permissions are per session, not per process.
+                resetSessionPermissionsLocked()
                 return mode
             }
             let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
@@ -552,6 +608,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             self.session = session
             self.backend = backend
             self.agent = agent
+            // Priming REPLACES the conversation, so it replaces the consent context with it.
+            // This is the clear that actually fires in production - see the helper. Inside the
+            // busy check on purpose: a prime that bails leaves the running turn's stack alone,
+            // and must leave its grants alone too.
+            resetSessionPermissionsLocked()
             return false
         }
         if busy {
@@ -649,15 +710,38 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// Send session/request_permission and await the client's choice. Parked on a
     /// continuation keyed by request id; resumed by handlePermissionResponse (or by
     /// failPendingPermissions on cancel/teardown).
-    func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome {
-        let sid = lock.withLock { sessionID } ?? ""
-        let requestID = lock.withLock { () -> Int in
+    ///
+    /// A standing session decision for this tool short-circuits the round-trip entirely: no
+    /// request reaches the client, which is the whole point of "always" - the user asked not to
+    /// be interrupted about this tool again.
+    func agentRequestPermission(toolCallId: String, toolName: String, title: String) async
+        -> PermissionOutcome
+    {
+        let standing = lock.withLock { () -> PermissionOutcome? in
+            // Reject wins if a tool is ever in both: fail-closed. It cannot happen today (a
+            // settled tool never prompts again, so only one set can gain it), but the ordering
+            // should not be the thing standing between us and an unintended allow.
+            if alwaysRejected.contains(toolName) { return .deny }
+            if alwaysAllowed.contains(toolName) { return .allow }
+            return nil
+        }
+        if let standing {
+            log("permission: \(toolName) -> \(standing == .allow ? "allow" : "deny") (standing)")
+            return standing
+        }
+
+        // Snapshot the epoch WITH the id, in one critical section: the answer to this request may
+        // land after the session has been replaced, and the stamp is how that is detected.
+        let (sid, requestID, epoch) = lock.withLock { () -> (String, Int, Int) in
             outboundCounter += 1
-            return outboundCounter
+            return (sessionID ?? "", outboundCounter, sessionEpoch)
         }
         return await withCheckedContinuation {
             (cont: CheckedContinuation<PermissionOutcome, Never>) in
-            lock.withLock { pendingPermissions[requestID] = cont }
+            lock.withLock {
+                pendingPermissions[requestID] = PendingPermission(
+                    cont: cont, toolName: toolName, epoch: epoch)
+            }
             send([
                 "jsonrpc": "2.0",
                 "id": requestID,
@@ -665,9 +749,16 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 "params": [
                     "sessionId": sid,
                     "toolCall": ["toolCallId": toolCallId, "title": title],
+                    // ACP's standard four. The always variants are per TOOL, not per call, so
+                    // approving write_file never approves the shell tool: a write is bounded by
+                    // the sandbox's writable dirs, while a shell command inside the same sandbox
+                    // can still delete the project or reach the network. Same option, different
+                    // blast radius - so each tool is opted in on its own.
                     "options": [
                         ["optionId": "allow", "name": "Allow", "kind": "allow_once"],
+                        ["optionId": "allow_always", "name": "Always Allow", "kind": "allow_always"],
                         ["optionId": "reject", "name": "Reject", "kind": "reject_once"],
+                        ["optionId": "reject_always", "name": "Never Allow", "kind": "reject_always"],
                     ],
                 ],
             ])
@@ -675,12 +766,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     private func handlePermissionResponse(id: Int, msg: [String: Any]) {
-        let cont = lock.withLock { () -> CheckedContinuation<PermissionOutcome, Never>? in
-            let c = pendingPermissions[id]
+        let pending = lock.withLock { () -> PendingPermission? in
+            let p = pendingPermissions[id]
             pendingPermissions[id] = nil
-            return c
+            return p
         }
-        guard let cont else {
+        guard let pending else {
             log("response for unknown/expired request id \(id); dropping")
             return
         }
@@ -691,7 +782,20 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         {
             switch inner["outcome"] as? String {
             case "selected":
-                outcome = (inner["optionId"] as? String) == "allow" ? .allow : .deny
+                // Anything that is not an explicit allow denies, including an optionId we never
+                // advertised: an unrecognized choice must not run the tool.
+                switch inner["optionId"] as? String {
+                case "allow":
+                    outcome = .allow
+                case "allow_always":
+                    record(pending, into: \.alwaysAllowed, verb: "always allow")
+                    outcome = .allow
+                case "reject_always":
+                    record(pending, into: \.alwaysRejected, verb: "never allow")
+                    outcome = .deny
+                default:
+                    outcome = .deny
+                }
             case "cancelled":
                 outcome = .cancel
             default:
@@ -701,13 +805,34 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // The client errored on the request: treat as a denial, not a crash.
             outcome = .deny
         }
-        cont.resume(returning: outcome)
+        pending.cont.resume(returning: outcome)
+    }
+
+    /// Record a standing decision, but ONLY if the session it was asked under is still current.
+    /// The user answers a request that was parked before a session/new or session/prime landed;
+    /// without the epoch check that answer would write consent into the session the clear just
+    /// created. The turn's own outcome still honors the answer - the user did choose it - but it
+    /// leaves no trace in the new conversation.
+    private func record(
+        _ pending: PendingPermission, into set: ReferenceWritableKeyPath<ACPServer, Set<String>>,
+        verb: String
+    ) {
+        let stale = lock.withLock { () -> Bool in
+            guard pending.epoch == sessionEpoch else { return true }
+            self[keyPath: set].insert(pending.toolName)
+            return false
+        }
+        if stale {
+            log("permission: \(verb) \(pending.toolName) ignored - answered for a replaced session")
+        } else {
+            log("permission: \(verb) \(pending.toolName) for this session")
+        }
     }
 
     private func failPendingPermissions(with outcome: PermissionOutcome) {
         let continuations = lock.withLock {
             () -> [CheckedContinuation<PermissionOutcome, Never>] in
-            let waiting = Array(pendingPermissions.values)
+            let waiting = pendingPermissions.values.map(\.cont)
             pendingPermissions.removeAll()
             return waiting
         }
@@ -810,22 +935,28 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 (registry?.toolSpecs.isEmpty == false)
             )
         }
-        var options: [[String: Any]] = []
-        // No model option on the openai backend: the applet picks the gguf and restarts
-        // llama-server itself, so offering a picker here would be a dead control.
-        if openaiBaseURL == nil {
-            let choices = availableModels().map {
-                ["value": $0.value, "name": $0.value] as [String: Any]
-            }
-            options.append([
-                "id": "model",
-                "name": "Model",
-                "category": "model",
-                "currentValue": current,
-                "type": "select",
-                "options": choices,
-            ])
-        }
+        let options: [[String: Any]] = []
+        // NO model picker, on EITHER backend - so no client renders one, and session/new's
+        // configOptions is always empty.
+        //
+        // The openai backend never had one: the applet picks the gguf and restarts llama-server
+        // itself, so a picker here would be a dead control. The MLX backend DID advertise one,
+        // and that is what this removes. It produced a picker under the composer in MLX windows
+        // and nothing in llama-server windows - an asymmetry that was the visible half of a real
+        // problem: choosing a model there went straight to set_config_option and the APPLET
+        // never saw it. The applet owns the window title, the model label, the RAM advisory and
+        // the history stamping, so an agent-side switch left all of them describing a model that
+        // was no longer loaded.
+        //
+        // Model choice belongs to the applet's picker, which is the only place that knows about
+        // both engines, the tools choice that goes with a model, RAM headroom, and the window's
+        // identity. Same reasoning that retired the mode picker: a live control for something the
+        // applet owns can only disagree with it.
+        //
+        // The MECHANISM stays: session/set_config_option "model" still switches the model (see
+        // handleSetConfigOption), and --model still works. Only the advertisement is gone, which
+        // is what the applet's picker will drive for an in-place MLX switch.
+        //
         // NO chat/agent mode picker. It is deliberately not advertised, so no client renders
         // it: whether a session is agentic is decided ONCE, before the agent is spawned, by
         // whether the host passes --mcp-config (the host's own "use tools" choice). "Chat
@@ -840,7 +971,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // `mode` survives internally as the agent's expression of that startup choice
         // (init: --mcp-config present -> "agent"), and `session/set_config_option` still
         // accepts it for any other ACP client. Only the affordance is gone.
-        _ = (modeNow, haveTools)
+        //
+        // The three locals are read under one lock acquisition and kept: `currentModelDir` and
+        // `registry` are the state a future advertised option would describe, and splitting the
+        // locked read to drop them would trade a real invariant for cosmetics.
+        _ = (current, modeNow, haveTools)
         return options
     }
 

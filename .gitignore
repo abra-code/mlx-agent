@@ -21,6 +21,9 @@ build/
 *.xcodeproj/project.xcworkspace/xcuserdata/
 *.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 DerivedData/
+# The tools/ smoke tests import each other (`sys.path.insert(0, "tools")`, then
+# `from acp_smoke import Agent`), so running any of them leaves tools/__pycache__ behind.
+__pycache__/
 .DS_Store
 Private/
 *.profraw

@@ -444,7 +444,11 @@ final class ConsoleAgentDelegate: AgentDelegate, @unchecked Sendable {
     func agentToolCallFinished(id: String, status: String, output: String) {
         err("[tool_call] \(status):\n\(output)\n")
     }
-    func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome {
+    func agentRequestPermission(toolCallId: String, toolName: String, title: String) async
+        -> PermissionOutcome
+    {
+        // The console runner has no user to ask, so --permission decides every call and there is
+        // no "always" to remember; toolName is unused here by design.
         err("[permission] \(title) -> auto-\(autoPermission)\n")
         return autoPermission
     }

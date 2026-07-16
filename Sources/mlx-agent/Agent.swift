@@ -42,7 +42,12 @@ protocol AgentDelegate: AnyObject, Sendable {
     func agentToolCallFinished(id: String, status: String, output: String)
     /// Gated-tool approval. Returns .allow to run, .deny to reject (result fed back to
     /// the model), .cancel to abort the whole turn.
-    func agentRequestPermission(toolCallId: String, title: String) async -> PermissionOutcome
+    ///
+    /// `toolName` is the exposed tool name - the registry's unique key. It is passed separately
+    /// from `title` because an implementation may key a standing decision on it (ACPServer does);
+    /// `title` is display text and must not be parsed for identity.
+    func agentRequestPermission(toolCallId: String, toolName: String, title: String) async
+        -> PermissionOutcome
     func agentTurnUsage(totalTokens: Int, tokensPerSecond: Double)
 }
 
@@ -197,7 +202,7 @@ final class Agent: @unchecked Sendable {
         if route.gated {
             let outcome =
                 await delegate?.agentRequestPermission(
-                    toolCallId: toolCallID, title: "Allow \(name)?") ?? .deny
+                    toolCallId: toolCallID, toolName: name, title: "Allow \(name)?") ?? .deny
             switch outcome {
             case .cancel:
                 delegate?.agentToolCallFinished(
