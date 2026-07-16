@@ -109,8 +109,10 @@ def main():
         sys.exit(2)
     passthrough = sys.argv[2:]
     argv = [sys.argv[1], "acp"] + passthrough
-    # The openai backend talks to a server the applet owns, so it exposes no model picker
-    # (see ACPServer.configOptionsJSON); the expectations below flip accordingly.
+    # Neither backend advertises anything in configOptions (see ACPServer.configOptionsJSON), so
+    # that expectation no longer varies. This flag remains for the one place the backends really
+    # do differ: the openai backend REFUSES a model switch outright (check 11), because there the
+    # applet owns llama-server, whereas the MLX path can still switch on the wire.
     openai = "openai" in passthrough
     agent = Agent(argv)
     fails = 0
@@ -141,16 +143,12 @@ def main():
         res = r.get("result", {})
         sid = res.get("sessionId")
         opts = res.get("configOptions", [])
-        model_opt = next((o for o in opts if o.get("id") == "model"), None)
         check("session/new", isinstance(sid, str) and bool(sid), f"sessionId={sid}")
-        if openai:
-            check("configOptions omits the applet-managed model select",
-                  model_opt is None, f"ids={[o.get('id') for o in opts]}")
-        else:
-            check("configOptions has model select",
-                  model_opt is not None and model_opt.get("type") == "select"
-                  and len(model_opt.get("options", [])) >= 1,
-                  f"current={model_opt.get('currentValue') if model_opt else None}")
+        # configOptions is empty on BOTH backends: nothing is advertised, so no client renders a
+        # picker. Asserting the whole list is empty (not just "no model option") is deliberate -
+        # it fails if anything is ever advertised again without a decision to do so.
+        check("configOptions is empty (no client-rendered picker)",
+              opts == [], f"ids={[o.get('id') for o in opts]}")
 
         # 3. session/prompt - streamed
         store = {}

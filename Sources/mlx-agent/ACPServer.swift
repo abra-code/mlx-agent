@@ -5,10 +5,13 @@
 // the methods it implements:
 //
 //   initialize                -> { protocolVersion: 1, ... }
-//   session/new               -> { sessionId, configOptions: [ model (mlx backend only) ] }
+//   session/new               -> { sessionId, configOptions: [] (always empty - see
+//                                configOptionsJSON: neither model nor mode is advertised, so no
+//                                client renders a picker; both remain settable over the wire)
 //   session/prompt            -> streams session/update notifications, resolves { stopReason }
 //   session/cancel  (notif)   -> cancels the in-flight turn
-//   session/set_config_option -> switches the model (mode is accepted but never advertised)
+//   session/set_config_option -> switches the model; model and mode are both accepted but
+//                                neither is advertised (the host owns both decisions)
 //   session/prime             -> REPLACES the session context with a supplied transcript
 //                                (client-driven resume/fresh; empty messages = reset)
 //

@@ -142,13 +142,19 @@ text:\n\n{{chunk}}"}]`.
 ### ACP server (`acp`)
 
 Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `session/new`
-(returns a `model` select, plus a `mode` select when tools are configured),
-`session/prompt` (streams `agent_message_chunk` and, for thinking models,
-`agent_thought_chunk` split out of `<think></think>`), `session/cancel`, and
-`session/set_config_option` (switch model; mode is accepted but no longer advertised, so no
-client shows a chat/agent picker - agentic-ness is decided by --mcp-config at spawn). One `ChatSession`
-per process; its KV cache persists across prompts. All logging is on stderr; stdout is
-JSON-RPC only.
+(`configOptions` is always empty - see below), `session/prompt` (streams
+`agent_message_chunk` and, for thinking models, `agent_thought_chunk` split out of
+`<think></think>`), `session/cancel`, and `session/set_config_option` (switches the model).
+One `ChatSession` per process; its KV cache persists across prompts. All logging is on
+stderr; stdout is JSON-RPC only.
+
+**Nothing is advertised in `configOptions`, so no client renders a picker.** `model` and
+`mode` both remain settable over the wire, and `--model` / `--mode` still work; only the
+affordances are gone. Both decisions belong to the host: agentic-ness is fixed at spawn by
+whether `--mcp-config` was passed, and the model is the host's to choose - it owns the
+picker that knows about every engine, the tools choice that goes with a model, RAM
+headroom, and the window's identity. An agent-side control for either could only disagree
+with the host, and (for the model) switch it without the host ever knowing.
 
 In agent mode a prompt runs the tool loop: it streams `tool_call` / `tool_call_update` /
 `usage_update`, and sends `session/request_permission` before any gated tool. That request
