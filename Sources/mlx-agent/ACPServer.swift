@@ -99,6 +99,13 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private var registryBuildTask: Task<MCPToolRegistry?, Never>?
     private var signalSources: [DispatchSourceSignal] = []
     private var sessionID: String?
+    // The absolute working directory the client declared in session/new (ACP's `cwd`). The
+    // client also launched us with the process cwd set to this, so relative paths already
+    // resolve here; this copy exists ONLY so the model is TOLD where it is - a model cannot
+    // call getcwd(), it knows the directory only if it is in the system prompt (see
+    // effectiveSystemPrompt). Empty/"/" are treated as "unknown" and inject nothing. Set on
+    // session/new and left untouched by session/prime (same process, same cwd).
+    private var sessionCwd: String?
     private var promptTask: Task<Void, Never>?
     // Claimed under `lock` the instant a prompt is accepted, and held until `promptTask` is
     // committed (the Task exists only after its closure is built, so there is a gap between the
@@ -385,7 +392,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     ],
                 ])
         case "session/new":
-            Task { await self.handleNewSession(id: id) }
+            Task { await self.handleNewSession(id: id, params: params) }
         case "session/prompt":
             handlePrompt(id: id, params: params)
         case "session/cancel":
@@ -405,7 +412,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // MARK: - Handlers
 
-    private func handleNewSession(id: Int?) async {
+    private func handleNewSession(id: Int?, params: [String: Any]) async {
+        // ACP requires `cwd` to be an absolute path; ignore anything else (empty, relative, or
+        // a bare "/") so we never inject a misleading directory into the model's context.
+        let cwd = (params["cwd"] as? String).flatMap { $0.hasPrefix("/") && $0 != "/" ? $0 : nil }
+        lock.withLock { self.sessionCwd = cwd }
         if let openaiBaseURL {
             await handleNewSessionOpenAI(id: id, baseURL: openaiBaseURL)
         } else {
@@ -480,17 +491,31 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// prompt prepends nothing - the translator path). The default acp parameters (0.7 /
     /// 4096) are overlaid with any --temperature/--top-p/--max-new-tokens/--seed/
     /// --repetition-penalty the CLI supplied.
+    /// The configured system prompt with the session's working directory appended, so the
+    /// model KNOWS its cwd (it cannot call getcwd - it only knows what is in its context).
+    /// nil stays nil: the translator path (`--system-prompt ""`) prepends no system message,
+    /// and injecting a directory line there would pollute every request. An unknown cwd
+    /// (nil/empty/"/") appends nothing.
+    private func effectiveSystemPrompt() -> String? {
+        guard let base = systemPrompt else { return nil }
+        guard let cwd = lock.withLock({ sessionCwd }) else { return base }
+        return base
+            + "\n\nYour current working directory is \(cwd). "
+            + "Interpret relative file paths as relative to this directory."
+    }
+
     private func buildSessionStack(
         container: ModelContainer, history: [Chat.Message]
     ) -> (ChatSession, MLXBackend, Agent) {
         let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
+        let instructions = effectiveSystemPrompt()
         let session: ChatSession
         if history.isEmpty {
             session = ChatSession(
-                container, instructions: systemPrompt, generateParameters: parameters)
+                container, instructions: instructions, generateParameters: parameters)
         } else {
             session = ChatSession(
-                container, instructions: systemPrompt, history: history,
+                container, instructions: instructions, history: history,
                 generateParameters: parameters)
         }
         let registry = lock.withLock { self.registry }
@@ -510,7 +535,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     ) -> (OpenAIBackend, Agent) {
         let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
         let backend = OpenAIBackend(
-            baseURL: baseURL, parameters: parameters, systemPrompt: systemPrompt,
+            baseURL: baseURL, parameters: parameters, systemPrompt: effectiveSystemPrompt(),
             seedHistory: history)
         let registry = lock.withLock { self.registry }
         let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
