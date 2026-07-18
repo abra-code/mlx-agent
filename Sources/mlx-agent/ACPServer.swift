@@ -684,9 +684,10 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 self.respond(id, ["stopReason": "cancelled"])
             case .failed(let message):
                 // Reply with a JSON-RPC error, not an out-of-spec stopReason. ACP's
-                // StopReason enum has no "error" member.
+                // StopReason enum has no "error" member. Log the RAW message (for debugging) but
+                // send the client a message a user can act on (see userFacingTurnError).
                 self.log("turn failed: \(message)")
-                self.respondError(id, -32000, "generation failed: \(message)")
+                self.respondError(id, -32000, Self.userFacingTurnError(message))
             case .stop(let reason):
                 self.log("turn resolved: stopReason=\(reason)")
                 self.respond(id, ["stopReason": reason])
@@ -1253,6 +1254,27 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
         send(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+    }
+
+    /// Turn a raw generation-failure string into something a user can act on. The common opaque
+    /// case is a chat-template (Jinja) render failure - e.g. "upper filter requires string" from
+    /// a model whose tool-calling template our Jinja engine can't render. That text is meaningless
+    /// to a user and reads like the app is broken, when it is a model-compatibility issue that
+    /// disappears with tools off (the failing macros only run when tool schemas are rendered).
+    /// The raw message is still logged (see the call site) for debugging.
+    static func userFacingTurnError(_ raw: String) -> String {
+        let lower = raw.lowercased()
+        let templateSignals = [
+            "filter requires", "no filter named", "unknown filter", "unknown tag",
+            "jinja", "chat template", "template render", "template error",
+        ]
+        if templateSignals.contains(where: { lower.contains($0) }) {
+            return
+                "This model's chat template could not render the request, so it can't run here. "
+                + "This usually affects tool calling - start a new chat with tools turned off, or "
+                + "pick a different model. (details: \(raw))"
+        }
+        return "generation failed: \(raw)"
     }
 
     private func send(_ message: [String: Any]) {

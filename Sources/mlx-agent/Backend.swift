@@ -73,7 +73,71 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
 
     var tools: [ToolSpec]? {
         get { session.tools }
-        set { session.tools = newValue }
+        // Normalize each tool's JSON schema so the chat template can render it. The GGUF path
+        // (llama-server / minja) is untouched - only the schemas fed to this in-process MLX
+        // ChatSession, whose swift-jinja renderer is strict, are normalized. See normalizeSchema.
+        set { session.tools = newValue?.map(Self.normalizeSchema) }
+    }
+
+    /// Give every JSON-Schema node a scalar string `type`. Some MCP tools declare optional
+    /// params as `anyOf: [{type: string}, {type: null}]` (Pydantic `Optional[...]`) or
+    /// `type: ["string","null"]`, with no scalar `type`. Lenient template engines (llama.cpp's
+    /// minja, which renders the template on the GGUF path) tolerate that, but swift-jinja - which
+    /// renders it on the MLX path - throws "upper filter requires string" when a template does
+    /// `value['type'] | upper` on such a node (e.g. gemma-4's tool template), failing the whole
+    /// turn. Collapsing to a concrete scalar type makes those templates render; the schema stays
+    /// model-facing JSON, and a concrete type is strictly more compatible than a missing one.
+    static func normalizeSchema(_ spec: ToolSpec) -> ToolSpec {
+        guard var function = spec["function"] as? [String: any Sendable],
+            let params = function["parameters"] as? [String: any Sendable]
+        else { return spec }
+        function["parameters"] = normalizeSchemaNode(params)
+        var out = spec
+        out["function"] = function
+        return out
+    }
+
+    private static func normalizeSchemaNode(_ node: [String: any Sendable]) -> [String: any Sendable]
+    {
+        var out = node
+        if (out["type"] as? String) == nil {
+            out["type"] = concreteType(from: node)
+        }
+        if let props = out["properties"] as? [String: any Sendable] {
+            var newProps: [String: any Sendable] = [:]
+            for (key, value) in props {
+                if let sub = value as? [String: any Sendable] {
+                    newProps[key] = normalizeSchemaNode(sub)
+                } else {
+                    newProps[key] = value
+                }
+            }
+            out["properties"] = newProps
+        }
+        if let items = out["items"] as? [String: any Sendable] {
+            out["items"] = normalizeSchemaNode(items)
+        }
+        return out
+    }
+
+    /// A scalar type string for a node whose `type` is missing or an array: prefer the first
+    /// non-"null" branch of `type: [...]` or `anyOf`/`oneOf`, else "string".
+    private static func concreteType(from node: [String: any Sendable]) -> String {
+        if let arr = node["type"] as? [any Sendable] {
+            for entry in arr {
+                if let type = entry as? String, type != "null" { return type }
+            }
+        }
+        for key in ["anyOf", "oneOf"] {
+            guard let subs = node[key] as? [any Sendable] else { continue }
+            for sub in subs {
+                if let dict = sub as? [String: any Sendable],
+                    let type = dict["type"] as? String, type != "null" {
+                    return type
+                }
+            }
+        }
+        return "string"
     }
 
     /// The library's `Generation` values, relabelled as `BackendEvent`. This path never
