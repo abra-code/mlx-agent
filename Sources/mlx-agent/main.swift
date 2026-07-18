@@ -647,6 +647,10 @@ func usage() {
           --extra-eos-token <t>    extra generation stop token, unioned into the model's stop set
                                    at load (repeatable); e.g. "<end_of_turn>" for a Gemma
                                    conversion whose generation_config.json omits it
+          --idle-unload-seconds <n> acp/map: release the MLX model weights after <n> seconds
+                                   without a prompt/job and reload transparently on the next
+                                   one (default 600; 0 disables). Mirrors llama-server's
+                                   --sleep-idle-seconds on the gguf path
           --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
                                    message at all (default: helpful-assistant prompt)
 
@@ -683,6 +687,20 @@ func option(_ name: String, in args: [String]) -> String? {
 func intOption(_ name: String, in args: [String]) -> Int? { option(name, in: args).flatMap(Int.init) }
 func doubleOption(_ name: String, in args: [String]) -> Double? {
     option(name, in: args).flatMap(Double.init)
+}
+
+/// --idle-unload-seconds, shared by acp and map. A supplied-but-unparseable (or negative /
+/// non-finite) value is a hard usage error rather than a silent fall-back to the default:
+/// an operator who typed "5m" must not run with 10 minutes of resident weights believing
+/// their value took effect.
+func idleUnloadSecondsOption(in args: [String]) -> Double {
+    guard let raw = option("--idle-unload-seconds", in: args) else { return 600 }
+    guard let v = Double(raw), v.isFinite, v >= 0 else {
+        FileHandle.standardError.write(
+            Data("invalid --idle-unload-seconds \"\(raw)\": expected a number of seconds (0 disables)\n".utf8))
+        exit(2)
+    }
+    return v
 }
 
 /// Resolve the system prompt from the CLI:
@@ -822,7 +840,7 @@ do {
             extraEOSTokens: extraEOSTokens,
             // MLX-only idle-unload (mirrors llama-server --sleep-idle-seconds). Default 600s; 0
             // disables. Ignored on the openai backend (llama-server does its own idle sleep).
-            idleUnloadSeconds: option("--idle-unload-seconds", in: cliArgs).flatMap(Double.init) ?? 600
+            idleUnloadSeconds: idleUnloadSecondsOption(in: cliArgs)
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {
@@ -857,7 +875,11 @@ do {
         }
         await MapServer(
             modelDir: requireModelDir(), spoolDir: spool,
-            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens
+            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens,
+            // Same idle-unload policy as the acp path (and llama-server's sleep): default 600s,
+            // 0 disables. The map broker outlives its jobs by design, so without this a single
+            // translation left the weights resident until the owner app quit.
+            idleUnloadSeconds: idleUnloadSecondsOption(in: cliArgs)
         ).run()
     case "tools":
         guard let cfg = option("--mcp-config", in: cliArgs) else {

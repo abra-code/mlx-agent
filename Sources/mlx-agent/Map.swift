@@ -121,6 +121,15 @@ final class MapServer: @unchecked Sendable {
     // rate for an upfront ETA before a job has produced any tokens. 0 if priming failed.
     private var primedRate: Double = 0
 
+    // Idle-unload (same policy as the ACP path and llama-server's --sleep-idle-seconds): after
+    // `idleUnloadSeconds` without a job, the model weights are released and MLX's buffer cache
+    // returned to the OS; the next job transparently reloads. Unlike ACPServer no timer, lock,
+    // or mid-turn guard is needed here: the run loop is single-threaded, so the check runs only
+    // between polls, where no generation can be in flight. 0 disables.
+    private let idleUnloadSeconds: TimeInterval
+    private var container: ModelContainer?
+    private var lastActivity = Date()
+
     private let jobURL: URL
     private let statusURL: URL
     private let resultTxtURL: URL
@@ -130,11 +139,15 @@ final class MapServer: @unchecked Sendable {
     // How often the generation loop checks the stop flag (in generation events).
     private let stopCheckStride = 16
 
-    init(modelDir: String, spoolDir: String, gen: GenConfig, extraEOSTokens: Set<String>) {
+    init(
+        modelDir: String, spoolDir: String, gen: GenConfig, extraEOSTokens: Set<String>,
+        idleUnloadSeconds: TimeInterval = 600
+    ) {
         self.modelDir = modelDir
         self.spoolDir = URL(fileURLWithPath: spoolDir, isDirectory: true)
         self.gen = gen
         self.extraEOSTokens = extraEOSTokens
+        self.idleUnloadSeconds = idleUnloadSeconds
         self.jobURL = self.spoolDir.appending(component: "job.json")
         self.statusURL = self.spoolDir.appending(component: "status.json")
         self.resultTxtURL = self.spoolDir.appending(component: "result.txt")
@@ -161,7 +174,6 @@ final class MapServer: @unchecked Sendable {
 
         let label = (modelDir as NSString).lastPathComponent
         writeStatus(state: "loading", message: "Loading model...")
-        let container: ModelContainer
         do {
             container = try await loadModel(modelDir, extraEOSTokens: extraEOSTokens)
         } catch {
@@ -171,10 +183,11 @@ final class MapServer: @unchecked Sendable {
         }
         // Warm the Metal kernels and measure decode speed, so the first real job has an upfront
         // ETA and the UI can show a comparable tok/s figure for the loaded model.
-        primedRate = await primeAndMeasure(container: container)
+        primedRate = await primeAndMeasure(container: container!)
         writeStatus(
             state: "ready", tokPerSec: primedRate > 0 ? primedRate : nil, message: "Ready - \(label)")
         log(String(format: "ready on %@ (%.1f tok/s); watching %@", label, primedRate, spoolDir.path))
+        lastActivity = Date()
 
         var lastEpoch: Int? = nil
         while spoolExists() {
@@ -189,16 +202,71 @@ final class MapServer: @unchecked Sendable {
                     lastEpoch = epoch
                     writeStatus(state: "error", epoch: epoch, message: reason)
                     log("job \(epoch): rejected - \(reason)")
+                    // Activity, even though rejected: a producer iterating on a bad template is
+                    // alive and about to submit a valid job - don't unload out from under it.
+                    lastActivity = Date()
                 }
             case .job(let job):
                 if job.epoch != lastEpoch {
                     lastEpoch = job.epoch
-                    await process(job, container: container)
+                    await runJob(job)
                 }
             }
+            idleUnloadIfDue()
             try? await Task.sleep(nanoseconds: 150_000_000)  // 150 ms poll
         }
         log("spool directory gone; exiting")
+    }
+
+    /// Run one job, transparently reloading the model first if it was idle-unloaded. A reload
+    /// failure is reported against the job's epoch and leaves the model unloaded, so the NEXT
+    /// job (epoch contract: resubmit under a new epoch) retries the load.
+    private func runJob(_ job: Job) async {
+        let active: ModelContainer
+        if let loaded = container {
+            active = loaded
+        } else {
+            writeStatus(state: "loading", epoch: job.epoch, message: "Loading model...")
+            log("idle-reload: loading \((modelDir as NSString).lastPathComponent)")
+            do {
+                active = try await loadModel(modelDir, extraEOSTokens: extraEOSTokens)
+            } catch {
+                writeStatus(
+                    state: "error", epoch: job.epoch,
+                    message: "Model load failed: \(error.localizedDescription)")
+                log("idle-reload failed: \(error.localizedDescription)")
+                lastActivity = Date()
+                return
+            }
+            container = active
+            // The measured decode rate survives the unload; re-prime only if it never took.
+            if primedRate == 0 { primedRate = await primeAndMeasure(container: active) }
+        }
+        await process(job, container: active)
+        lastActivity = Date()
+    }
+
+    /// Release the model weights after `idleUnloadSeconds` without a job. Runs between polls
+    /// only, so it can never fire mid-generation. The spool protocol is untouched: status keeps
+    /// its last state (still truthful - the server remains ready to accept jobs), and the next
+    /// job passes through the same "loading" state the poller already handles at startup.
+    private func idleUnloadIfDue() {
+        guard idleUnloadSeconds > 0, container != nil,
+            Date().timeIntervalSince(lastActivity) >= idleUnloadSeconds
+        else { return }
+        // Snapshot while the weights are still loaded: dropping the container moves them into
+        // MLX's buffer cache, so a later snapshot would read ~0 active and hide what we freed.
+        let before = MLX.Memory.snapshot()
+        container = nil
+        // The container refs are gone, so the weights sit in MLX's buffer cache; clearCache
+        // returns that cache to the OS instead of holding it for the next allocation.
+        MLX.GPU.clearCache()
+        let after = MLX.Memory.snapshot()
+        let beforeMiB = (before.activeMemory + before.cacheMemory) / 1_048_576
+        let afterMiB = (after.activeMemory + after.cacheMemory) / 1_048_576
+        log(
+            "idle-unload: released \((modelDir as NSString).lastPathComponent) after "
+                + "\(Int(idleUnloadSeconds))s idle; resident \(beforeMiB)MiB -> \(afterMiB)MiB")
     }
 
     // MARK: Job processing
