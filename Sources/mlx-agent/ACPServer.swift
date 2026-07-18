@@ -176,7 +176,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         engine: EngineSpec, mcpConfigPath: String? = nil,
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
         systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
-        extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = 600
+        extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = IdleUnload.defaultSeconds
     ) {
         self.idleUnloadSeconds = idleUnloadSeconds
         switch engine {
@@ -282,34 +282,26 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// OS. A no-op if a prompt slipped in or the model is already unloaded - the promptTask guard
     /// is what guarantees we never unload mid-turn.
     private func idleFired() {
-        // Snapshot the footprint while the weights are STILL loaded: dropping the container moves
-        // them from MLX's active memory into its buffer cache, so a snapshot taken afterwards
-        // would read ~0 active and hide what we freed. active+cache is the real resident total.
-        let before = MLX.Memory.snapshot()
-        let dir: String? = lock.withLock {
-            // promptStarting covers the gap before promptTask is committed: never unload with a
-            // turn running OR about to run.
-            guard self.promptTask == nil, !self.promptStarting, self.container != nil else {
-                return nil
+        // Release mechanics (snapshot ordering, clearCache, log format) are shared with the
+        // other modes in IdleUnload.releaseModel; only the drop closure - what "clear every
+        // strong reference" means for the ACP session stack, and when it must abort - is
+        // this server's business.
+        let released = IdleUnload.releaseModel(afterIdle: idleUnloadSeconds, log: { self.log($0) }) {
+            lock.withLock {
+                // promptStarting covers the gap before promptTask is committed: never unload
+                // with a turn running OR about to run.
+                guard self.promptTask == nil, !self.promptStarting, self.container != nil else {
+                    return nil
+                }
+                self.container = nil
+                self.session = nil
+                self.backend = nil
+                self.agent = nil
+                self.idleUnloaded = true
+                return (self.currentModelDir as NSString).lastPathComponent
             }
-            self.container = nil
-            self.session = nil
-            self.backend = nil
-            self.agent = nil
-            self.idleUnloaded = true
-            return self.currentModelDir
         }
-        guard let dir else { return }
-        idleTimer = nil
-        // The container refs are gone, so the weights are now in MLX's buffer cache; clearCache
-        // returns that cache to the OS instead of holding it for the next allocation.
-        MLX.GPU.clearCache()
-        let after = MLX.Memory.snapshot()
-        let beforeMiB = (before.activeMemory + before.cacheMemory) / 1_048_576
-        let afterMiB = (after.activeMemory + after.cacheMemory) / 1_048_576
-        log(
-            "idle-unload: released \((dir as NSString).lastPathComponent) after "
-                + "\(Int(idleUnloadSeconds))s idle; resident \(beforeMiB)MiB -> \(afterMiB)MiB")
+        if released { idleTimer = nil }
     }
 
     /// Reload the model after an idle-unload and rebuild the session stack around the shadow

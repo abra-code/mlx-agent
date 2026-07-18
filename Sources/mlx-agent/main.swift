@@ -694,7 +694,7 @@ func doubleOption(_ name: String, in args: [String]) -> Double? {
 /// an operator who typed "5m" must not run with 10 minutes of resident weights believing
 /// their value took effect.
 func idleUnloadSecondsOption(in args: [String]) -> Double {
-    guard let raw = option("--idle-unload-seconds", in: args) else { return 600 }
+    guard let raw = option("--idle-unload-seconds", in: args) else { return IdleUnload.defaultSeconds }
     guard let v = Double(raw), v.isFinite, v >= 0 else {
         FileHandle.standardError.write(
             Data("invalid --idle-unload-seconds \"\(raw)\": expected a number of seconds (0 disables)\n".utf8))
