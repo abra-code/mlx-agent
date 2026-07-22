@@ -177,7 +177,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
 /// send and first byte), so a cancel that lands early is latched and applied to the task
 /// the moment it is handed over - otherwise llama-server would keep generating into a
 /// dropped connection.
-private final class URLTaskHandle: @unchecked Sendable {
+final class URLTaskHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var task: URLSessionTask?
     private var cancelled = false

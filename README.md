@@ -88,8 +88,19 @@ translation template's `{type, source_lang_code, target_lang_code, text}` - and 
 against the model's own unmodified chat template.
 
 ```
-mlx-agent map --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+mlx-agent map --backend mlx    --model <dir>    --spool <dir> [--extra-eos-token <t>] [gen flags]
+mlx-agent map --backend openai --base-url <url> --spool <dir> [gen flags]
 ```
+
+`--backend` (default `mlx`) picks the engine, and BOTH serve the identical spool protocol below -
+a producer cannot tell which one answered except by speed. `mlx` (the default) loads a local
+safetensors `--model` in-process (RAM-gated, with idle-unload). `openai` serves the spool from a
+**separately-launched llama-server** addressed by `--base-url` (its OpenAI-compatible root, e.g.
+`http://127.0.0.1:8188/v1`): no weights are loaded here, so there is no RAM gate and no idle-unload
+(llama-server does its own idle sleep). The server owns templating - `messages` jobs post the array
+to `/chat/completions` as-is (run llama-server with `--jinja`), and `prompt` jobs are tokenized via
+`/tokenize` honoring `add_special_tokens` exactly, then generated via `/completion` from the token
+ids. `--backend mlx` requires `--model`; `--backend openai` requires `--base-url`.
 
 The job carries a template with a `{{chunk}}` placeholder - either chat **`messages`**
 (rendered through the model's own chat template) or a raw completion **`prompt`** for models
@@ -150,6 +161,19 @@ prompt, e.g. MiLMMT-46 per its model card:
 {"epoch": 1, "text": "...", "output": "stitch", "add_special_tokens": false,
  "prompt": "Translate this from German to English:\nGerman: {{chunk}}\nEnglish:"}
 ```
+
+**Example - the openai backend** (a llama-server-served gguf): launch the server, then point the
+broker at it. The same `job.json` shapes above work unchanged (`messages` -> `/chat/completions`,
+`prompt` -> `/tokenize` + `/completion`):
+
+```
+llama-server --model <model.gguf> --host 127.0.0.1 --port 8188 --jinja &
+mlx-agent map --backend openai --base-url http://127.0.0.1:8188/v1 --spool <dir> \
+  --temperature 0 --max-new-tokens 2048
+```
+
+`tools/map_openai_smoke.py <mlx-agent> --base-url <url>` exercises this path (messages, prompt, and
+mid-generation cancellation) against a running server.
 
 ### ACP server (`acp`)
 

@@ -603,7 +603,8 @@ func usage() {
                                                           run one agent turn, print to stdout
           mlx-agent gate    [--model <dir>]               built-in tool-calling gate
           mlx-agent chat    [--model <dir>] --prompt <text>  load + stream one completion
-          mlx-agent map     --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+          mlx-agent map     [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                            --spool <dir> [--extra-eos-token <t>] [gen flags]
                                                           long-lived, spool-driven document map:
                                                           loads once, watches <spool>/job.json,
                                                           applies the job's per-chunk template
@@ -615,6 +616,10 @@ func usage() {
                                                           emits a per-chunk record. Translation,
                                                           proofread, rewrite, redact, classify,
                                                           extract are all just message templates.
+                                                          --backend openai serves the spool from a
+                                                          separately-launched llama-server (see
+                                                          --base-url); mlx (default) loads --model
+                                                          in-process.
           mlx-agent tools   --mcp-config <json>           launch the configured MCP servers and
                                                           dump their tool surface (exposed names,
                                                           descriptions, schemas, gating) as JSON;
@@ -630,14 +635,14 @@ func usage() {
                                                           mlx_lm's default, measured equal on M5)
 
         OPTIONS:
-          --backend mlx|openai     generation engine for acp/oneshot (default: mlx).
+          --backend mlx|openai     generation engine for acp/oneshot/map (default: mlx).
                                    mlx    = in-process mlx-swift-lm on a safetensors --model
                                    openai = a remote OpenAI-compatible --base-url (llama-server);
                                             no model is loaded here and the RAM gate is skipped
           --base-url <url>         OpenAI-compatible endpoint root, required by --backend openai
                                    (e.g. http://127.0.0.1:8099/v1); its /health is checked at
-                                   session/new. The MODEL is whatever that server was launched
-                                   with - it is not switchable from here.
+                                   session/new (acp) or at load (map). The MODEL is whatever that
+                                   server was launched with - it is not switchable from here.
           --model <dir>            model directory (or set MLX_AGENT_MODEL; required by the
                                    mlx backend and by gate/chat/map)
           --prompt <text>          prompt for chat/oneshot mode
@@ -874,12 +879,16 @@ do {
                 Data("map mode requires --spool <dir>\n".utf8))
             exit(2)
         }
+        // Same --backend selector as acp/oneshot (default mlx; mlx requires --model, openai
+        // requires --base-url). The openai path serves the spool from a separately-launched
+        // llama-server - no weights load here, so the RAM gate and idle-unload do not apply.
         await MapServer(
-            modelDir: requireModelDir(), spoolDir: spool,
+            engine: resolveEngine(cliArgs), spoolDir: spool,
             gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens,
             // Same idle-unload policy as the acp path (and llama-server's sleep): default 600s,
             // 0 disables. The map broker outlives its jobs by design, so without this a single
-            // translation left the weights resident until the owner app quit.
+            // translation left the weights resident until the owner app quit. MLX backend only;
+            // the openai engine opts out (llama-server does its own idle sleep).
             idleUnloadSeconds: idleUnloadSecondsOption(in: cliArgs)
         ).run()
     case "tools":
