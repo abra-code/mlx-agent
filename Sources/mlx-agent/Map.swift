@@ -890,9 +890,14 @@ private final class OpenAIMapEngine: MapEngine, @unchecked Sendable {
     var isLoaded: Bool { true }
 
     func load() async throws {
-        // Same health gate the acp/oneshot openai path uses: one clean error here if the server is
-        // down, rather than a failure on the first job. Mirrors an MLX load failure.
-        try await OpenAIBackend.waitForHealth(baseURL: baseURL)
+        // Same health gate the acp/oneshot openai path uses, but with a LONG patience window:
+        // llama-server answers /health 503 for the whole time it is loading its gguf, which for a
+        // 20 GB model is minutes, and the map broker is exactly the component whose job is to sit
+        // in state "loading" until the server is ready (the applet spawns both and does not wait
+        // itself). 120 attempts x ~2.5 s covers ~5 minutes; a genuinely absent server still fails
+        // with the same clean startup error. acp keeps the short default - an interactive
+        // session/new should not hang for minutes.
+        try await OpenAIBackend.waitForHealth(baseURL: baseURL, attempts: 120)
         if let name = await fetchModelName() { modelLabel = name }
     }
 
