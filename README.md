@@ -91,9 +91,12 @@ against the model's own unmodified chat template.
 mlx-agent map --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
 ```
 
-The job carries a chat-message template with a `{{chunk}}` placeholder; per chunk the server
-substitutes the chunk text for `{{chunk}}` (at the parsed-object level, so no escaping is
-needed), applies the model's template, and generates. Two output modes:
+The job carries a template with a `{{chunk}}` placeholder - either chat **`messages`**
+(rendered through the model's own chat template) or a raw completion **`prompt`** for models
+that ship no chat template and are prompted as plain completions (e.g. MT models like
+MiLMMT-46 or Seed-X). Per chunk the server substitutes the chunk text for `{{chunk}}` (for
+`messages` at the parsed-object level, so no escaping is needed), tokenizes, and generates.
+Two output modes:
 
 - **stitch** (default) - reassemble the per-chunk outputs into one document, preserving the
   verbatim inter-chunk separators. For text->text transforms (translate, proofread, rewrite,
@@ -105,7 +108,10 @@ needed), applies the model's template, and generates. Two output modes:
 Spool protocol (writes are atomic - temp file + rename - except the append-only jsonl):
 
 - **in** `job.json` - `{"epoch": N, "text": "...", "budget_tokens": 1200, "output":
-  "stitch"|"collect", "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}`.
+  "stitch"|"collect", "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}` - or, in
+  place of `messages`, `"prompt": "<completion prompt with {{chunk}}>"` plus an optional
+  `"add_special_tokens": true|false` (default `true`; whether the tokenizer wraps the prompt
+  in BOS/EOS, mirroring HF - exactly one of `messages`/`prompt` must be present).
   Producers write it via atomic rename; a new job is one with a higher `epoch`.
   `budget_tokens` (default 1200) caps the per-chunk source token count. In place of inline
   `text`, a job may set `"text_file": "<name>"` to read the source from that file in the spool
@@ -137,7 +143,13 @@ exits when the spool directory disappears (owner quit) or stdin hits EOF (parent
 against `mlx-agent map --model <dir> --spool <dir> --extra-eos-token "<end_of_turn>"
 --temperature 0 --max-new-tokens 2048`. A string-content instruct model instead takes e.g.
 `"messages": [{"role": "user", "content": "Correct the grammar; output only the corrected
-text:\n\n{{chunk}}"}]`.
+text:\n\n{{chunk}}"}]`. A completion-prompted MT model (no chat template) takes a raw
+prompt, e.g. MiLMMT-46 per its model card:
+
+```json
+{"epoch": 1, "text": "...", "output": "stitch", "add_special_tokens": false,
+ "prompt": "Translate this from German to English:\nGerman: {{chunk}}\nEnglish:"}
+```
 
 ### ACP server (`acp`)
 

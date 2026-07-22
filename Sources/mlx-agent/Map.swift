@@ -13,9 +13,11 @@
 // carry STRUCTURED content (e.g. a translation template's {type, source_lang_code,
 // target_lang_code, text}) and render it against the model's OWN unmodified chat template.
 //
-// The job supplies a chat-message template with a `{{chunk}}` placeholder; per chunk the
-// server substitutes the chunk text for the placeholder, applies the model's template, and
-// generates. Two output modes:
+// The job supplies a template with a `{{chunk}}` placeholder - either chat `messages`
+// rendered through the model's own chat template, or a raw completion `prompt` for models
+// that ship no chat template and are prompted as plain completions (e.g. MT models like
+// MiLMMT-46 or Seed-X). Per chunk the server substitutes the chunk text for the
+// placeholder, tokenizes, and generates. Two output modes:
 //   - stitch (default): reassemble the per-chunk outputs into one document, preserving the
 //     verbatim inter-chunk separators -> result.txt (progressive).
 //   - collect: emit a per-chunk record -> results.jsonl (one JSON object per line). Use for
@@ -24,7 +26,9 @@
 // Spool protocol (writes are atomic - temp file + rename - except the append-only jsonl):
 //   in:  job.json  {"epoch": N, "text": "...", "budget_tokens": 1200,
 //                   "output": "stitch"|"collect",
-//                   "messages": [ <chat messages, with "{{chunk}}" somewhere> ]}
+//                   "messages": [ <chat messages, with "{{chunk}}" somewhere> ]
+//                   | "prompt": "<completion prompt with {{chunk}}>"
+//                     [, "add_special_tokens": true|false]}   // prompt only; default true
 //        stop       empty flag file; requests cancellation of the current job
 //   out: status.json {"state": loading|ready|mapping|done|cancelled|error,
 //                     "epoch": N, "chunk": k, "total": N, "message": "...",
@@ -93,13 +97,22 @@ private final class JobMeter: @unchecked Sendable {
 final class MapServer: @unchecked Sendable {
     private enum Output { case stitch, collect }
 
+    /// The job's per-chunk template: chat `messages` rendered through the model's own chat
+    /// template, or a raw completion `prompt` for models that ship none. `specialTokens`
+    /// mirrors HF's `add_special_tokens` (whether the tokenizer wraps the prompt in BOS/EOS);
+    /// chat templates emit their own special tokens, so it applies to `prompt` only.
+    private enum Template: Sendable {
+        case messages(Data)  // JSON of the `messages` template (carries {{chunk}})
+        case prompt(String, specialTokens: Bool)
+    }
+
     /// A map request read from the spool.
     private struct Job {
         let epoch: Int
         let text: String
         let budget: Int
         let output: Output
-        let messagesData: Data  // JSON of the `messages` template (carries {{chunk}})
+        let template: Template
     }
 
     /// One chunk's generation result plus the exact decode stats for tok/s.
@@ -267,10 +280,17 @@ final class MapServer: @unchecked Sendable {
         // The template must carry the placeholder in a substitutable value, else every chunk
         // would get the same text-less prompt - a producer mistake worth a clear error rather
         // than silent garbage.
-        if !Self.templateHasPlaceholder(job.messagesData) {
-            writeStatus(
-                state: "error", epoch: job.epoch,
-                message: "messages template has no \(Self.placeholder) placeholder value")
+        let placeholderMissing: String?
+        switch job.template {
+        case .messages(let data):
+            placeholderMissing = Self.templateHasPlaceholder(data)
+                ? nil : "messages template has no \(Self.placeholder) placeholder value"
+        case .prompt(let prompt, _):
+            placeholderMissing = prompt.contains(Self.placeholder)
+                ? nil : "prompt template has no \(Self.placeholder) placeholder"
+        }
+        if let placeholderMissing {
+            writeStatus(state: "error", epoch: job.epoch, message: placeholderMissing)
             return
         }
 
@@ -367,7 +387,7 @@ final class MapServer: @unchecked Sendable {
             let result: ChunkResult
             do {
                 result = try await generate(
-                    chunk: chunk.text, messagesData: job.messagesData,
+                    chunk: chunk.text, template: job.template,
                     params: params, container: container, meter: meter)
             } catch {
                 await stopReporter()
@@ -409,8 +429,9 @@ final class MapServer: @unchecked Sendable {
             job.epoch, sumGenTokens, sumGenTime, decodeRate))
     }
 
-    /// Generate one chunk's output: render the job's message template with the chunk text
-    /// substituted for `{{chunk}}`, apply the model's own chat template, and generate.
+    /// Generate one chunk's output: render the job's template with the chunk text substituted
+    /// for `{{chunk}}` - through the model's own chat template for `messages`, or by direct
+    /// tokenization for a raw completion `prompt` - and generate.
     ///
     /// The whole generation runs INSIDE `container.perform`, so the model's serial-access mutex
     /// is held for the entire decode (not just prefill). A stop request `cancel()`s the decode
@@ -418,14 +439,22 @@ final class MapServer: @unchecked Sendable {
     /// fully finished before this closure returns and releases the mutex - the next job's
     /// generation can never overlap a still-running decode.
     private func generate(
-        chunk: String, messagesData: Data, params: GenerateParameters,
+        chunk: String, template: Template, params: GenerateParameters,
         container: ModelContainer, meter: JobMeter
     ) async throws -> ChunkResult {
         let stopURL = self.stopURL
         let stride = self.stopCheckStride
         return try await container.perform { context -> ChunkResult in
-            let messages = try Self.renderMessages(messagesData, chunk: chunk)
-            let tokens = try context.tokenizer.applyChatTemplate(messages: messages)
+            let tokens: [Int]
+            switch template {
+            case .messages(let messagesData):
+                let messages = try Self.renderMessages(messagesData, chunk: chunk)
+                tokens = try context.tokenizer.applyChatTemplate(messages: messages)
+            case .prompt(let prompt, let specialTokens):
+                tokens = context.tokenizer.encode(
+                    text: prompt.replacingOccurrences(of: Self.placeholder, with: chunk),
+                    addSpecialTokens: specialTokens)
+            }
             let iterator = try TokenIterator(
                 input: LMInput(tokens: MLXArray(tokens)), model: context.model,
                 cache: nil, parameters: params)
@@ -620,17 +649,43 @@ final class MapServer: @unchecked Sendable {
         } else {
             return .invalid(epoch: epoch, reason: "job has no \"text\" or readable \"text_file\"")
         }
-        guard let messages = obj["messages"] as? [[String: Any]], !messages.isEmpty,
-            let messagesData = try? JSONSerialization.data(withJSONObject: messages)
-        else {
-            return .invalid(epoch: epoch, reason: "job has no valid \"messages\" array")
+        // The per-chunk template is EITHER chat `messages` OR a raw completion `prompt` -
+        // exactly one. Both present is ambiguous (which would win?), so it is rejected rather
+        // than silently preferring one. An explicit JSON null (NSNull) counts as absent, so
+        // {"prompt": "...", "messages": null} means what the producer meant.
+        func present(_ key: String) -> Any? {
+            let v = obj[key]
+            return v is NSNull ? nil : v
+        }
+        let template: Template
+        switch (present("messages"), present("prompt")) {
+        case (.some, .some):
+            return .invalid(epoch: epoch, reason: "job has both \"messages\" and \"prompt\"")
+        case (.some(let raw), nil):
+            guard let messages = raw as? [[String: Any]], !messages.isEmpty,
+                let messagesData = try? JSONSerialization.data(withJSONObject: messages)
+            else {
+                return .invalid(epoch: epoch, reason: "job has no valid \"messages\" array")
+            }
+            template = .messages(messagesData)
+        case (nil, .some(let raw)):
+            guard let prompt = raw as? String, !prompt.isEmpty else {
+                return .invalid(epoch: epoch, reason: "job \"prompt\" is not a non-empty string")
+            }
+            // Mirrors HF's add_special_tokens: whether the tokenizer wraps the prompt in
+            // BOS/EOS. Default true (the tokenizer's standard behavior); a model card that
+            // says add_special_tokens=False (e.g. MiLMMT-46) sets false.
+            let special = (obj["add_special_tokens"] as? NSNumber)?.boolValue ?? true
+            template = .prompt(prompt, specialTokens: special)
+        case (nil, nil):
+            return .invalid(epoch: epoch, reason: "job has no \"messages\" array or \"prompt\" string")
         }
         let budget = (obj["budget_tokens"] as? NSNumber)?.intValue ?? 1200
         let output: Output = (obj["output"] as? String == "collect") ? .collect : .stitch
         return .job(
             Job(
                 epoch: epoch, text: text, budget: max(64, budget), output: output,
-                messagesData: messagesData))
+                template: template))
     }
 
     private func writeText(_ text: String, to url: URL) {

@@ -606,8 +606,9 @@ func usage() {
           mlx-agent map     --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
                                                           long-lived, spool-driven document map:
                                                           loads once, watches <spool>/job.json,
-                                                          applies the job's per-chunk message
-                                                          template ({{chunk}} placeholder)
+                                                          applies the job's per-chunk template
+                                                          (chat messages, or a raw completion
+                                                          prompt; {{chunk}} placeholder)
                                                           independently to each chunk of the input;
                                                           output stitch (-> result.txt) reassembles
                                                           one document, collect (-> results.jsonl)
