@@ -53,6 +53,12 @@ packages:
   swift-sdk:
     url: https://github.com/modelcontextprotocol/swift-sdk
     majorVersion: 0.9.0
+  # Transitive via swift-transformers (which only asks for 2.0.0+), but pinned here because
+  # agentic MLX turns need >= 2.4.2: string filters coerce undefined/null (Jinja2 soft_str),
+  # which gemma-family tool templates rely on (value['type'] | upper on optional MCP params).
+  swift-jinja:
+    url: https://github.com/huggingface/swift-jinja.git
+    majorVersion: 2.4.2
 
 targets:
   # Foundation-only chunker for the map mode. Its own target so its logic can be tested

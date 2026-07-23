@@ -1,28 +1,9 @@
-# xcodebuild's -derivedDataPath. Deliberately NOT hidden (it was .build/ while this was a
-# SwiftPM package): the build output is large, is what every consumer script reaches into,
-# and hiding it made three build locations easy to lose track of. Every script and the
-# README pass `-derivedDataPath build`, so products land in build/Build/Products/<config>/.
 build/
-# CORRECTION (2026-07-15): d01200f removed this line, arguing that with Package.swift gone
-# nothing could recreate .build/ so the rule would be dead text. That was wrong. Xcode's
-# background INDEXER still writes .build/index-build/ (SourceKit-LSP's path) whenever the
-# project is open in the IDE - 32MB reappeared here with no SwiftPM anywhere in sight, and
-# a stale macro plugin was still running out of it. `xcodebuild` alone does NOT recreate it
-# (verified by deleting the directory and running a full build), which is exactly why the
-# earlier claim survived a command-line-only check. Without this line those 32MB sit
-# untracked, one `git add -A` away from the history.
 .build/
 .swiftpm/
-# mlx-agent.xcodeproj IS committed - it is generated from project.yml by `xcodegen generate`,
-# but it carries the two shared schemes (both with coverage off) and the resolved dependency
-# pins (project.xcworkspace/xcshareddata/swiftpm/Package.resolved), so it has to be in the
-# repo. Only the per-user state inside it is ignored.
-*.xcodeproj/xcuserdata/
-*.xcodeproj/project.xcworkspace/xcuserdata/
+xcuserdata/
 *.xcodeproj/project.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
 DerivedData/
-# The tools/ smoke tests import each other (`sys.path.insert(0, "tools")`, then
-# `from acp_smoke import Agent`), so running any of them leaves tools/__pycache__ behind.
 __pycache__/
 .DS_Store
 Private/
