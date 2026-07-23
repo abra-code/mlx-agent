@@ -10,11 +10,15 @@ permission gate before any mutating tool.
 ## Modes
 
 ```
-mlx-agent acp       [--model <dir>] [--mcp-config <json>] [--mode chat|agent] [guardrails]
-mlx-agent oneshot   [--model <dir>] --prompt <text> [--mcp-config <json>]
+mlx-agent acp       [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                    [--mcp-config <json>] [--mode chat|agent] [guardrails]
+mlx-agent oneshot   [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                    --prompt <text> [--mcp-config <json>]
                     [--auto-permission allow|deny] [guardrails]
 mlx-agent chat      [--model <dir>] --prompt <text>
-mlx-agent translate --model <dir> --spool <dir> [--extra-eos-token <t>] [gen flags]
+mlx-agent map       [--backend mlx|openai] [--model <dir> | --base-url <url>]
+                    --spool <dir> [--extra-eos-token <t>] [gen flags]
+mlx-agent tools     --mcp-config <json>
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
@@ -24,7 +28,9 @@ mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--ru
 - **oneshot** - run one agent turn and print it; non-interactive, for scripts and tests.
   `--auto-permission` answers the permission gate (default `deny`).
 - **chat** - load a model and stream a single completion.
-- **translate** - long-lived, spool-driven translator. See below.
+- **map** - long-lived, spool-driven map over document chunks. See below.
+- **tools** - launch the `--mcp-config` servers and dump their tool surface as JSON, no
+  model load; for inspecting exactly what schemas the model would see.
 - **gate** - a self-contained tool-calling correctness check (a handful of fixed cases),
   useful to catch a regression in the underlying engine without the full ACP stack.
 - **bench** - inference speed benchmark using the methodology of Apple's M5 MLX post
@@ -38,6 +44,16 @@ mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--ru
 
 Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
 (60), `--tool-result-bytes <n>` (32768).
+
+`--backend` (default `mlx`) on `acp`, `oneshot`, and `map` picks the engine: `mlx` loads a
+local safetensors `--model` in-process; `openai` serves from a separately-launched
+llama-server addressed by `--base-url` (see the map section for the tradeoffs - they apply
+to all three modes).
+
+Idle unload (`acp` and `map`, MLX backend only): `--idle-unload-seconds <sec>` (default
+600, `0` disables) unloads the resident weights after that much idle time and reloads them
+on the next request, mirroring llama-server's `--sleep-idle-seconds`. Ignored on the
+openai backend, where llama-server does its own idle sleep.
 
 ### System prompt and generation flags (`acp`, `oneshot`, `chat`)
 
@@ -130,7 +146,8 @@ Spool protocol (writes are atomic - temp file + rename - except the append-only 
 - **in** `stop` - an empty flag file; requests cancellation of the current job. Checked
   between chunks and during generation (an in-flight chunk is cancelled).
 - **out** `status.json` - `{"state": loading|ready|mapping|done|cancelled|error, "epoch": N,
-  "chunk": k, "total": N, "message": "..."}`.
+  "chunk": k, "total": N, "message": "..."}`, plus optional progress fields while mapping
+  (`tok_per_sec`, `tokens_done`, `tokens_total`, `eta_sec`).
 - **out** `result.txt` (stitch) - the accumulated stitched output so far (grows per chunk).
 - **out** `results.jsonl` (collect) - one `{"index", "source", "output", "sep"}` object per
   line, appended as each chunk finishes. `concat(source + sep)` over the records reproduces
@@ -180,7 +197,9 @@ mid-generation cancellation) against a running server.
 Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `session/new`
 (`configOptions` is always empty - see below), `session/prompt` (streams
 `agent_message_chunk` and, for thinking models, `agent_thought_chunk` split out of
-`<think></think>`), `session/cancel`, and `session/set_config_option` (switches the model).
+`<think></think>`), `session/cancel`, `session/set_config_option` (switches the model),
+and `session/prime` (replaces the session context with a supplied transcript for
+resume/fresh flows - see [`docs/session-prime.md`](docs/session-prime.md)).
 One `ChatSession` per process; its KV cache persists across prompts. All logging is on
 stderr; stdout is JSON-RPC only.
 

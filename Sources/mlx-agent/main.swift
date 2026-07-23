@@ -4,8 +4,10 @@
 //   acp      - Agent Client Protocol server over stdio (chat + agentic tools)
 //   oneshot  - run one agent turn and print it (non-interactive; drives test suites)
 //   chat     - load a model and stream a single completion
-//   gate     - built-in tool-calling correctness check (5 fixed cases)
+//   map      - long-lived, spool-driven map over document chunks (see Map.swift)
 //   tools    - launch the --mcp-config servers, dump their tool surface as JSON (no model)
+//   gate     - built-in tool-calling correctness check (5 fixed cases)
+//   bench    - inference speed benchmark (TTFT, prefill/generation tok/s; see Bench.swift)
 //
 // `gate` is a self-contained diagnostic: it drives ChatSession's tool machinery over a
 // handful of prompts (single tool call, correct args, parallel calls, and a negative
