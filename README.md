@@ -304,50 +304,10 @@ logic in its own target: `ThinkSplitter` lived in `ACPServer.swift`, was therefo
 untestable in seconds, and shipped a bug for it. Anything that does not need MLX belongs
 in a library target with tests.
 
-### Code coverage: never ship an instrumented binary
+### Code coverage
 
-Both schemes pin coverage OFF, and that matters more than it sounds. **Coverage is a
-scheme-level setting, not a per-target one** - it applies to the WHOLE build graph, so
-every dependency gets instrumented alongside the tool. Do not try to control it with
-per-target `settings:` in `project.yml`: those never reach the SPM package targets, so
-you get a MIXED binary (deps instrumented, product not) that is worse than either
-extreme and nearly invisible. Command-line `CLANG_ENABLE_CODE_COVERAGE=NO` has exactly
-that effect, and `-enableCodeCoverage NO` is rejected outside `test`.
-
-An instrumented binary is ~35% larger, slower in a hot token loop, and dumps a multi-MB
-`default.profraw` into its working directory on EVERY run - in the shipped app, wherever
-the host happens to be running from.
-
-This bit us before: this package used to be built via an auto-generated scheme (no
-`Package.swift` scheme was checked in), and **adding a `.testTarget` silently switched
-coverage on for the whole graph** - reproducible in a two-file package. That trap is gone
-with a real project and committed schemes, but verify the shipped binary anyway:
-
-```
-otool -l <binary> | grep -c __llvm_prf_cnts     # 0 = clean
-```
-
-Use the section check above, NOT `nm | grep __llvm_prf`: nm reports 0 for a small
-instrumented binary (false clean). The runtime check never lies - run the binary and
-see whether a `default.profraw` appears next to it.
+Building with code coverage OFF. Details: [`docs/code-coverage.md`](docs/code-coverage.md).
 
 ## Dependency pins
 
-Version ranges live in `project.yml` (`packages:`); the exact resolved versions live in
-`mlx-agent.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`, which is
-committed - that file is what makes a build reproducible, so review it in diffs.
-
-- `mlx-swift-lm` 3.31.4 (MLXLLM, MLXLMCommon, MLXHuggingFace)
-- `mlx-swift` 0.31.6 (MLX; `minorVersion: 0.31.4`, i.e. up-to-next-minor, to match mlx-swift-lm)
-- `swift-transformers` 1.3.x (Tokenizers) - mlx-swift-lm 3.x decoupled the tokenizer
-  integration into an OPT-IN dependency the consumer must supply; the
-  `#huggingFaceTokenizerLoader()` macro expands to `Tokenizers.AutoTokenizer`.
-  `swift-huggingface` 0.9.0 comes in transitively (the `HuggingFace`/Hub client).
-- `swift-sdk` (MCP) 0.9.0+ - MCP stdio tool clients (one per configured server).
-- `swift-jinja` 2.4.2+ - transitive via swift-transformers (which only asks for 2.0.0+),
-  pinned explicitly because agentic MLX turns need the 2.4.2 string-filter coercion fix
-  (undefined/null coerce like Jinja2's `soft_str`; gemma-family tool templates do
-  `value['type'] | upper` on optional MCP params).
-
-The graph resolves cleanly against mlx-swift-lm's `swift-syntax 602..<604`
-constraint (resolves 603.0.2 with prebuilt macro binaries).
+The pin list and the rationale for each: [`docs/dependency-pins.md`](docs/dependency-pins.md).

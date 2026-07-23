@@ -39,7 +39,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: complete
 
 packages:
-  # Pins mirror the graph that Package.resolved held; keep them and README's "Dependency pins"
+  # Pins mirror the graph that Package.resolved held; keep them and docs/dependency-pins.md
   # in step. mlx-swift is upToNextMinor to match what mlx-swift-lm expects.
   mlx-swift-lm:
     url: https://github.com/ml-explore/mlx-swift-lm
