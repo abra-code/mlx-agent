@@ -1,20 +1,21 @@
 // Backend.swift - the generation seam the tool loop runs against.
 //
-// The tool loop (Agent.runTurn) is written against GenerationBackend, NOT against
-// ChatSession directly, so an alternative backend (e.g. a remote OpenAI-compatible
-// endpoint) can slot in without touching the loop. The currency types are MLXLMCommon's
+// The tool loop (Agent.runTurn) is written against GenerationBackend, NOT against a
+// concrete engine, so an alternative backend (e.g. a remote OpenAI-compatible endpoint)
+// can slot in without touching the loop. The currency types are MLXLMCommon's
 // (Chat.Message, Generation, ToolSpec, ToolCall) - plain Codable data that any backend
-// can translate to/from its own wire format. The MLX impl below wraps a ChatSession with
-// toolDispatch LEFT NIL so tool calls surface as `.toolCall` Generation values for the
-// external loop to dispatch; this is what lets us enforce the iteration cap / timeout /
-// dedup guardrails that the library's internal restart loop (ChatSession.streamMap) does
-// not provide.
+// can translate to/from its own wire format. Tool calls surface as `.toolCall` events for
+// the external loop to dispatch, which is what lets us enforce the iteration cap /
+// timeout / dedup guardrails that mlx-swift-lm's own internal restart loop does not
+// provide.
 //
-// Two backends live here:
-//   MLXBackend    - in-process mlx-swift-lm ChatSession (safetensors).
+// Two backends live here, and they are deliberately symmetric: each owns its conversation
+// as [Chat.Message], sends the whole of it every pass, and guards that state with a lock.
+//   MLXBackend    - in-process mlx-swift-lm (safetensors), driving TokenIterator directly.
 //   OpenAIBackend - a remote OpenAI-compatible /chat/completions endpoint (llama-server).
 
 import Foundation
+import MLX
 import MLXLMCommon
 import MLXLLM
 
@@ -56,41 +57,175 @@ protocol GenerationBackend: AnyObject, Sendable {
     func clear() async
 }
 
-/// mlx-swift-lm backend: a ChatSession driven with `toolDispatch == nil` so the tool
-/// loop stays external. `streamDetails(to:)` yields `.chunk` / `.toolCall` / `.info`.
+/// mlx-swift-lm backend. Owns the conversation and the KV cache, and renders the FULL
+/// conversation through the model's chat template on every pass.
 ///
-/// ChatSession is documented as not thread-safe and is not Sendable; this wrapper is
-/// `@unchecked Sendable` on the same contract the rest of the agent honors - it is only
-/// ever touched from within a single in-flight prompt Task at a time (ACPServer
-/// serializes prompts; oneshot runs one turn). We never run two turns concurrently on
-/// one session.
+/// WHY NOT ChatSession - this is the fix for a tool-call loop, so do not "simplify" it back.
+///
+/// ChatSession is incremental: it keeps conversation state in the KV cache and applies the chat
+/// template to only the messages appended since the previous pass. But it passes `tools` (and
+/// re-prepends `instructions`) on EVERY application. Chat templates are written to render a
+/// COMPLETE conversation, so applying one to a suffix re-emits whatever preamble it puts at the
+/// top. For Qwen3 that top is `{%- if tools %}`, so every tool-result pass appended:
+///
+///     <|im_start|>system
+///     {the whole system prompt}
+///
+///     # Tools
+///     You may call one or more functions to assist with the user query.
+///     ...<tools>{...}</tools>...
+///     <|im_end|>
+///     <|im_start|>user
+///     <tool_response>
+///     ...the result...
+///     </tool_response><|im_end|>
+///     <|im_start|>assistant
+///
+/// A fresh "you may call one or more functions" instruction landed immediately before every
+/// assistant turn, so the model called the tool again, and again, until Agent's iteration cap
+/// ended the turn with no answer. Measured in Cadabra 2026-07-27: eight identical `pdf_text`
+/// calls on "summarize this PDF", thoughts empty from the third on. ChatSession's own internal
+/// tool loop (`toolDispatch`) has the same defect, so using that instead would not help.
+///
+/// Rendering the whole conversation each pass is simply what the template contract asks for, and
+/// it is template-agnostic - no per-model special-casing, which is what every narrower workaround
+/// would have needed (this codebase has already been bitten once by a model-specific template
+/// quirk). Conversation ownership mirrors OpenAIBackend, which already works exactly this way.
+///
+/// The KV cache is still reused: the freshly rendered token sequence is matched against the
+/// tokens the cache already holds, the cache is trimmed back to the common prefix, and only the
+/// genuinely new tokens are prefilled. In steady state that is the new tool result plus a
+/// re-render of the last assistant turn - everything before it is reused. If the cache cannot be
+/// trimmed, it is rebuilt instead: slower, never wrong.
+///
+/// Two costs this design pays that the old incremental one did not, both logged rather than hidden:
+///
+/// - **Sliding-window models re-prefill everything.** `RotatingKVCache.isTrimmable` goes false once
+///   the conversation passes the window, and a trim is always needed (the re-rendered assistant turn
+///   never matches the raw generated tokens), so Gemma 3/4/3n, GPT-OSS, Exaone4, Mistral3 and
+///   friends rebuild every pass. Append-only never had to trim, so it never hit this.
+/// - **The whole conversation is re-rendered and re-tokenized every pass**, even to feed a hundred
+///   new tokens. Cheap next to prefill, but it scales with conversation length times tool
+///   iterations.
+///
+/// `@unchecked Sendable`: `toolSpecs` is lock-guarded and everything else is reachable only from
+/// inside `PassGate`, which serializes entire passes. Do NOT go back to relying on "one prompt at a
+/// time" - the ACP cancel window breaks that assumption, and the crash it caused is described on
+/// PassGate.
 final class MLXBackend: GenerationBackend, @unchecked Sendable {
-    private let session: ChatSession
 
-    init(_ session: ChatSession) {
-        self.session = session
+    /// Carries the non-Sendable model pieces out of `ModelContainer.perform`; the library's own
+    /// `SendableBox` is `package`-scoped. Using the model outside the lock is the same contract
+    /// ChatSession relies on: the weights are not mutated, and each backend owns a private
+    /// KVCache, which is the part that genuinely cannot be shared.
+    private final class Box<T>: @unchecked Sendable {
+        let value: T
+        init(_ value: T) { self.value = value }
+    }
+
+    /// Serializes a whole pass - append, render, prefill, generate, record - against this backend.
+    ///
+    /// This replaces protection that ChatSession used to provide and that dropping it silently
+    /// removed: `ChatSession.streamMap` wrapped its entire generation in `cache.update { }` on a
+    /// SerialAccessContainer, so two overlapping passes on one session BLOCKED. Without it they
+    /// interleave, and the ACP cancel window makes that reachable with a contract-abiding client:
+    /// Agent returns `.cancelled` from inside its `for try await`, so the pass Task is only
+    /// cancelled asynchronously (via the stream iterator's deinit), while ACPServer's `defer`
+    /// clears `promptTask` at once and accepts the next prompt. The abandoned pass is then still
+    /// inside `await genTask.value` with its `cachedTokens`/`messages` writes pending while the new
+    /// pass trims the same cache. Measured: a hard `[broadcast_shapes]` SIGTRAP that kills the
+    /// process, at round 6-11 of a cancel/prompt loop.
+    ///
+    /// An `actor` cannot do this job: actors are reentrant across `await`, so a second call would
+    /// interleave at the first suspension point - which is most of a pass.
+    private actor PassGate {
+        private var busy = false
+        private var waiting: [CheckedContinuation<Void, Never>] = []
+
+        /// Non-cancellable on purpose: a waiter that bailed on cancellation would let the next pass
+        /// start while this one still owns the cache, which is the bug this exists to prevent.
+        func acquire() async {
+            guard busy else { busy = true; return }
+            await withCheckedContinuation { waiting.append($0) }
+        }
+
+        func release() {
+            if waiting.isEmpty { busy = false } else { waiting.removeFirst().resume() }
+        }
+    }
+
+    /// Runs `body` as the only pass in flight. Lives here rather than on the actor because a
+    /// non-Sendable closure cannot cross into an actor under strict concurrency; the mutual
+    /// exclusion is the actor's, the scoping is ours.
+    private func withPass<T>(_ body: () async throws -> T) async rethrows -> T {
+        await gate.acquire()
+        do {
+            let result = try await body()
+            await gate.release()
+            return result
+        } catch {
+            await gate.release()
+            throw error
+        }
+    }
+
+    private let container: ModelContainer
+    private let instructions: String?
+    private let parameters: GenerateParameters
+    private let gate = PassGate()
+
+    /// Guards `toolSpecs` only. Everything else is reachable exclusively from inside `gate`.
+    private let lock = NSLock()
+    private var toolSpecs: [ToolSpec]?
+
+    /// The authoritative conversation, system message included. Gate-owned.
+    private var messages: [Chat.Message]
+    /// Whether the last recorded assistant message carried tool calls that have not been answered.
+    /// Tracked here because `Chat.Message.Tool.storage` is fileprivate to the library - a recorded
+    /// message cannot be inspected for tool calls after the fact. Gate-owned.
+    private var lastAssistantHasUnansweredCalls = false
+
+    /// The KV cache, and the prompt tokens it is known to hold. The cache also holds whatever the
+    /// model generated after that prompt, whose token ids we never see; the surplus is trimmed on
+    /// the next pass, which is also how a cancelled or failed pass self-heals. Gate-owned.
+    private var cache: [KVCache] = []
+    private var cachedTokens: [Int] = []
+
+    init(
+        container: ModelContainer, instructions: String?, history: [Chat.Message] = [],
+        parameters: GenerateParameters, tools: [ToolSpec]? = nil
+    ) {
+        self.container = container
+        self.instructions = instructions
+        self.parameters = parameters
+        self.toolSpecs = tools
+        self.messages = (instructions.map { [Chat.Message.system($0)] } ?? []) + history
     }
 
     var tools: [ToolSpec]? {
-        get { session.tools }
-        set { session.tools = newValue }
+        get { lock.withLock { toolSpecs } }
+        set { lock.withLock { toolSpecs = newValue } }
     }
 
-    /// The library's `Generation` values, relabelled as `BackendEvent`. This path never
-    /// yields `.reasoning`: mlx-swift-lm streams raw text, so any <think> markers are
-    /// inline and it is ThinkSplitter's job to find them.
-    func stream(_ messages: [Chat.Message]) -> AsyncThrowingStream<BackendEvent, Error> {
-        let upstream = session.streamDetails(to: messages)
+    /// The library's `Generation` values, relabelled as `BackendEvent`. This path never yields
+    /// `.reasoning`: mlx-swift-lm streams raw text, so any <think> markers are inline and it is
+    /// ThinkSplitter's job to find them.
+    ///
+    /// `new` is appended INSIDE the gate rather than here, so that a pass abandoned by a cancel
+    /// finishes recording its own turn before the next prompt's turn lands. Appending here would
+    /// make the ordering a race - the hazard OpenAIBackend documents on `flushAbandonedTextLocked`.
+    func stream(_ new: [Chat.Message]) -> AsyncThrowingStream<BackendEvent, Error> {
+        // Boxed because Chat.Message is not Sendable and a Task closure is `sending`. Ownership
+        // really is transferred - the caller builds this array for us and does not keep it.
+        let input = Box(new)
         return AsyncThrowingStream { continuation in
-            let task = Task {
+            // weak: an idle-unload drops the backend to release the model, and a pass Task holding
+            // self strongly would pin the weights it is trying to free.
+            let task = Task { [weak self] in
+                guard let self else { return continuation.finish() }
                 do {
-                    for try await generation in upstream {
-                        switch generation {
-                        case .chunk(let text): continuation.yield(.text(text))
-                        case .toolCall(let call): continuation.yield(.toolCall(call))
-                        case .info(let info): continuation.yield(.info(info))
-                        @unknown default: break
-                        }
+                    try await self.withPass {
+                        try await self.runPass(appending: input.value, yielding: continuation)
                     }
                     continuation.finish()
                 } catch {
@@ -102,7 +237,169 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
     }
 
     func clear() async {
-        await session.clear()
+        await withPass {
+            messages = instructions.map { [Chat.Message.system($0)] } ?? []
+            lastAssistantHasUnansweredCalls = false
+            cache = []
+            cachedTokens = []
+        }
+    }
+
+    private func log(_ s: String) {
+        FileHandle.standardError.write(Data("[mlx-agent mlx] \(s)\n".utf8))
+    }
+
+    /// Keeps the conversation renderable before the new turn lands.
+    ///
+    /// Both hazards are the price of rendering the whole history every pass, and OpenAIBackend
+    /// already pays it (`stripUnansweredToolCalls`, `mergeAdjacentUserTurns`) for the same reason:
+    /// a strict template `raise_exception`s on a malformed history, and because every later pass
+    /// re-renders the same messages, that failure would repeat for the rest of the session rather
+    /// than spoiling one turn.
+    ///
+    /// - An assistant turn announcing tool calls that were never answered - the iteration cap fires
+    ///   between announcement and dispatch, a permission is cancelled, or a cancel lands mid-
+    ///   dispatch. Reachable today with `--max-tool-iters 1`.
+    /// - Two user turns in a row, when a pass throws and records no assistant reply.
+    private func reconcileHistory(before new: [Chat.Message]) {
+        if lastAssistantHasUnansweredCalls, new.first?.role != .tool, let last = messages.indices.last {
+            log("dropping unanswered tool-call announcement from the rendered history")
+            messages[last] = .assistant(messages[last].content)
+        }
+        lastAssistantHasUnansweredCalls = false
+
+        guard let first = new.first, first.role == .user,
+            let last = messages.indices.last, messages[last].role == .user
+        else {
+            messages.append(contentsOf: new)
+            return
+        }
+        messages[last] = .user(messages[last].content + "\n\n" + first.content)
+        messages.append(contentsOf: new.dropFirst())
+    }
+
+    private func runPass(
+        appending new: [Chat.Message],
+        yielding continuation: AsyncThrowingStream<BackendEvent, Error>.Continuation
+    ) async throws {
+        reconcileHistory(before: new)
+        let toolSpecs = self.tools
+        let pieces = await container.perform { context in
+            Box(
+                (
+                    model: context.model, processor: context.processor,
+                    tokenizer: context.tokenizer, configuration: context.configuration
+                ))
+        }
+        let (model, processor, tokenizer, configuration) = pieces.value
+
+        let input = try await processor.prepare(
+            input: UserInput(chat: messages, tools: toolSpecs))
+
+        // Images/videos/audio opt out of token-level reuse: the processor builds media payloads
+        // alongside the token array, and slicing the tokens would desync them. Text-only is the
+        // only case this agent actually produces, but degrading safely beats assuming.
+        let hasMedia = messages.contains {
+            !$0.images.isEmpty || !$0.videos.isEmpty || !$0.audios.isEmpty
+        }
+
+        let fullTokens = input.text.tokens.asArray(Int32.self).map(Int.init)
+        var reused = 0
+
+        // Reuse requires a cache that can be trimmed AND that reports where it is. Both checks are
+        // out here rather than inside the `surplus > 0` branch below, because the failure they
+        // catch is precisely one where `surplus` computes to 0 and the branch never runs:
+        //
+        //   - `BaseKVCache.offset` is a plain stored property that ArraysCache / MambaCache /
+        //     CacheList never write, so `offset` reads 0 forever on recurrent and hybrid models
+        //     (Mamba2, FalconH1, BaichuanM1, and - depending on which layer lands first -
+        //     Qwen3-Next, Qwen3.5, LFM2, Jamba, NemotronH). Trusting it would feed the full prompt
+        //     into a cache that already holds the conversation: no crash, just silently doubled
+        //     context. `isTrimmable` is false for exactly those, so this catches them.
+        //   - RotatingKVCache reports `isTrimmable` false once the conversation passes its sliding
+        //     window, so those families (Gemma 3/4/3n, GPT-OSS, Exaone4, Mistral3, ...) rebuild and
+        //     re-prefill every pass. That is a real cost this design pays and ChatSession did not,
+        //     because append-only never needed to trim. Logged rather than hidden.
+        let offsets = cache.map(\.offset)
+        let uniformOffsets = offsets.allSatisfy { $0 == offsets.first }
+        if hasMedia || cache.isEmpty || !canTrimPromptCache(cache) || !uniformOffsets {
+            if !cache.isEmpty && !hasMedia {
+                log("cache not reusable (trimmable=\(canTrimPromptCache(cache)) uniform=\(uniformOffsets)); rebuilding and re-prefilling \(fullTokens.count) tokens")
+            }
+            cache = makePromptCache(model: model, parameters: parameters)
+        } else {
+            // Never reuse the entire prompt: there has to be at least one token left to decode
+            // the next logits from.
+            let matched = min(
+                Self.commonPrefixLength(fullTokens, cachedTokens),
+                max(fullTokens.count - 1, 0))
+            reused = min(matched, offsets[0])
+            let surplus = offsets[0] - reused
+            if surplus > 0, trimPromptCache(cache, numTokens: surplus) != surplus {
+                log("cache trim came up short; rebuilding")
+                cache = makePromptCache(model: model, parameters: parameters)
+                reused = 0
+            }
+        }
+
+        // Recorded BEFORE the prefill, not after: the cache now holds exactly fullTokens[0..<reused],
+        // so the invariant "the cache is a prefix of cachedTokens, plus an untracked generated tail"
+        // is true at every instant from here on. Recording it after the iterator instead would leave
+        // a throw out of prefill with the cache half-filled and cachedTokens naming the OLD prompt -
+        // a later pass could then match a prefix against slots holding different tokens.
+        cachedTokens = fullTokens
+
+        // With media the processor's own LMInput has to go through whole; otherwise feed only the
+        // tokens the cache does not already cover.
+        let passInput: LMInput =
+            hasMedia ? input : LMInput(tokens: MLXArray(fullTokens[reused...].map(Int32.init)))
+
+        let iterator = try TokenIterator(
+            input: passInput, model: model, cache: cache, parameters: parameters)
+        let (generations, genTask) = MLXLMCommon.generateTask(
+            promptTokenCount: passInput.text.tokens.size,
+            modelConfiguration: configuration,
+            tokenizer: tokenizer,
+            iterator: iterator,
+            tools: toolSpecs)
+
+        var text = ""
+        var calls: [ToolCall] = []
+        for await generation in generations {
+            if Task.isCancelled { break }
+            switch generation {
+            case .chunk(let chunk):
+                text += chunk
+                continuation.yield(.text(chunk))
+            case .toolCall(let call):
+                calls.append(call)
+                continuation.yield(.toolCall(call))
+            case .info(let info):
+                continuation.yield(.info(info))
+            @unknown default:
+                break
+            }
+        }
+        // Explicit rather than relying on the stream iterator's deinit to fire onTermination: the
+        // generate task keeps writing to the KVCache until it stops, and the next pass must not
+        // begin against a moving cache. (The gate would hold it off anyway; this makes the stop
+        // independent of iterator-lifetime timing.)
+        genTask.cancel()
+        await genTask.value
+
+        // Recorded even on cancellation, deliberately: the partial answer is what the reader
+        // already saw, so leaving it out would make the history disagree with the screen.
+        if !text.isEmpty || !calls.isEmpty {
+            messages.append(.assistant(text, toolCalls: calls.isEmpty ? nil : calls))
+            lastAssistantHasUnansweredCalls = !calls.isEmpty
+        }
+    }
+
+    private static func commonPrefixLength(_ a: [Int], _ b: [Int]) -> Int {
+        var i = 0
+        let limit = min(a.count, b.count)
+        while i < limit, a[i] == b[i] { i += 1 }
+        return i
     }
 }
 
@@ -142,7 +439,7 @@ final class URLTaskHandle: @unchecked Sendable {
 /// llama-server (`--jinja`, so tool calls are grammar-constrained and arrive as streaming
 /// tool-call deltas). The applet owns the server process; this class only talks to it.
 ///
-/// State the MLX path gets from ChatSession's KV cache, this class keeps explicitly:
+/// State the MLX path keeps in its KV cache, this class keeps explicitly:
 /// `messages` is the running conversation, and every turn re-POSTs it in full (the server
 /// prefix-caches, so a follow-up is still cheap). Serialization goes through the library's
 /// `MessageGenerator` bridge rather than hand-rolled bookkeeping: `Chat.Message.Tool`'s

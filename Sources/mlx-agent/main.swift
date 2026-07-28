@@ -295,21 +295,24 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
     // Rationale: Qwen3 emits a <think> block BEFORE its <tool_call>; if we checked
     // the cumulative respond() output, that pre-call thinking would falsely satisfy
     // "the model produced a final answer" even if the real follow-up turn was empty.
-    let session = ChatSession(
-        container,
+    // Drives the SAME MLXBackend production uses. It used to drive ChatSession directly, which
+    // meant this diagnostic could not see the prompt-assembly bug that made the agent re-call one
+    // tool until the iteration cap - the whole class of fault it exists to catch.
+    let backend = MLXBackend(
+        container: container,
         instructions: defaultSystemPrompt,
-        generateParameters: GenerateParameters(maxTokens: 2048, temperature: 0),
+        parameters: GenerateParameters(maxTokens: 2048, temperature: 0),
         tools: toolSpecs())
 
     let t0 = Date()
 
-    // Turn 1: collect the tool calls the model emits. With no toolDispatch set,
-    // ChatSession yields toolCall items as Generation values instead of looping.
+    // Turn 1: collect the tool calls the model emits. The backend surfaces them as events for
+    // an external loop to dispatch, so nothing loops on our behalf here.
     var calls: [ToolCall] = []
     var turn1Text = ""
     do {
-        for try await gen in session.streamDetails(to: c.prompt) {
-            if let tc = gen.toolCall {
+        for try await ev in backend.stream([.user(c.prompt)]) {
+            if case .toolCall(let tc) = ev {
                 calls.append(tc)
                 if calls.count > maxToolCallsPerCase {
                     return CaseResult(
@@ -317,8 +320,8 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
                         note: "exceeded max tool calls (\(maxToolCallsPerCase))",
                         latency: Date().timeIntervalSince(t0))
                 }
-            } else if let ch = gen.chunk {
-                turn1Text += ch
+            } else if case .text(let chunk) = ev {
+                turn1Text += chunk
             }
         }
     } catch {
@@ -371,9 +374,11 @@ func runOneCase(_ c: GateCase, container: ModelContainer) async -> CaseResult {
     // SAME session (KV cache preserved) and require a non-empty follow-up. Only
     // this turn's text counts - it isolates the post-tool-result answer.
     let toolMessages = calls.map { Chat.Message.tool(syntheticToolResult(for: $0), id: $0.id) }
-    let turn2Text: String
+    var turn2Text = ""
     do {
-        turn2Text = try await session.respond(to: toolMessages)
+        for try await ev in backend.stream(toolMessages) {
+            if case .text(let chunk) = ev { turn2Text += chunk }
+        }
     } catch {
         return CaseResult(
             name: c.name, ok: false, note: "turn2 (post-tool) error: \(error.localizedDescription)",
@@ -395,7 +400,7 @@ func runGate(model dir: String, extraEOSTokens: Set<String>) async throws -> Int
     print(String(repeating: "=", count: 78))
     print("mlx-agent tool-calling gate")
     print("model  : \(dir)")
-    print("engine : mlx-swift-lm 3.31.4 (MLXLLM ChatSession + ToolCallProcessor)")
+    print("engine : mlx-swift-lm 3.31.4 (MLXBackend + ToolCallProcessor)")
     print(String(repeating: "=", count: 78))
 
     let baseline = MLX.Memory.snapshot()
@@ -474,7 +479,7 @@ func runOneshot(
     case .mlx(let dir):
         let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
         backend = MLXBackend(
-            ChatSession(container, instructions: systemPrompt, generateParameters: parameters))
+            container: container, instructions: systemPrompt, parameters: parameters)
     case .openai(let baseURL):
         // No model to load and no RAM gate to run: the weights live in llama-server.
         try await OpenAIBackend.waitForHealth(baseURL: baseURL)

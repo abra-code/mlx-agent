@@ -200,7 +200,7 @@ Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `sess
 `<think></think>`), `session/cancel`, `session/set_config_option` (switches the model),
 and `session/prime` (replaces the session context with a supplied transcript for
 resume/fresh flows - see [`docs/session-prime.md`](docs/session-prime.md)).
-One `ChatSession` per process; its KV cache persists across prompts. All logging is on
+One backend per process; the MLX path's KV cache persists across prompts. All logging is on
 stderr; stdout is JSON-RPC only.
 
 **Nothing is advertised in `configOptions`, so no client renders a picker.** `model` and

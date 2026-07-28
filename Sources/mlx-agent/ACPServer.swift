@@ -23,8 +23,8 @@
 // it folds away in the UI. The two backends separate it differently: the MLX path streams
 // raw text with inline <think></think> tags that ThinkSplitter (see the AgentText target)
 // classifies, while llama-server classifies it for us into `reasoning_content`. One live
-// ChatSession per process (KV cache persists across prompts, so a follow-up turn's
-// prefill is cheaper).
+// backend per process (both keep the conversation and reuse the KV cache / prefix across
+// prompts, so a follow-up turn's prefill is cheaper).
 //
 // Everything on stdout is JSON-RPC; all logging goes to stderr.
 
@@ -65,7 +65,6 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // MLX-only: the loaded weights and the session driving them.
     private var container: ModelContainer?
-    private var session: ChatSession?
     private var backend: GenerationBackend?
     private var agent: Agent?
     private var registry: MCPToolRegistry?
@@ -84,13 +83,16 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // rejected as "no active session".
     private var idleUnloaded = false
     // A shadow of the conversation as clean (user, assistant) text turns, kept ONLY so an
-    // idle-unload can rebuild the ChatSession's context on reload. ChatSession's message history
-    // is private and collapses into an opaque KV cache after the first turn, so it cannot be read
-    // back - hence this parallel record, the same thing the OpenAIBackend keeps explicitly and
-    // llama-server's own idle-sleep relies on the client resending. Text turns only: intra-turn
+    // idle-unload can rebuild the backend's context on reload: the unload throws the backend away
+    // along with its history, and this outlives it. (It predates MLXBackend owning a readable
+    // conversation and could now be sourced from it instead; left as-is because it is also what
+    // the openai path and llama-server's own idle-sleep rely on.) Text turns only: intra-turn
     // tool calls/results are not replayed, so after an idle reload the model keeps the
-    // conversation but not the exact tool outputs (documented trade, appended only on a clean
-    // .stop so a cancelled/failed turn never enters the replayed context). Reset to the primed
+    // conversation but not the exact tool outputs. That trade got slightly worse when MLXBackend
+    // took ownership of the conversation: its history now also holds tool exchanges and the partial
+    // answers of cancelled turns, none of which are mirrored here, so post-reload context is poorer
+    // than the live context in a way it was not when the history was unreadable. (Appended only on
+    // a clean .stop so a cancelled/failed turn never enters the replayed context.) Reset to the primed
     // history on session/prime and to [] on session/new.
     private var mlxTranscript: [Chat.Message] = []
     // Accumulates THIS turn's assistant answer (kind == .message only, never .thought) so it can
@@ -294,7 +296,6 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     return nil
                 }
                 self.container = nil
-                self.session = nil
                 self.backend = nil
                 self.agent = nil
                 self.idleUnloaded = true
@@ -314,10 +315,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             "idle-reload: loading \((dir as NSString).lastPathComponent), "
                 + "replaying \(history.count) messages")
         let container = try await loadModel(dir, extraEOSTokens: extraEOSTokens)
-        let (session, backend, agent) = buildSessionStack(container: container, history: history)
+        let (backend, agent) = buildSessionStack(container: container, history: history)
         lock.withLock {
             self.container = container
-            self.session = session
             self.backend = backend
             self.agent = agent
             self.idleUnloaded = false
@@ -451,11 +451,10 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // Build the MCP tool registry once (spawns the server processes) if configured,
             // BEFORE the session stack (buildSessionStack reads self.registry).
             let registry = await ensureRegistry()
-            let (session, backend, agent) = buildSessionStack(container: container, history: [])
+            let (backend, agent) = buildSessionStack(container: container, history: [])
             let sid = "mlx-session-1"
             let modeNow = lock.withLock { () -> String in
                 self.container = container
-                self.session = session
                 self.backend = backend
                 self.agent = agent
                 self.sessionID = sid
@@ -498,28 +497,21 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     private func buildSessionStack(
         container: ModelContainer, history: [Chat.Message]
-    ) -> (ChatSession, MLXBackend, Agent) {
+    ) -> (MLXBackend, Agent) {
         let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
         let instructions = effectiveSystemPrompt()
-        let session: ChatSession
-        if history.isEmpty {
-            session = ChatSession(
-                container, instructions: instructions, generateParameters: parameters)
-        } else {
-            session = ChatSession(
-                container, instructions: instructions, history: history,
-                generateParameters: parameters)
-        }
         let registry = lock.withLock { self.registry }
-        let backend = MLXBackend(session)
+        let backend = MLXBackend(
+            container: container, instructions: instructions, history: history,
+            parameters: parameters)
         let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
         agent.delegate = self
         let modeNow = lock.withLock { mode }
         agent.setToolsEnabled(modeNow == "agent")
-        return (session, backend, agent)
+        return (backend, agent)
     }
 
-    /// The openai counterpart of buildSessionStack: no container, no ChatSession - the
+    /// The openai counterpart of buildSessionStack: no container, no model in-process - the
     /// backend holds the conversation itself. Same generation defaults (0.7 / 4096 overlaid
     /// with the CLI's --temperature etc.), same registry + mode re-application.
     private func buildOpenAIStack(
@@ -590,7 +582,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     private func handlePrompt(id: Int?, params: [String: Any]) {
-        // One turn at a time: the ChatSession/backend is not safe to drive concurrently (see
+        // One turn at a time: the backend is not safe to drive concurrently (see
         // MLXBackend). Claim the slot ATOMICALLY with the busy-check - see promptStarting.
         let (agent, ourSid, unloaded, busy) = lock.withLock {
             () -> (Agent?, String?, Bool, Bool) in
@@ -726,9 +718,17 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 respondError(id, -32602, "unknown mode: \(value)")
                 return
             }
-            let agent = lock.withLock { () -> Agent? in
+            // Busy-checked like every other stack mutation in this file. Flipping tools under a
+            // live turn would change the backend's tool set between passes of one tool loop, so
+            // the model would be told mid-turn that the tools it just called no longer exist.
+            let (busy, agent) = lock.withLock { () -> (Bool, Agent?) in
+                if promptTask != nil || promptStarting { return (true, nil) }
                 self.mode = value
-                return self.agent
+                return (false, self.agent)
+            }
+            if busy {
+                respondError(id, -32003, "a prompt is already in progress for this session")
+                return
             }
             agent?.setToolsEnabled(value == "agent")
             log("mode -> \(value)")
@@ -752,10 +752,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 // KV cache cannot carry across models); registry and mode are re-applied
                 // by buildSessionStack.
                 let container = try await loadModel(target.dir, extraEOSTokens: extraEOSTokens)
-                let (session, backend, agent) = buildSessionStack(container: container, history: [])
+                let (backend, agent) = buildSessionStack(container: container, history: [])
                 lock.withLock {
                     self.container = container
-                    self.session = session
                     self.backend = backend
                     self.agent = agent
                     self.currentModelDir = target.dir
@@ -803,18 +802,17 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // reload shadow and leaves the model unloaded, so the next prompt reloads with it (the
         // KV prefill is lazy anyway). `container` was captured at the top, so a concurrent
         // idle-unload cannot free its buffers while this holds the strong ref.
-        let session: ChatSession?
         let backend: GenerationBackend?
         let agent: Agent?
         if let openaiBaseURL {
             let (b, a) = buildOpenAIStack(baseURL: openaiBaseURL, history: history)
-            (session, backend, agent) = (nil, b, a)
+            (backend, agent) = (b, a)
         } else if let container {
-            let (s, b, a) = buildSessionStack(container: container, history: history)
-            (session, backend, agent) = (s, b, a)
+            let (b, a) = buildSessionStack(container: container, history: history)
+            (backend, agent) = (b, a)
         } else {
             // MLX, idle-unloaded: no weights to build on. Recorded below; next prompt reloads.
-            (session, backend, agent) = (nil, nil, nil)
+            (backend, agent) = (nil, nil)
         }
         // Refuse to swap the stack under a running turn. Checked inside the same lock
         // that publishes the swap, so a prompt accepted before us keeps its stack and
@@ -822,7 +820,6 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // priming) makes a first -32003 a rare transient it retries once.
         let busy = lock.withLock { () -> Bool in
             if promptTask != nil || promptStarting { return true }
-            self.session = session
             self.backend = backend
             self.agent = agent
             if openaiBaseURL == nil {
