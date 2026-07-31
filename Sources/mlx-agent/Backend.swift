@@ -15,6 +15,7 @@
 //   OpenAIBackend - a remote OpenAI-compatible /chat/completions endpoint (llama-server).
 
 import Foundation
+import AgentText
 import MLX
 import MLXLMCommon
 import MLXLLM
@@ -185,6 +186,27 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
     /// message cannot be inspected for tool calls after the fact. Gate-owned.
     private var lastAssistantHasUnansweredCalls = false
 
+    /// Projects the recorded assistant text down to the ANSWER, so reasoning never re-enters the
+    /// prompt as ordinary assistant content. Gate-owned.
+    ///
+    /// This is the parity OpenAIBackend already had: its `text` accumulates `delta.content` and
+    /// never `reasoning_content`, so its history has always been reasoning-free. The MLX path
+    /// recorded the raw stream instead, markers and all.
+    ///
+    /// Gemma 4's template hid that for the common case - its `strip_thinking()` macro removes
+    /// channel blocks when re-rendering assistant content - but it removes EVERY channel, and
+    /// Gemma 4 names the channel carrying the ANSWER `content`. Rendered against the real
+    /// template, an assistant turn recorded as `<|channel>content ... <channel|>` comes back
+    /// EMPTY: the reply is erased from the history it belongs in. `<think>` families have no
+    /// such macro at all, so for them the raw markers went straight back into the next prompt.
+    ///
+    /// Deliberately a SECOND splitter rather than a reclassification of the event stream: Agent
+    /// stays the sole classifier of what the reader sees. A backend yielding `.reasoning` in
+    /// place of raw `.text` would let a thought segment overtake message text still sitting in
+    /// Agent's hold-back and reorder the two on screen. Two splitters over the same bytes is the
+    /// price of exact display ordering; it is pure string scanning, invisible next to decode.
+    private var historySplitter = ThinkSplitter()
+
     /// The KV cache, and the prompt tokens it is known to hold. The cache also holds whatever the
     /// model generated after that prompt, whose token ids we never see; the surplus is trimmed on
     /// the next pass, which is also how a cancelled or failed pass self-heals. Gate-owned.
@@ -240,6 +262,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
         await withPass {
             messages = instructions.map { [Chat.Message.system($0)] } ?? []
             lastAssistantHasUnansweredCalls = false
+            historySplitter = ThinkSplitter()
             cache = []
             cachedTokens = []
         }
@@ -262,6 +285,12 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
     ///   dispatch. Reachable today with `--max-tool-iters 1`.
     /// - Two user turns in a row, when a pass throws and records no assistant reply.
     private func reconcileHistory(before new: [Chat.Message]) {
+        // A user turn starts a new reasoning scope, so the projection splitter restarts with it -
+        // the same per-turn lifetime Agent gives its display splitter. WITHIN a turn the state
+        // must survive, because a reasoning block may span a tool call and the pass after it has
+        // to know it is still inside one.
+        if new.first?.role == .user { historySplitter = ThinkSplitter() }
+
         if lastAssistantHasUnansweredCalls, new.first?.role != .tool, let last = messages.indices.last {
             log("dropping unanswered tool-call announcement from the rendered history")
             messages[last] = .assistant(messages[last].content)
@@ -363,13 +392,18 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
             iterator: iterator,
             tools: toolSpecs)
 
-        var text = ""
+        // The ANSWER, for the history: reasoning is streamed to the client but never recorded.
+        // The chunk yielded below is still the RAW one - classifying the event stream here would
+        // reorder thought against message downstream (see `historySplitter`).
+        var answer = ""
         var calls: [ToolCall] = []
         for await generation in generations {
             if Task.isCancelled { break }
             switch generation {
             case .chunk(let chunk):
-                text += chunk
+                for (kind, seg) in historySplitter.feed(chunk) where kind == .message {
+                    answer += seg
+                }
                 continuation.yield(.text(chunk))
             case .toolCall(let call):
                 calls.append(call)
@@ -387,11 +421,31 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
         genTask.cancel()
         await genTask.value
 
+        // This pass's stream is over, so no further chunk can complete a marker that straddled a
+        // chunk boundary: whatever the splitter still holds is final text. Same contract, and the
+        // same reason, as Agent's end-of-pass flush.
+        for (kind, seg) in historySplitter.flush() where kind == .message { answer += seg }
+
         // Recorded even on cancellation, deliberately: the partial answer is what the reader
-        // already saw, so leaving it out would make the history disagree with the screen.
-        if !text.isEmpty || !calls.isEmpty {
-            messages.append(.assistant(text, toolCalls: calls.isEmpty ? nil : calls))
+        // already saw, so leaving it out would make the history disagree with the screen. A pass
+        // that produced ONLY reasoning and no tool call now records nothing, which is correct and
+        // is what OpenAIBackend already did - `reconcileHistory` handles the resulting two user
+        // turns in a row.
+        if !answer.isEmpty || !calls.isEmpty {
+            messages.append(.assistant(answer, toolCalls: calls.isEmpty ? nil : calls))
             lastAssistantHasUnansweredCalls = !calls.isEmpty
+        } else {
+            // Logged rather than silent because of one shape this can leave behind: a pass that
+            // ANSWERED tool results but produced only reasoning (a long think cut off by
+            // maxTokens) records nothing, so the history goes ... assistant(calls), tool(result),
+            // user(next) - a tool -> user adjacency with no assistant turn between. That is
+            // exactly what OpenAIBackend has always handed llama-server, so it is the parity this
+            // change buys rather than a defect; but Gemma-family templates have historically
+            // raise_exception'd on role-alternation violations, and if a strict one ever trips,
+            // this line is what points at it. The fix would then be to record `assistant("")`
+            // here when the pass consumed tool results.
+            log("pass recorded no assistant turn (no answer, no tool calls)"
+                + (new.first?.role == .tool ? "; this pass answered tool results" : ""))
         }
     }
 
