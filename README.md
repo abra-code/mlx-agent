@@ -204,7 +204,8 @@ mid-generation cancellation) against a running server.
 Newline-delimited JSON-RPC 2.0 over stdin/stdout. Implements `initialize`, `session/new`
 (`configOptions` is always empty - see below), `session/prompt` (streams
 `agent_message_chunk` and, for thinking models, `agent_thought_chunk` split out of
-`<think></think>`), `session/cancel`, `session/set_config_option` (switches the model),
+`<think></think>` or Gemma 4's `<|channel>thought ... <channel|>`), `session/cancel`,
+`session/set_config_option` (switches the model),
 and `session/prime` (replaces the session context with a supplied transcript for
 resume/fresh flows - see [`docs/session-prime.md`](docs/session-prime.md)).
 One backend per process; the MLX path's KV cache persists across prompts. All logging is on
@@ -232,14 +233,27 @@ python3 tools/acp_smoke.py build/Build/Products/Debug/mlx-agent
 ```
 
 `tools/acp_tool_leak.py` covers what `acp_smoke.py` structurally cannot: it drives a turn
-that CALLS A TOOL and asserts no raw model markers (harmony `<|channel|>...`, `<think>`)
-reach the visible message. Both regressions it guards only manifest across a tool call, so
-they are invisible to a chat-only run. It needs a server and an MCP config:
+that CALLS A TOOL and asserts no raw model markers (harmony `<|channel|>...`, `<think>`,
+Gemma 4's `<|channel>` / `<channel|>`) reach the visible message. All three regressions it
+guards only manifest across a tool call, so they are invisible to a chat-only run.
+
+Run it BOTH ways. It used to hardcode `--backend openai`, which is why the Gemma 4 leak went
+unseen: on llama-server the SERVER splits reasoning into `reasoning_content` and the markers
+never reach `ThinkSplitter`, so the native MLX path - the one the apps use for safetensors
+models - had no coverage at all.
 
 ```
 python3 tools/acp_tool_leak.py build/Build/Products/Debug/mlx-agent \
-  --base-url http://127.0.0.1:8080/v1 --mcp-config /path/to/mcp-config.json
+  --backend openai --base-url http://127.0.0.1:8080/v1 --mcp-config /path/to/mcp-config.json
+
+python3 tools/acp_tool_leak.py build/Build/Products/Debug/mlx-agent \
+  --backend mlx --model /path/to/gemma-4-12B-it-MLX-8bit --mcp-config /path/to/mcp-config.json \
+  --no-expect-thought
 ```
+
+`--no-expect-thought` is needed for Gemma 4 with thinking off: it emits an EMPTY thought
+channel, so "some reasoning was captured" is not a fair check. The flag stays on by default
+because for gpt-oss an empty thought means reasoning was swallowed into the message.
 
 ### Tools (agent mode)
 
