@@ -131,6 +131,12 @@ targets:
 
 schemes:
   # Ships the tool. This is what the applet's binary is built from.
+  #
+  # SHIPPING BUILDS ARE RELEASE. The embedding script (AIChatApp/update-cadabra.sh) passes
+  # `-configuration Release` explicitly, so it does not depend on the per-action configs
+  # below - but profile and archive are Release here too, so measuring or exporting from
+  # Xcode reflects what actually ships (-O, wholemodule) rather than an -Onone build.
+  # Only run/test stay Debug, which is what you want while iterating.
   mlx-agent:
     build:
       targets:
@@ -141,9 +147,9 @@ schemes:
       config: Debug
       gatherCoverageData: false
     profile:
-      config: Debug
+      config: Release
     archive:
-      config: Debug
+      config: Release
 
   # Fast, MLX-free unit tests: every target here depends only on Foundation-only libraries,
   # so neither MLX nor the Metal toolchain is compiled. This is what `swift test` used to

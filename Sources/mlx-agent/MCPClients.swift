@@ -174,7 +174,7 @@ final class MCPServer: @unchecked Sendable {
                 input: FileDescriptor(rawValue: readFD),
                 output: FileDescriptor(rawValue: writeFD),
                 logger: nil)
-            let client = Client(name: "mlx-agent", version: "0.1")
+            let client = Client(name: "mlx-agent", version: agentVersion)
             try await withTimeout(mcpHandshakeTimeout) {
                 _ = try await client.connect(transport: transport)  // connect() calls initialize()
             }

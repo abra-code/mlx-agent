@@ -22,6 +22,7 @@ mlx-agent tools     --mcp-config <json>
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
+mlx-agent --version
 ```
 
 - **acp** - ACP server over stdio (chat + agentic tools). See below.
@@ -41,6 +42,12 @@ mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--ru
   running across machines. Numbers are only comparable on AC power on a COOL machine:
   a fanless Air throttles the GPU by ~40% for minutes after a sustained CPU load
   (e.g. a build).
+
+- **--version** - print `mlx-agent <version>` and exit 0 (`-version` and a bare `version`
+  are accepted too). Loads no model and reads no config, so it doubles as a liveness probe
+  on a deployed, codesigned binary. The version is one constant
+  (`Sources/mlx-agent/Version.swift`) shared with the ACP `initialize` reply's
+  `agentInfo.version` and the MCP client identity, so all three cannot drift.
 
 Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
 (60), `--tool-result-bytes <n>` (32768).
@@ -283,6 +290,11 @@ xcodebuild -project mlx-agent.xcodeproj -scheme mlx-agent \
 The `-skip...` flags trust the `CudaBuild` package plugin and the swift-syntax
 macros (otherwise xcodebuild blocks on a validation prompt). The binary lands at
 `build/Build/Products/Debug/mlx-agent` with the metallib bundle beside it.
+
+Shipping builds are **Release** (`-O`, whole-module): swap `-configuration Release` into
+the command above and the product lands in `build/Build/Products/Release` instead. That is
+what `AIChatApp/update-cadabra.sh` builds and embeds in the app - Debug is for iterating
+here, and is what the scheme's run/test actions still use.
 
 Run:
 

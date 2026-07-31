@@ -374,7 +374,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 [
                     "protocolVersion": 1,
                     "authMethods": [],
-                    "agentInfo": ["name": "mlx-agent", "version": "0.1"],
+                    "agentInfo": ["name": "mlx-agent", "version": agentVersion],
                     "agentCapabilities": [
                         "promptCapabilities": ["audio": false, "image": false, "embeddedContext": false],
                         // Custom extension: this agent accepts session/prime (context replacement

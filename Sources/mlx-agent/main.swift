@@ -596,7 +596,7 @@ func runToolsDump(mcpConfigPath: String) async -> Int {
 
 func usage() {
     let text = """
-        mlx-agent - native MLX ACP agent (chat + tools)
+        mlx-agent \(agentVersion) - native MLX ACP agent (chat + tools)
 
         USAGE:
           mlx-agent acp     [--backend mlx|openai] [--model <dir> | --base-url <url>]
@@ -640,6 +640,9 @@ func usage() {
                                                           --prefill-step overrides the library's
                                                           512-token prompt chunking; 2048 matches
                                                           mlx_lm's default, measured equal on M5)
+          mlx-agent --version                             print "mlx-agent <version>" and exit 0
+                                                          (loads no model, reads no config;
+                                                          "-version" and bare "version" work too)
 
         OPTIONS:
           --backend mlx|openai     generation engine for acp/oneshot/map (default: mlx).
@@ -842,6 +845,12 @@ let extraEOSTokens = parseExtraEOSTokens(cliArgs)
 
 do {
     switch mode {
+    // Answered before anything else can fail: no model, no MCP config, no MLX touched. That
+    // is what makes it usable as a liveness probe on a deployed binary (update-cadabra.sh
+    // runs it post-codesign to prove the signed tool still launches).
+    case "--version", "-version", "version":
+        print("mlx-agent \(agentVersion)")
+        exit(0)
     case "acp":
         await ACPServer(
             engine: resolveEngine(cliArgs),
