@@ -28,8 +28,9 @@
 //
 // Everything on stdout is JSON-RPC; all logging goes to stderr.
 
-import Foundation
+import AgentDigest
 import AgentText
+import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -106,6 +107,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // (llama-server does its own idle sleep, and the OpenAIBackend keeps only a tiny messages
     // array). 0 disables. The timer lives on `idleQueue` and is only ever touched from it.
     private let idleUnloadSeconds: TimeInterval
+    /// Where condensations are recorded, when --digest-dir asked for one. Handed to the backend
+    /// too, so an overflow condensation inside a turn lands in the same place as a prime-time one.
+    private let digestArchive: DigestArchive?
     private let idleQueue = DispatchQueue(label: "com.abracode.mlx-agent.idle")
     private var idleTimer: DispatchSourceTimer?
     // True once the model has been idle-unloaded: the session is still "live" (sessionID set,
@@ -144,6 +148,16 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // busy-check and `promptTask = task`). Without it, `idleFired` or `session/prime` could see
     // `promptTask == nil` in that gap and unload/swap the stack mid-turn. Both treat it as busy.
     private var promptStarting = false
+    // Claimed for the whole of a condensing session/prime, which generates and is therefore async.
+    // A separate flag from `promptStarting` so the refusal messages stay accurate; it is folded
+    // into EVERY busy check that tests promptStarting (idleFired, handlePrompt,
+    // handleSetConfigOption, handleSessionPrime). The one place it is deliberately NOT tested is
+    // `finishPrime`'s publish check - that runs while this flag is held BY US.
+    private var condensing = false
+    /// The in-flight condensation, so session/cancel can reach it. AgentDigest checks
+    /// `Task.isCancelled` once per slice and FMDigestGenerator checks it on entry - all of which
+    /// was unreachable from the wire until this existed.
+    private var condenseTask: Task<Void, Never>?
     private var stdinBuffer = Data()
     private var doneContinuation: CheckedContinuation<Void, Never>?
     private let writeLock = NSLock()
@@ -208,8 +222,10 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         engine: EngineSpec, mcpConfigPath: String? = nil,
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
         systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
-        extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = IdleUnload.defaultSeconds
+        extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = IdleUnload.defaultSeconds,
+        digestArchive: DigestArchive? = nil
     ) {
+        self.digestArchive = digestArchive
         self.idleUnloadSeconds = idleUnloadSeconds
         self.engine = engine
         switch engine {
@@ -326,7 +342,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             lock.withLock {
                 // promptStarting covers the gap before promptTask is committed: never unload
                 // with a turn running OR about to run.
-                guard self.promptTask == nil, !self.promptStarting, self.container != nil else {
+                guard self.promptTask == nil, !self.promptStarting, !self.condensing,
+                    self.container != nil
+                else {
                     return nil
                 }
                 self.container = nil
@@ -601,7 +619,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
         let backend = FoundationBackend(
             parameters: parameters, systemPrompt: effectiveSystemPrompt(), seedHistory: history,
-            log: { [weak self] message in self?.log(message) })
+            archive: digestArchive, log: { [weak self] message in self?.log(message) })
         let registry = lock.withLock { self.registry }
         let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
         agent.delegate = self
@@ -665,14 +683,14 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private func handlePrompt(id: Int?, params: [String: Any]) {
         // One turn at a time: the backend is not safe to drive concurrently (see
         // MLXBackend). Claim the slot ATOMICALLY with the busy-check - see promptStarting.
-        let (agent, ourSid, unloaded, busy) = lock.withLock {
-            () -> (Agent?, String?, Bool, Bool) in
-            let busy = self.promptTask != nil || self.promptStarting
-            if !busy { self.promptStarting = true }
-            return (self.agent, self.sessionID, self.idleUnloaded, busy)
+        let (agent, ourSid, unloaded, blocker) = lock.withLock {
+            () -> (Agent?, String?, Bool, String?) in
+            let blocker = self.busyReasonLocked()
+            if blocker == nil { self.promptStarting = true }
+            return (self.agent, self.sessionID, self.idleUnloaded, blocker)
         }
-        if busy {
-            respondError(id, -32003, "a prompt is already in progress for this session")
+        if let blocker {
+            respondError(id, -32003, blocker)
             return
         }
         // From here the claim (promptStarting) is held; every early return MUST release it.
@@ -775,6 +793,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     private func handleCancel(params: [String: Any]) {
+        // A condensation is cancellable and can otherwise hold the session for minutes; Stop
+        // must reach it too, not just a running prompt.
+        if let condense = lock.withLock({ self.condenseTask }) {
+            condense.cancel()
+            log("session/cancel: cancelling an in-flight context summarization")
+        }
         let (task, ourSid) = lock.withLock { (promptTask, sessionID) }
         if let reqSid = params["sessionId"] as? String, let ourSid, reqSid != ourSid {
             log("cancel: ignoring - unknown session \(reqSid)")
@@ -802,13 +826,13 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // Busy-checked like every other stack mutation in this file. Flipping tools under a
             // live turn would change the backend's tool set between passes of one tool loop, so
             // the model would be told mid-turn that the tools it just called no longer exist.
-            let (busy, agent) = lock.withLock { () -> (Bool, Agent?) in
-                if promptTask != nil || promptStarting { return (true, nil) }
+            let (blocker, agent) = lock.withLock { () -> (String?, Agent?) in
+                if let blocker = busyReasonLocked() { return (blocker, nil) }
                 self.mode = value
-                return (false, self.agent)
+                return (nil, self.agent)
             }
-            if busy {
-                respondError(id, -32003, "a prompt is already in progress for this session")
+            if let blocker {
+                respondError(id, -32003, blocker)
                 return
             }
             agent?.setToolsEnabled(value == "agent")
@@ -816,6 +840,14 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respond(id, ["configOptions": configOptionsJSON()])
 
         case "model":
+            // Latent until a backend-independent summarizer lands (model switching is MLX-only
+            // and condensing is foundation-only today), but this branch publishes container,
+            // backend, agent AND mlxTranscript with no busy check at all - the one stack mutation
+            // in this file that had none.
+            if let blocker = lock.withLock({ busyReasonLocked() }) {
+                respondError(id, -32003, blocker)
+                return
+            }
             // The applet owns llama-server, so it restarts the server to change models and
             // deliberately does NOT re-inject the transport - the conversation array here
             // survives, which IS the desired continue-with-a-new-model semantics. Nothing
@@ -883,12 +915,115 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respondError(id, -32602, "session/prime requires messages (an array)")
             return
         }
-        let history = Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) }
+        var wireBytes = 0
+        for m in rawMessages { wireBytes += (m["content"] as? String)?.utf8.count ?? 0 }
+        let supplied = rawMessages.count
+
+        // No `condense` key: byte-for-byte the behavior this method has always had, including
+        // staying synchronous. That is the contract - a plain prime is near-instant and every
+        // existing client depends on it.
+        guard let request = params["condense"] as? [String: Any] else {
+            let history = Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) }
+            finishPrime(
+                id: id, container: container, history: history, suppliedCount: supplied,
+                wireBytes: wireBytes, extra: [:])
+            return
+        }
+
+        // Condensing generates, so this path is async - and that is the whole difficulty. The
+        // busy slot is claimed HERE, synchronously, before the Task exists: between "we decided
+        // to condense" and "the Task is running" a prompt could otherwise be accepted, and it
+        // would then be generating against a stack we are about to swap. Same discipline as
+        // `promptStarting`, different flag so the refusal messages stay honest.
+        //
+        // The epoch captured alongside it is the OTHER half, and the more important one. Blocking
+        // prompts is not enough: session/new and a plain session/prime both legitimately REPLACE
+        // the session, and neither waits for us. Publishing our stack afterwards would resurrect
+        // a conversation the user discarded - measured, with the model then quoting from it. So
+        // this records which session we started summarizing for, and finishPrime refuses to
+        // publish into a different one.
+        let (claimed, epoch) = lock.withLock { () -> (Bool, Int) in
+            if busyReasonLocked() != nil { return (false, 0) }
+            condensing = true
+            return (true, sessionEpoch)
+        }
+        guard claimed else {
+            respondError(id, -32003, "cannot prime while a prompt is in progress")
+            return
+        }
+
+        let policy = Self.condensePolicy(from: request, base: digestPolicyForEngine())
+        // Boxed because `Chat.Message` is not Sendable and the raw wire array is a function
+        // PARAMETER, which strict concurrency treats as belonging to the caller's region rather
+        // than a disconnected one - so neither can simply be captured. The box is honest here:
+        // it is written before the Task exists and read only inside it.
+        let boxed = PrimeHistoryBox(
+            Self.primeHistory(from: rawMessages) { [weak self] in self?.log($0) })
+        let accepted = boxed.messages.count
+        // Stored so session/cancel can reach it. Without that the slot is held for up to
+        // maxSlices * the per-slice timeout - minutes - during which every prompt, mode switch
+        // and prime is refused, and the cancellation support the planner and generator already
+        // implement is unreachable from the wire.
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.lock.withLock {
+                    self.condensing = false
+                    self.condenseTask = nil
+                }
+            }
+            // Re-read rather than capture, and safe for a specific reason: idleFired tests
+            // `condensing`, which we are holding, so no unload can free the container underneath
+            // us for as long as this runs.
+            let container = self.lock.withLock { self.container }
+            let outcome = await self.condenseForPrime(history: boxed.messages, policy: policy)
+            self.finishPrime(
+                id: id, container: container, history: outcome.history, suppliedCount: accepted,
+                wireBytes: wireBytes, extra: outcome.extra, expectedEpoch: epoch)
+        }
+        lock.withLock { condenseTask = task }
+    }
+
+    /// Why a stack-mutating request must be refused right now, or nil when it may proceed.
+    /// MUST be called with `lock` held.
+    ///
+    /// One place rather than four copies of the same disjunction, and it names the ACTUAL blocker:
+    /// telling a client "a prompt is already in progress" while what is really running is a
+    /// ten-second summarization sends it looking for a prompt that does not exist.
+    private func busyReasonLocked() -> String? {
+        if promptTask != nil || promptStarting {
+            return "a prompt is already in progress for this session"
+        }
+        if condensing {
+            return "the session context is being summarized; retry shortly"
+        }
+        return nil
+    }
+
+    /// Carries a primed history across the Task boundary. One writer, one reader, and the write
+    /// happens-before the Task exists - there is no concurrency here to check.
+    private final class PrimeHistoryBox: @unchecked Sendable {
+        let messages: [Chat.Message]
+        init(_ messages: [Chat.Message]) { self.messages = messages }
+    }
+
+    /// Build the stack around `history`, publish it, and respond.
+    ///
+    /// Shared by the plain and condensing prime paths so the two cannot drift - the stack-building
+    /// rules here (which engine needs what, the idle-unload interaction, the permission reset) are
+    /// subtle enough that a second copy would be wrong within a release.
+    /// - Parameter expectedEpoch: nil on the synchronous path, which cannot be stale. On the
+    ///   condensing path it is the session epoch captured when the claim was taken; publishing
+    ///   into a different one would restore a conversation the client already replaced.
+    private func finishPrime(
+        id: Int?, container: ModelContainer?, history: [Chat.Message], suppliedCount: Int,
+        wireBytes: Int, extra: [String: Any], expectedEpoch: Int? = nil
+    ) {
         // Rebuild the stack around the restored history. The openai backend needs nothing but
         // the history itself; the MLX one additionally needs its loaded weights - and if those
         // were idle-unloaded, we do NOT reload here: prime just records the new context as the
         // reload shadow and leaves the model unloaded, so the next prompt reloads with it (the
-        // KV prefill is lazy anyway). `container` was captured at the top, so a concurrent
+        // KV prefill is lazy anyway). `container` was captured by the caller, so a concurrent
         // idle-unload cannot free its buffers while this holds the strong ref.
         let backend: GenerationBackend?
         let agent: Agent?
@@ -909,8 +1044,23 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // that publishes the swap, so a prompt accepted before us keeps its stack and
         // we bail; the client's ordering contract (cancel + await resolution before
         // priming) makes a first -32003 a rare transient it retries once.
+        //
+        // `condensing` is deliberately NOT tested here: on the condensing path this runs while
+        // that flag is held by the very Task calling us, and testing it would deadlock the
+        // feature against itself. `expectedEpoch` is what guards the foreign-caller case instead.
+        var superseded = false
         let busy = lock.withLock { () -> Bool in
             if promptTask != nil || promptStarting { return true }
+            // The session was replaced while we were summarizing (session/new, or another prime).
+            // Publishing now would resurrect the conversation the client just discarded.
+            if let expectedEpoch, expectedEpoch != sessionEpoch {
+                superseded = true
+                return true
+            }
+            // Released HERE rather than in the Task's defer, so the slot opens the instant the
+            // stack is published rather than after the response is written. The defer stays as a
+            // backstop for the paths that never reach this point.
+            if expectedEpoch != nil { condensing = false }
             self.backend = backend
             self.agent = agent
             if isMLXEngine {
@@ -929,14 +1079,126 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return false
         }
         if busy {
-            respondError(id, -32003, "cannot prime while a prompt is in progress")
+            if superseded {
+                log("session/prime: discarding a condensed context - the session was replaced")
+                respondError(
+                    id, -32003,
+                    "the session was replaced while its context was being summarized")
+            } else {
+                respondError(id, -32003, "cannot prime while a prompt is in progress")
+            }
             return
         }
         rearmIdleTimerIfIdle()
-        var wireBytes = 0
-        for m in rawMessages { wireBytes += (m["content"] as? String)?.utf8.count ?? 0 }
-        log("session primed: \(history.count) messages (\(rawMessages.count) supplied, ~\(wireBytes) content bytes)")
-        respond(id, ["primed": history.count])
+        log(
+            "session primed: \(history.count) messages (\(suppliedCount) supplied, "
+                + "~\(wireBytes) content bytes)")
+        var payload: [String: Any] = ["primed": history.count]
+        for (key, value) in extra { payload[key] = value }
+        respond(id, payload)
+    }
+
+    // MARK: - session/prime condensation
+
+    /// Policy for a condensing prime: engine-derived sizing, with the two knobs the wire exposes
+    /// layered on top. `PrimePolicy` clamps whatever arrives, so a hostile value cannot get past
+    /// this into the slicing loop.
+    ///
+    /// `sliceBudgetTokens` and `maxSlices` are deliberately NOT on the wire: they are properties of
+    /// the summarizing model's context window, which the agent knows and the client does not.
+    private static func condensePolicy(from request: [String: Any], base: PrimePolicy)
+        -> PrimePolicy
+    {
+        func int(_ key: String) -> Int? { (request[key] as? NSNumber)?.intValue }
+        return PrimePolicy(
+            keepRecentTurns: int("keepRecentTurns") ?? base.keepRecentTurns,
+            maxDigestTokens: int("maxDigestTokens") ?? base.maxDigestTokens,
+            sliceBudgetTokens: base.sliceBudgetTokens,
+            maxItemsPerList: base.maxItemsPerList,
+            maxSlices: base.maxSlices)
+    }
+
+    /// Sizing for whichever engine will do the summarizing. Only foundation can today; the
+    /// library's defaults stand in for the others so the shape is already right when step 12 adds
+    /// a backend-backed summarizer.
+    private func digestPolicyForEngine() -> PrimePolicy {
+        isFoundationEngine ? FoundationBackend.defaultDigestPolicy() : .default
+    }
+
+    /// Summarize the older part of `history`, or explain why not.
+    ///
+    /// NEVER truncates and never throws: a summarizer that is unavailable, refuses, times out or
+    /// returns nothing usable results in the FULL history being primed with `condensed: false` and
+    /// a reason the client can show. That guarantee is `DigestPlanner.condense`'s; this method's
+    /// job is only to not undermine it.
+    private func condenseForPrime(history: [Chat.Message], policy: PrimePolicy) async -> (
+        history: [Chat.Message], extra: [String: Any]
+    ) {
+        func declined(_ reason: String) -> ([Chat.Message], [String: Any]) {
+            log("session/prime: condense requested but not performed - \(reason)")
+            return (history, ["condensed": false, "reason": reason])
+        }
+
+        // Only the foundation engine summarizes today. Step 12 adds a conformance that drives
+        // whichever backend the session already has; until then say so plainly rather than
+        // silently priming everything and letting the client believe it was condensed.
+        guard isFoundationEngine else {
+            return declined(
+                "this session's backend cannot summarize yet; only --backend foundation can")
+        }
+        let status = FMAvailability.probe()
+        guard status.isAvailable else { return declined(status.summary) }
+
+        #if canImport(FoundationModels)
+            guard #available(macOS 26.0, *) else { return declined(status.summary) }
+            let started = Date()
+            let result = await DigestPlanner.condense(
+                history: digestTurns(from: history),
+                using: FMDigestGenerator(
+                    policy: policy, timeout: 25,
+                    log: { [weak self] message in self?.log(message) }),
+                policy: policy,
+                generator: FMDigestGenerator.name)
+
+            guard let digest = result.digest else {
+                return declined(result.reason ?? "the summarizer produced nothing")
+            }
+            digestArchive?.record(
+                result, summarizer: FMDigestGenerator.name, trigger: "session/prime",
+                log: { [weak self] message in self?.log(message) })
+
+            // The verbatim tail is spliced from the ORIGINAL messages so tool-call metadata is not
+            // lost in a round trip through DigestTurn; only the turns the planner produced are
+            // converted. See DigestSupport.
+            let tail = Array(history.dropFirst(result.tailStartIndex))
+            let condensed = chatMessages(from: result.injected) + tail
+            log(
+                "session/prime: summarized \(result.droppedTurns) turns "
+                    + "(\(result.droppedBytes) bytes) into digest "
+                    + "\(digest.sourceSHA256.prefix(8)) in "
+                    + "\(String(format: "%.1f", Date().timeIntervalSince(started))) s; "
+                    + "kept \(tail.count) verbatim")
+            return (
+                condensed,
+                [
+                    "condensed": true,
+                    // The count `primed` and `dropped.turns` are both relative to: primeHistory
+                    // legitimately filters empty turns, orphan tool messages, unknown roles and a
+                    // trailing unanswered tool announcement, so the client's own message count
+                    // does NOT close the arithmetic and a client checking it would compute a
+                    // negative injected count on a transcript with any of those.
+                    "accepted": history.count,
+                    // Which model made it. "The digest is thin" and "the digest was made by a 3B
+                    // model" are the same observation from the client's side; it should be able to
+                    // tell them apart.
+                    "summarizer": FMDigestGenerator.name,
+                    "digest": digest.jsonObject,
+                    "dropped": ["turns": result.droppedTurns, "bytes": result.droppedBytes],
+                ]
+            )
+        #else
+            return declined("this build has no Foundation Models support")
+        #endif
     }
 
     /// Map wire messages ({role, content, toolCalls?, toolCallId?}) to Chat.Message

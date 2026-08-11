@@ -20,6 +20,7 @@
 		63B093CB88E3C0D6AE085BF4 /* Bench.swift in Sources */ = {isa = PBXBuildFile; fileRef = B550B67CB6DC34E5A5CF1038 /* Bench.swift */; };
 		644F8057FEEE03430825462A /* DigestRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6A531076CE58ECBC88C8B157 /* DigestRenderer.swift */; };
 		6630F9A7BEC5B5E3CFB7CDC2 /* SessionDigestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9665CF4C4B4E40161B7C79ED /* SessionDigestTests.swift */; };
+		679B5C860C34412B2B8A89FF /* DigestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D7ECF895279033AA409499 /* DigestSupport.swift */; };
 		6D4123EF7D2A8D99419D42B5 /* libAgentText.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4C39AF4A4F8886F17DA2142C /* libAgentText.a */; };
 		6FCAD0BADFB7FA78A1C4BE48 /* FMDigest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 05EEE55B5463DE5B05CC1867 /* FMDigest.swift */; };
 		75D2413F071A4B1C4253C3D1 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = BD47E9A1D109FA5B40B1F3DF /* MLX */; };
@@ -108,6 +109,7 @@
 		38620DC971FD79A6EA742717 /* AgentTextTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AgentTextTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E02C37297C02B773BFDE264 /* Agent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Agent.swift; sourceTree = "<group>"; };
 		469312102E94520E403591DB /* PassGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PassGate.swift; sourceTree = "<group>"; };
+		48D7ECF895279033AA409499 /* DigestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DigestSupport.swift; sourceTree = "<group>"; };
 		4AAD26E028CDB8A7A03C96DA /* ThinkSplitterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkSplitterTests.swift; sourceTree = "<group>"; };
 		4BF2DE33621B0BFE5EEF50EC /* ChunkerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChunkerTests.swift; sourceTree = "<group>"; };
 		4C39AF4A4F8886F17DA2142C /* libAgentText.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libAgentText.a; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -184,6 +186,7 @@
 				3E02C37297C02B773BFDE264 /* Agent.swift */,
 				BDE3300A74A3119AE3FDAFC3 /* Backend.swift */,
 				B550B67CB6DC34E5A5CF1038 /* Bench.swift */,
+				48D7ECF895279033AA409499 /* DigestSupport.swift */,
 				05EEE55B5463DE5B05CC1867 /* FMDigest.swift */,
 				09F0848AE28D17FE54BC0D99 /* FoundationBackend.swift */,
 				E215391877375B24A31BA7BF /* FoundationCheck.swift */,
@@ -588,6 +591,7 @@
 				A36328C0CE787951150B351C /* Agent.swift in Sources */,
 				9F95AFB406372E7CD13AC93D /* Backend.swift in Sources */,
 				63B093CB88E3C0D6AE085BF4 /* Bench.swift in Sources */,
+				679B5C860C34412B2B8A89FF /* DigestSupport.swift in Sources */,
 				6FCAD0BADFB7FA78A1C4BE48 /* FMDigest.swift in Sources */,
 				1D7E9FB135F1C031CB7230AE /* FoundationBackend.swift in Sources */,
 				86EDF73B84309E37483074DA /* FoundationCheck.swift in Sources */,

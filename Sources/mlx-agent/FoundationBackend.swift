@@ -68,6 +68,9 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// Hard bound on one slice of summarization. See `FMDigestGenerator.timeout` for why a bound
     /// is not optional here.
     private let digestTimeout: TimeInterval
+    /// Where to record a condensation, when `--digest-dir` asked for one. nil is the default and
+    /// means the log line is the only trace.
+    private let archive: DigestArchive?
 
     #if canImport(FoundationModels)
         /// Typed as Any so this stored property does not need `@available` (a stored property
@@ -88,6 +91,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         // 25 s, not 45: a slice measures 3-5 s, and this is also how long a Stop can go unheard
         // while one is in flight. Five times the observed worst case is enough headroom.
         digestTimeout: TimeInterval = 25,
+        archive: DigestArchive? = nil,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.parameters = parameters
@@ -95,6 +99,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         self.seedHistory = seedHistory
         self.digestPolicy = digestPolicy
         self.digestTimeout = digestTimeout
+        self.archive = archive
         self.log = log
         rebuildSession()
         // Say what silently will not happen. Every other GenerateParameters knob maps onto
@@ -488,7 +493,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             guard !history.isEmpty else { return false }
 
             let result = await DigestPlanner.condense(
-                history: history.map(Self.digestTurn(from:)),
+                history: digestTurns(from: history),
                 using: FMDigestGenerator(policy: policy, timeout: digestTimeout, log: log),
                 policy: policy,
                 generator: FMDigestGenerator.name)
@@ -499,6 +504,9 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
                         + (result.reason ?? "no reason given"))
                 return false
             }
+            archive?.record(
+                result, summarizer: FMDigestGenerator.name, trigger: "context overflow",
+                log: log)
 
             // The verbatim tail is spliced from the ORIGINAL messages, not from the planner's
             // round-tripped copies. DigestTurn carries role and text only, so rebuilding the tail
@@ -506,8 +514,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             // turns the planner PRODUCED are converted, and it reports both halves rather than
             // leaving this to arithmetic on a count.
             let tail = Array(history.dropFirst(result.tailStartIndex))
-            let injected = result.injected.map(Self.chatMessage(from:))
-            rebuildSession(replacingHistoryWith: injected + tail)
+            rebuildSession(replacingHistoryWith: chatMessages(from: result.injected) + tail)
 
             log(
                 "foundation backend: \(reason); summarized \(result.droppedTurns) turns "
@@ -517,30 +524,8 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         }
     #endif
 
-    /// Our conversation currency, in the summarizer's.
-    ///
-    /// Tool turns are carried across (unlike `transcript`, which drops them) because a tool result
-    /// is often where the only hard fact in an exchange lives, and a summary of it is safe in a way
-    /// that replaying the call is not.
-    private static func digestTurn(from message: Chat.Message) -> DigestTurn {
-        let role: DigestRole
-        switch message.role {
-        case .user: role = .user
-        case .assistant: role = .assistant
-        case .system: role = .system
-        case .tool: role = .tool
-        }
-        return DigestTurn(role: role, content: message.content)
-    }
-
-    private static func chatMessage(from turn: DigestTurn) -> Chat.Message {
-        switch turn.role {
-        case .user: return .user(turn.content)
-        case .assistant: return .assistant(turn.content)
-        case .system: return .system(turn.content)
-        case .tool: return Chat.Message(role: .tool, content: turn.content)
-        }
-    }
+    // The Chat.Message <-> DigestTurn conversions live in DigestSupport.swift: nothing about them
+    // is Foundation Models specific, and the prime path needs the same pair.
 
     /// Record a finished pass into our own history, and replace the session if the pass did not
     /// finish cleanly.

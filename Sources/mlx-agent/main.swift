@@ -703,6 +703,11 @@ func usage() {
                                    without a prompt/job and reload transparently on the next
                                    one (default 600; 0 disables). Mirrors llama-server's
                                    --sleep-idle-seconds on the gguf path
+          --digest-dir <dir>       acp: record every context condensation into <dir> as
+                                   digest-<unixms>.json plus a digests.jsonl index. Each file
+                                   holds the digest AND the exact text it was made from, so what
+                                   a summary dropped can be diffed after the fact. Off by
+                                   default - it writes conversation text to disk
           --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
                                    message at all (default: helpful-assistant prompt)
 
@@ -745,6 +750,31 @@ func doubleOption(_ name: String, in args: [String]) -> Double? {
 /// non-finite) value is a hard usage error rather than a silent fall-back to the default:
 /// an operator who typed "5m" must not run with 10 minutes of resident weights believing
 /// their value took effect.
+/// --digest-dir, validated like `--idle-unload-seconds` rather than trusted like a plain option.
+///
+/// `option()` returns whatever the next argv element is, which for a flag that decides WHERE THE
+/// USER'S CONVERSATIONS ARE WRITTEN is not good enough. All three of these were reachable:
+/// `--digest-dir --backend foundation` spooled transcripts into a directory named "--backend";
+/// `--digest-dir` as the last argument silently disabled the archive; and `--digest-dir ""`
+/// resolved to the process cwd, dropping conversation text into the user's project. A hard error
+/// is right for the same reason it is right for idle-unload - an operator who typed this must not
+/// end up somewhere else believing it took effect.
+func digestArchiveOption(in args: [String]) -> DigestArchive? {
+    guard args.contains("--digest-dir") else { return nil }
+    guard let raw = option("--digest-dir", in: args) else {
+        FileHandle.standardError.write(Data("--digest-dir requires a directory path\n".utf8))
+        exit(2)
+    }
+    guard !raw.isEmpty, !raw.hasPrefix("-") else {
+        FileHandle.standardError.write(
+            Data("invalid --digest-dir \"\(raw)\": expected a directory path\n".utf8))
+        exit(2)
+    }
+    return DigestArchive(path: raw) { message in
+        FileHandle.standardError.write(Data("[mlx-agent acp] \(message)\n".utf8))
+    }
+}
+
 func idleUnloadSecondsOption(in args: [String]) -> Double {
     guard let raw = option("--idle-unload-seconds", in: args) else { return IdleUnload.defaultSeconds }
     guard let v = Double(raw), v.isFinite, v >= 0 else {
@@ -909,7 +939,11 @@ do {
             extraEOSTokens: extraEOSTokens,
             // MLX-only idle-unload (mirrors llama-server --sleep-idle-seconds). Default 600s; 0
             // disables. Ignored on the openai backend (llama-server does its own idle sleep).
-            idleUnloadSeconds: idleUnloadSecondsOption(in: cliArgs)
+            idleUnloadSeconds: idleUnloadSecondsOption(in: cliArgs),
+            // Off unless asked for: the artifact contains the SUMMARIZED CONVERSATION, so an
+            // agent that wrote it by default would be spooling the user's transcripts to disk
+            // without being told to. Same explicit-spool philosophy as map.
+            digestArchive: digestArchiveOption(in: cliArgs)
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {
