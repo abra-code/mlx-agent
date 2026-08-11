@@ -45,8 +45,23 @@ func runFoundationCheck(prompt: String?) async -> Int {
 
         let model = SystemLanguageModel.default
         print("  context size:   \(model.contextSize) tokens")
-        print("  languages:      \(model.supportedLanguages.count) supported")
         print("  current locale: \(model.supportsLocale() ? "supported" : "NOT supported")")
+
+        // The list, not just the count. Which languages are in it decides whether this model
+        // can be used for anything multilingual at all, and the set is smaller than people
+        // assume - a prompt in an absent language fails outright with unsupportedLanguageOrLocale
+        // rather than degrading, so the answer has to be checkable before a feature is designed
+        // around it.
+        //
+        // The count and the code list measure different things, which is why both are printed.
+        // `supportedLanguages` holds LOCALES (en-AU, en-GB, en-US; zh-Hans-CN, zh-Hant-HK,
+        // zh-Hant-TW), so reducing it to primary language codes and deduping gives a
+        // materially smaller number than the count above.
+        let codes = Set(model.supportedLanguages.compactMap { $0.languageCode?.identifier })
+            .sorted()
+        print("  locales:        \(model.supportedLanguages.count) supported")
+        print("  languages:      \(codes.count) distinct")
+        print("                  \(codes.joined(separator: " "))")
 
         // One real pass. Greedy so a repeat run of this check reads the same, which is what
         // makes it usable as a smoke test rather than a curiosity.
