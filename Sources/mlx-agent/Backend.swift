@@ -126,54 +126,23 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
 
     /// Serializes a whole pass - append, render, prefill, generate, record - against this backend.
     ///
-    /// This replaces protection that ChatSession used to provide and that dropping it silently
-    /// removed: `ChatSession.streamMap` wrapped its entire generation in `cache.update { }` on a
-    /// SerialAccessContainer, so two overlapping passes on one session BLOCKED. Without it they
-    /// interleave, and the ACP cancel window makes that reachable with a contract-abiding client:
-    /// Agent returns `.cancelled` from inside its `for try await`, so the pass Task is only
-    /// cancelled asynchronously (via the stream iterator's deinit), while ACPServer's `defer`
-    /// clears `promptTask` at once and accepts the next prompt. The abandoned pass is then still
-    /// inside `await genTask.value` with its `cachedTokens`/`messages` writes pending while the new
-    /// pass trims the same cache. Measured: a hard `[broadcast_shapes]` SIGTRAP that kills the
-    /// process, at round 6-11 of a cancel/prompt loop.
-    ///
-    /// An `actor` cannot do this job: actors are reentrant across `await`, so a second call would
-    /// interleave at the first suspension point - which is most of a pass.
-    private actor PassGate {
-        private var busy = false
-        private var waiting: [CheckedContinuation<Void, Never>] = []
+    /// The type and the rationale now live in PassGate.swift, because a second backend needed
+    /// exactly the same guarantee. What it protects HERE: without it, two overlapping passes
+    /// interleave and the abandoned one's `cachedTokens`/`messages` writes land while the new
+    /// pass trims the same cache. Measured as a hard `[broadcast_shapes]` SIGTRAP that kills the
+    /// process, at round 6-11 of a cancel/prompt loop. It replaces protection ChatSession used
+    /// to provide and that dropping it silently removed (`streamMap` wrapped its whole
+    /// generation in `cache.update { }` on a SerialAccessContainer).
+    private let gate = PassGate()
 
-        /// Non-cancellable on purpose: a waiter that bailed on cancellation would let the next pass
-        /// start while this one still owns the cache, which is the bug this exists to prevent.
-        func acquire() async {
-            guard busy else { busy = true; return }
-            await withCheckedContinuation { waiting.append($0) }
-        }
-
-        func release() {
-            if waiting.isEmpty { busy = false } else { waiting.removeFirst().resume() }
-        }
-    }
-
-    /// Runs `body` as the only pass in flight. Lives here rather than on the actor because a
-    /// non-Sendable closure cannot cross into an actor under strict concurrency; the mutual
-    /// exclusion is the actor's, the scoping is ours.
+    /// Runs `body` as the only pass in flight against this backend.
     private func withPass<T>(_ body: () async throws -> T) async rethrows -> T {
-        await gate.acquire()
-        do {
-            let result = try await body()
-            await gate.release()
-            return result
-        } catch {
-            await gate.release()
-            throw error
-        }
+        try await mlx_agent.withPass(gate, body)
     }
 
     private let container: ModelContainer
     private let instructions: String?
     private let parameters: GenerateParameters
-    private let gate = PassGate()
 
     /// Guards `toolSpecs` only. Everything else is reachable exclusively from inside `gate`.
     private let lock = NSLock()

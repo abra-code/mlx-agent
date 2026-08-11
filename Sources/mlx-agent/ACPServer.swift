@@ -54,9 +54,29 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private let extraEOSTokens: Set<String>
     private let lock = NSLock()
 
-    /// openai: the endpoint root. nil selects the MLX path - the ONE branch condition, set
-    /// in init and never mutated, so no lock is needed to read it.
-    private let openaiBaseURL: URL?
+    /// Which engine this server was launched with. Set in init and never mutated, so no lock is
+    /// needed to read it.
+    ///
+    /// This used to be `openaiBaseURL: URL?`, with nil meaning "the MLX path" - a binary switch
+    /// that read `openaiBaseURL == nil` at seven call sites. That encoding does not survive a
+    /// third engine: every one of those sites means "MLX only" (weights to unload, a shadow
+    /// transcript to replay, a model that can be switched), and under the old spelling a new
+    /// backend would silently inherit all of them. `isMLXEngine` says what is actually meant.
+    private let engine: EngineSpec
+
+    /// True only for the in-process MLX path. What it gates: idle-unload of weights, the shadow
+    /// transcript replayed after a reload, and runtime model switching - none of which exist for
+    /// a backend that holds no weights of its own.
+    private var isMLXEngine: Bool {
+        if case .mlx = engine { return true }
+        return false
+    }
+
+    /// openai: the endpoint root, nil on every other engine.
+    private var openaiBaseURL: URL? {
+        if case .openai(let baseURL) = engine { return baseURL }
+        return nil
+    }
     /// MLX path only; "" on the openai backend (the applet decides what llama-server serves).
     private var currentModelDir: String
     private let mcpConfigPath: String?
@@ -181,13 +201,13 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = IdleUnload.defaultSeconds
     ) {
         self.idleUnloadSeconds = idleUnloadSeconds
+        self.engine = engine
         switch engine {
         case .mlx(let modelDir):
             self.currentModelDir = modelDir
-            self.openaiBaseURL = nil
-        case .openai(let baseURL):
+        case .openai:
+            // The applet decides what llama-server serves; there is no model dir on this side.
             self.currentModelDir = ""
-            self.openaiBaseURL = baseURL
         }
         self.mcpConfigPath = mcpConfigPath
         self.guardrails = guardrails
@@ -255,7 +275,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// boundary. Must be called WITHOUT `lock` (it takes `lock` to sample state, then hops to
     /// `idleQueue` to touch the timer). A stale arm is harmless: `idleFired` re-checks under lock.
     private func rearmIdleTimerIfIdle() {
-        guard openaiBaseURL == nil, idleUnloadSeconds > 0 else { return }
+        guard isMLXEngine, idleUnloadSeconds > 0 else { return }
         let shouldArm = lock.withLock { self.container != nil && self.promptTask == nil }
         let interval = idleUnloadSeconds
         idleQueue.async { [weak self] in
@@ -655,7 +675,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // errored) must not enter the replayed context. A turn that produced no answer text
             // (e.g. tool-only, since tool exchanges are not replayed) is skipped whole so the
             // user/assistant pairing never carries an empty assistant message into prefill.
-            if self.openaiBaseURL == nil, case .stop = outcome {
+            if self.isMLXEngine, case .stop = outcome {
                 self.lock.withLock {
                     guard !self.assistantTurnBuffer.isEmpty else { return }
                     self.mlxTranscript.append(.user(text))
@@ -739,7 +759,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // deliberately does NOT re-inject the transport - the conversation array here
             // survives, which IS the desired continue-with-a-new-model semantics. Nothing
             // for us to switch, and silently succeeding would be a lie.
-            if openaiBaseURL != nil {
+            if !isMLXEngine {
                 respondError(id, -32601, "model is applet-managed on the openai backend")
                 return
             }
@@ -822,7 +842,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             if promptTask != nil || promptStarting { return true }
             self.backend = backend
             self.agent = agent
-            if openaiBaseURL == nil {
+            if isMLXEngine {
                 // Keep MLX reload state consistent with the rebuilt stack: a prime with the model
                 // loaded is (re)loaded; one with it idle-unloaded stays unloaded (agent nil), and
                 // either way `mlxTranscript` becomes the new context to replay on the next reload.
@@ -1067,7 +1087,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     func agentEmitText(kind: ThinkSplitter.Kind, _ text: String) {
         let sid: String? = lock.withLock {
             // Capture the answer (not the reasoning) for the reload shadow on the MLX path.
-            if kind == .message, self.openaiBaseURL == nil { self.assistantTurnBuffer += text }
+            if kind == .message, self.isMLXEngine { self.assistantTurnBuffer += text }
             return self.sessionID
         }
         guard let sid else { return }
