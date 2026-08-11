@@ -78,6 +78,16 @@ targets:
     sources:
       - Sources/AgentText
 
+  # Session summarization: the digest type, the split/slice/merge policy, and the renderer that
+  # turns a digest back into history text. Foundation-only for the usual reason, plus one specific
+  # to it: a digest made on macOS 26 under Foundation Models has to be primeable into an MLX or
+  # OpenAI session on macOS 14, so nothing here may know what produced it.
+  AgentDigest:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/AgentDigest
+
   mlx-agent:
     type: tool
     platform: macOS
@@ -86,6 +96,7 @@ targets:
     dependencies:
       - target: Chunking
       - target: AgentText
+      - target: AgentDigest
       # mlx-swift-lm 3.x decoupled swift-transformers into an opt-in integration: the
       # MLXHuggingFace macros expand to code referencing Tokenizers, so the CONSUMER must
       # supply it. That is why swift-transformers is here though mlx-swift-lm does not
@@ -137,6 +148,17 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
 
+  AgentDigestTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/AgentDigestTests
+    dependencies:
+      - target: AgentDigest
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   # Ships the tool. This is what the applet's binary is built from.
   #
@@ -167,9 +189,11 @@ schemes:
       targets:
         ChunkingTests: [test]
         AgentTextTests: [test]
+        AgentDigestTests: [test]
     test:
       config: Debug
       gatherCoverageData: false
       targets:
         - ChunkingTests
         - AgentTextTests
+        - AgentDigestTests

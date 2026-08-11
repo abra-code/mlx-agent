@@ -15,6 +15,20 @@
             buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
+               BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
+               BuildableName = "AgentDigestTests.xctest"
+               BlueprintName = "AgentDigestTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
                BlueprintIdentifier = "981EF93A726A4AC29F24A634"
                BuildableName = "AgentTextTests.xctest"
                BlueprintName = "AgentTextTests"
@@ -46,9 +60,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
-            BuildableName = "AgentTextTests.xctest"
-            BlueprintName = "AgentTextTests"
+            BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
+            BuildableName = "AgentDigestTests.xctest"
+            BlueprintName = "AgentDigestTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -75,6 +89,17 @@
                ReferencedContainer = "container:mlx-agent.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
+               BuildableName = "AgentDigestTests.xctest"
+               BlueprintName = "AgentDigestTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>
@@ -92,9 +117,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
-            BuildableName = "AgentTextTests.xctest"
-            BlueprintName = "AgentTextTests"
+            BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
+            BuildableName = "AgentDigestTests.xctest"
+            BlueprintName = "AgentDigestTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -108,9 +133,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "981EF93A726A4AC29F24A634"
-            BuildableName = "AgentTextTests.xctest"
-            BlueprintName = "AgentTextTests"
+            BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
+            BuildableName = "AgentDigestTests.xctest"
+            BlueprintName = "AgentDigestTests"
             ReferencedContainer = "container:mlx-agent.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
