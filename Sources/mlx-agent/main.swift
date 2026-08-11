@@ -640,6 +640,13 @@ func usage() {
                                                           --prefill-step overrides the library's
                                                           512-token prompt chunking; 2048 matches
                                                           mlx_lm's default, measured equal on M5)
+          mlx-agent fm-check [--prompt <text>]            report whether Apple's on-device system
+                                                          model (Foundation Models, macOS 26+) is
+                                                          usable here: availability, context size,
+                                                          language support, and one real generation
+                                                          to prove a pass completes. Loads no MLX
+                                                          model. Exit 0 only if generation worked;
+                                                          prints a RESULT_JSON line for scripts
           mlx-agent --version                             print "mlx-agent <version>" and exit 0
                                                           (loads no model, reads no config;
                                                           "-version" and bare "version" work too)
@@ -913,6 +920,11 @@ do {
             exit(2)
         }
         exit(Int32(await runToolsDump(mcpConfigPath: cfg)))
+    // Loads no model and reads no config, like --version: it answers whether Apple's on-device
+    // model is usable on this machine, which is what an embedding app needs before deciding to
+    // offer anything built on it.
+    case "fm-check":
+        exit(Int32(await runFoundationCheck(prompt: option("--prompt", in: cliArgs))))
     case "bench":
         let code = try await runBench(
             model: requireModelDir(),

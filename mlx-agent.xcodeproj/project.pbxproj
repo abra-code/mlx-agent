@@ -18,8 +18,10 @@
 		75D2413F071A4B1C4253C3D1 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = BD47E9A1D109FA5B40B1F3DF /* MLX */; };
 		80F48DB1144E3C4FF55DA51B /* Chunker.swift in Sources */ = {isa = PBXBuildFile; fileRef = F274CF7229F7F51AF0F52765 /* Chunker.swift */; };
 		856B8E93C12BB6875621375A /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 52DE7041102657E23D235C25 /* MLXLLM */; };
+		86EDF73B84309E37483074DA /* FoundationCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = E215391877375B24A31BA7BF /* FoundationCheck.swift */; };
 		8AE812ED99A92E767B3D7EFF /* libChunking.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E9FFACB364A5BB5CB83744DF /* libChunking.a */; };
 		8BCCA115B089CB49D4E0C9F7 /* Version.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF785E5E6C1AAECF8DE386C /* Version.swift */; };
+		8DB509EB3659AC7F1EA93008 /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A901288567746C0195E9BE74 /* FoundationModels.framework */; settings = {ATTRIBUTES = (Weak, ); }; };
 		9F95AFB406372E7CD13AC93D /* Backend.swift in Sources */ = {isa = PBXBuildFile; fileRef = BDE3300A74A3119AE3FDAFC3 /* Backend.swift */; };
 		A36328C0CE787951150B351C /* Agent.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E02C37297C02B773BFDE264 /* Agent.swift */; };
 		BCB89A7DFFF472D2E60253C8 /* IdleUnload.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78778B1B914C9AD92CD750EA /* IdleUnload.swift */; };
@@ -27,6 +29,7 @@
 		BD314C0FF09C0C88EF8166F1 /* ChunkerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4BF2DE33621B0BFE5EEF50EC /* ChunkerTests.swift */; };
 		C07F2184454B6B5E903A6801 /* Map.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B7F370E24C4B3388D09AC6D /* Map.swift */; };
 		CF50B7ADD2A8D452C58F4609 /* MCP in Frameworks */ = {isa = PBXBuildFile; productRef = 44B7BB4DADE8AA62493652DC /* MCP */; };
+		D2C1CCB40B437EF4F0C40175 /* FoundationSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 26B40FABDF95D50D51933874 /* FoundationSupport.swift */; };
 		D5C5669F115D11D3A208E514 /* MCPClients.swift in Sources */ = {isa = PBXBuildFile; fileRef = F55B7D2A87D64A3F9DF47AFF /* MCPClients.swift */; };
 		F1EB9B58DEBA34201E563C2B /* libChunking.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E9FFACB364A5BB5CB83744DF /* libChunking.a */; };
 		F68CE5CE76931117218E3424 /* ACPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08EAC0C65B2AC05C4ECA0EC9 /* ACPServer.swift */; };
@@ -67,6 +70,7 @@
 		08EAC0C65B2AC05C4ECA0EC9 /* ACPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPServer.swift; sourceTree = "<group>"; };
 		1BC3EC6FD00DD8AB3FC5CCB9 /* mlx-agent */ = {isa = PBXFileReference; includeInIndex = 0; path = "mlx-agent"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1EDC523FDD56FB3B551B220A /* ThinkSplitter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkSplitter.swift; sourceTree = "<group>"; };
+		26B40FABDF95D50D51933874 /* FoundationSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationSupport.swift; sourceTree = "<group>"; };
 		38620DC971FD79A6EA742717 /* AgentTextTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = AgentTextTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E02C37297C02B773BFDE264 /* Agent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Agent.swift; sourceTree = "<group>"; };
 		4AAD26E028CDB8A7A03C96DA /* ThinkSplitterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkSplitterTests.swift; sourceTree = "<group>"; };
@@ -76,9 +80,11 @@
 		6FF785E5E6C1AAECF8DE386C /* Version.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Version.swift; sourceTree = "<group>"; };
 		78778B1B914C9AD92CD750EA /* IdleUnload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdleUnload.swift; sourceTree = "<group>"; };
 		9B7F370E24C4B3388D09AC6D /* Map.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Map.swift; sourceTree = "<group>"; };
+		A901288567746C0195E9BE74 /* FoundationModels.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FoundationModels.framework; path = System/Library/Frameworks/FoundationModels.framework; sourceTree = SDKROOT; };
 		B550B67CB6DC34E5A5CF1038 /* Bench.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Bench.swift; sourceTree = "<group>"; };
 		BDE3300A74A3119AE3FDAFC3 /* Backend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Backend.swift; sourceTree = "<group>"; };
 		D48F23012CFB20A5E0D96BE8 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		E215391877375B24A31BA7BF /* FoundationCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationCheck.swift; sourceTree = "<group>"; };
 		E9FFACB364A5BB5CB83744DF /* libChunking.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libChunking.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		F274CF7229F7F51AF0F52765 /* Chunker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Chunker.swift; sourceTree = "<group>"; };
 		F55B7D2A87D64A3F9DF47AFF /* MCPClients.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MCPClients.swift; sourceTree = "<group>"; };
@@ -97,6 +103,7 @@
 				75D2413F071A4B1C4253C3D1 /* MLX in Frameworks */,
 				573BFC199AA09A235BCD9D4C /* Tokenizers in Frameworks */,
 				CF50B7ADD2A8D452C58F4609 /* MCP in Frameworks */,
+				8DB509EB3659AC7F1EA93008 /* FoundationModels.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -126,6 +133,8 @@
 				3E02C37297C02B773BFDE264 /* Agent.swift */,
 				BDE3300A74A3119AE3FDAFC3 /* Backend.swift */,
 				B550B67CB6DC34E5A5CF1038 /* Bench.swift */,
+				E215391877375B24A31BA7BF /* FoundationCheck.swift */,
+				26B40FABDF95D50D51933874 /* FoundationSupport.swift */,
 				78778B1B914C9AD92CD750EA /* IdleUnload.swift */,
 				D48F23012CFB20A5E0D96BE8 /* main.swift */,
 				9B7F370E24C4B3388D09AC6D /* Map.swift */,
@@ -143,6 +152,14 @@
 				10ED12161BE67CA9B68E9895 /* mlx-agent */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		3B37F14097707C4A5E16CEDF /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				A901288567746C0195E9BE74 /* FoundationModels.framework */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 		3FA3FF9D05A62AD52F6C5211 /* Chunking */ = {
@@ -166,6 +183,7 @@
 			children = (
 				3680FE5EE356A50F2112C669 /* Sources */,
 				D44C19D4B9F038661A3A65E7 /* Tests */,
+				3B37F14097707C4A5E16CEDF /* Frameworks */,
 				886DBB16111FBFD93DBF6182 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -411,6 +429,8 @@
 				A36328C0CE787951150B351C /* Agent.swift in Sources */,
 				9F95AFB406372E7CD13AC93D /* Backend.swift in Sources */,
 				63B093CB88E3C0D6AE085BF4 /* Bench.swift in Sources */,
+				86EDF73B84309E37483074DA /* FoundationCheck.swift in Sources */,
+				D2C1CCB40B437EF4F0C40175 /* FoundationSupport.swift in Sources */,
 				BCB89A7DFFF472D2E60253C8 /* IdleUnload.swift in Sources */,
 				D5C5669F115D11D3A208E514 /* MCPClients.swift in Sources */,
 				C07F2184454B6B5E903A6801 /* Map.swift in Sources */,

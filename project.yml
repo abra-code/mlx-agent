@@ -103,6 +103,14 @@ targets:
       # MCP stdio tool clients (one per configured server) speak MCP directly - no mcp-proxy.
       - package: swift-sdk
         product: MCP
+      # Apple's on-device system model. WEAK on purpose: the framework is macOS 26.0 and this
+      # binary's deployment target is 14.0, so a hard link would make dyld refuse to launch the
+      # tool on every older system - breaking all modes, not just the Foundation Models ones.
+      # Swift's availability annotations usually get ld to weak-import the symbols anyway; this
+      # says so explicitly rather than depending on "usually". Verify after changing it with:
+      #     otool -l <binary> | grep -A2 LC_LOAD_WEAK_DYLIB | grep FoundationModels
+      - sdk: FoundationModels.framework
+        weak: true
 
   ChunkingTests:
     type: bundle.unit-test
