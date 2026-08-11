@@ -21,11 +21,10 @@
 //               Bridging MCP tools means moving the permission gate, iteration cap, timeout and
 //               dedup inside the call, which is its own change. Setting `tools` logs and is
 //               otherwise ignored, so agent mode degrades to chat rather than pretending.
-//   condense  - on overflow this reports a clean error. Summarizing the transcript and retrying
-//               is the next step, and wants the digest type that does not exist yet.
 
-import Foundation
+import AgentDigest
 import AgentText
+import Foundation
 import MLXLMCommon
 
 #if canImport(FoundationModels)
@@ -60,6 +59,16 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// exactly the turns that need preserving. Completed turns are appended here as they finish.
     private var seedHistory: [Chat.Message]
 
+    /// Policy for summarize-and-retry on context overflow. nil turns it off, and overflow then
+    /// surfaces as a clean turn failure.
+    ///
+    /// Not `@available`-gated and not an FM type, which is exactly why the decision of WHAT to
+    /// summarize is testable: see AgentDigest.
+    private let digestPolicy: PrimePolicy?
+    /// Hard bound on one slice of summarization. See `FMDigestGenerator.timeout` for why a bound
+    /// is not optional here.
+    private let digestTimeout: TimeInterval
+
     #if canImport(FoundationModels)
         /// Typed as Any so this stored property does not need `@available` (a stored property
         /// cannot be conditionally available). Every use casts back under `#available`, which is
@@ -72,15 +81,22 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     ///     that have a Foundation Models equivalent are mapped in `generationOptions`.
     ///   - systemPrompt: becomes the session's instructions; nil supplies none (translator mode).
     ///   - seedHistory: prior turns to resume from (session/prime), system message excluded.
+    ///   - digestPolicy: how to summarize when the window overflows; nil to fail instead.
     init(
         parameters: GenerateParameters, systemPrompt: String?, seedHistory: [Chat.Message] = [],
+        digestPolicy: PrimePolicy? = FoundationBackend.defaultDigestPolicy(),
+        // 25 s, not 45: a slice measures 3-5 s, and this is also how long a Stop can go unheard
+        // while one is in flight. Five times the observed worst case is enough headroom.
+        digestTimeout: TimeInterval = 25,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.parameters = parameters
         self.instructions = systemPrompt
         self.seedHistory = seedHistory
+        self.digestPolicy = digestPolicy
+        self.digestTimeout = digestTimeout
         self.log = log
-        rebuildSessionLocked()
+        rebuildSession()
         // Say what silently will not happen. Every other GenerateParameters knob maps onto
         // something here; this one has no equivalent in the framework at all.
         if parameters.repetitionPenalty != nil {
@@ -117,30 +133,62 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// would vanish.
     func clear() async {
         await withPass(gate) {
-            lock.withLock { seedHistory = [] }
-            rebuildSessionLocked()
+            rebuildSession(replacingHistoryWith: [])
         }
     }
 
     // MARK: - Session lifecycle
 
-    /// Build a fresh session from `instructions` + `seedHistory`.
+    /// Sized from the model's actual window rather than a constant.
+    ///
+    /// The budget has to hold FOUR things at once: this slice of conversation, the running digest
+    /// carried into the prompt as prior context, the digest being generated, and the instructions
+    /// plus the schema the framework echoes into the prompt. Hence two digest allowances, not one.
+    /// `PrimePolicy` clamps whatever comes out, so a future model with a tiny window degrades to
+    /// the floor instead of producing a negative budget.
+    ///
+    /// `maxSlices` has to move with the budget, not stay at the library default. A slice here is
+    /// about 1900 tokens against the library's 2800, so the same conversation needs ~45% more
+    /// slices - leaving the count alone would make this backend refuse to condense histories the
+    /// library's own sizing considers well within range, and the pass would then fail on the very
+    /// overflow the condense exists to prevent. 24 slices is roughly 180 KB of conversation, and
+    /// at the measured 3-5 s per slice it is also the point where the wait stops being defensible.
+    static func defaultDigestPolicy() -> PrimePolicy {
+        let context = FMAvailability.contextSize() ?? 4096
+        let maxDigestTokens = 700
+        let promptOverhead = 768
+        return PrimePolicy(
+            maxDigestTokens: maxDigestTokens,
+            sliceBudgetTokens: context - 2 * maxDigestTokens - promptOverhead,
+            maxSlices: 24)
+    }
+
+    /// Build a fresh session from `instructions` + `seedHistory`, optionally replacing the history
+    /// in the same breath.
     ///
     /// Cheap: it allocates a session and a transcript, and loads nothing. The system model is
     /// already resident - that being true is most of the reason this backend exists.
     ///
-    /// Reads the history and publishes the session under ONE lock acquisition. Doing it as two
-    /// (read, build, write) leaves a window in which a concurrent rebuild publishes a session
-    /// built from older history, which is the kind of race that shows up once a month as a lost
-    /// turn. Building the transcript inside the lock is fine - it allocates and does no I/O.
-    private func rebuildSessionLocked() {
+    /// Replaces, reads and publishes under ONE lock acquisition. Doing it as separate steps leaves
+    /// a window in which a concurrent rebuild publishes a session built from older history, which
+    /// is the kind of race that shows up once a month as a lost turn. Building the transcript
+    /// inside the lock is fine - it allocates and does no I/O.
+    private func rebuildSession(replacingHistoryWith newHistory: [Chat.Message]? = nil) {
         #if canImport(FoundationModels)
-            guard #available(macOS 26.0, *) else { return }
-            lock.withLock {
-                let transcript = Self.transcript(instructions: instructions, history: seedHistory)
-                sessionBox = LanguageModelSession(transcript: transcript)
+            if #available(macOS 26.0, *) {
+                lock.withLock {
+                    if let newHistory { seedHistory = newHistory }
+                    sessionBox = LanguageModelSession(
+                        transcript: Self.transcript(
+                            instructions: instructions, history: seedHistory))
+                }
+                return
             }
         #endif
+        // No framework, or too old for it: there is no session to build, but a caller asking to
+        // replace the history still gets that. Falling out of the #if without doing it would make
+        // `clear()` silently do nothing on macOS 14.
+        if let newHistory { lock.withLock { seedHistory = newHistory } }
     }
 
     #if canImport(FoundationModels)
@@ -266,55 +314,115 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             }
 
             try await withPass(gate) {
-                guard let session = lock.withLock({ sessionBox }) as? LanguageModelSession else {
-                    throw Self.unavailable(FMAvailability.probe().summary)
-                }
-
-                var delta = CumulativeDelta()
-                let started = Date()
-                var firstToken: Date?
+                var answer = ""
                 var completed = false
+                // Only turns that actually reached the model are recorded. A pass that failed
+                // before generating - no session, unavailable - would otherwise append a bare
+                // user turn with no reply, and repeated failures would stack consecutive user
+                // turns into the transcript.
+                var reachedModel = false
                 // A pass that does NOT reach the end - cancelled, or failed mid-answer - leaves
                 // the framework's session in a state that must not be reused. See recordTurn.
-                defer { recordTurn(prompt: prompt, answer: delta.emittedText, completed: completed) }
-                do {
-                    // Snapshots are CUMULATIVE - each carries the whole answer so far - while
-                    // BackendEvent.text is a fragment. CumulativeDelta is the adapter, and it
-                    // lives in the MLX-free target so its Unicode edge cases are tested.
-                    for try await snapshot in session.streamResponse(
-                        to: prompt, options: generationOptions)
-                    {
-                        try Task.checkCancellation()
-                        let text = delta.advance(to: snapshot.content) { [log] anomaly in
-                            log("foundation backend: \(anomaly)")
-                        }
-                        guard !text.isEmpty else { continue }
-                        if firstToken == nil { firstToken = Date() }
-                        // Always .text, never .reasoning: the system model emits no thought
-                        // markers, so ThinkSplitter passes this through untouched.
-                        continuation.yield(.text(text))
+                defer {
+                    if reachedModel {
+                        recordTurn(prompt: prompt, answer: answer, completed: completed)
                     }
-                    completed = true
-                } catch let error as LanguageModelSession.GenerationError {
-                    // Rethrown with a message that says what to do. Overflow is the one a caller
-                    // could act on by summarizing; that retry is the next change.
-                    throw Self.generationFailed(fmUserFacingError(error))
                 }
 
-                let finished = Date()
-                // Token counts are 26.4+; below that estimate rather than report zeros, since
-                // Agent derives tok/s from these and a zero reads as a stall.
-                let answer = delta.emittedText
-                let promptTokens = await Self.tokenCount(for: prompt) ?? (prompt.utf8.count / 4)
-                let answerTokens = await Self.tokenCount(for: answer) ?? (answer.utf8.count / 4)
-                let decodeStart = firstToken ?? finished
-                continuation.yield(
-                    .info(
-                        GenerateCompletionInfo(
-                            promptTokenCount: promptTokens,
-                            generationTokenCount: answerTokens,
-                            promptTime: decodeStart.timeIntervalSince(started),
-                            generationTime: finished.timeIntervalSince(decodeStart))))
+                // Proactive condense. Cheaper than the reactive path in the case that matters:
+                // overflow raised MID-ANSWER cannot be retried (see below), and this is what keeps
+                // a long conversation from reaching that state at all.
+                var triedCondensing = false
+                if await needsCondensingBefore(prompt: prompt) {
+                    // A success here also disarms the reactive retry: if the pass still overflows
+                    // after this, condensing again would summarize the preamble this one just
+                    // wrote - a digest of a digest, losing a second time to buy nothing.
+                    triedCondensing = await condenseHistory(
+                        because: "the next turn would exceed the window")
+                }
+
+                while true {
+                    // Re-read inside the loop: a condense between attempts replaces the session.
+                    guard let session = lock.withLock({ sessionBox }) as? LanguageModelSession
+                    else { throw Self.unavailable(FMAvailability.probe().summary) }
+                    reachedModel = true
+
+                    var delta = CumulativeDelta()
+                    // What the READER actually has, accumulated from the yields themselves rather
+                    // than read back from CumulativeDelta. Those differ: `emittedText` is the last
+                    // SNAPSHOT, and a snapshot that rewrites or truncates already-sent text
+                    // replaces it - an empty snapshot after "Hello" leaves `emittedText` empty
+                    // while the client is still holding "Hello". Both decisions below turn on this
+                    // value, and both get it wrong in the dangerous direction if it lies.
+                    var streamed = ""
+                    // Publish the partial answer on EVERY exit from this scope, including the
+                    // cancellation that unwinds past the catch below. Without it, the outer defer
+                    // would record an empty answer and the reader's visible text would vanish from
+                    // the model's context.
+                    defer { answer = streamed }
+                    let started = Date()
+                    var firstToken: Date?
+                    do {
+                        // Snapshots are CUMULATIVE - each carries the whole answer so far - while
+                        // BackendEvent.text is a fragment. CumulativeDelta is the adapter, and it
+                        // lives in the MLX-free target so its Unicode edge cases are tested.
+                        for try await snapshot in session.streamResponse(
+                            to: prompt, options: generationOptions)
+                        {
+                            try Task.checkCancellation()
+                            let text = delta.advance(to: snapshot.content) { [log] anomaly in
+                                log("foundation backend: \(anomaly)")
+                            }
+                            guard !text.isEmpty else { continue }
+                            if firstToken == nil { firstToken = Date() }
+                            // Always .text, never .reasoning: the system model emits no thought
+                            // markers, so ThinkSplitter passes this through untouched.
+                            continuation.yield(.text(text))
+                            streamed += text
+                        }
+                    } catch let error as LanguageModelSession.GenerationError {
+                        // Overflow is the one error a caller can act on. Retry ONCE, and only
+                        // while nothing has reached the client: text already streamed cannot be
+                        // un-sent, so a second attempt would append a fresh answer to a partial
+                        // one and the reader would see two half-replies stitched together.
+                        // Overflow raised mid-answer (the response itself filled the window)
+                        // therefore surfaces as a failure, which is honest - the request cannot
+                        // be satisfied by making the history smaller.
+                        if case .exceededContextWindowSize = error, !triedCondensing,
+                            streamed.isEmpty
+                        {
+                            triedCondensing = true
+                            if await condenseHistory(because: "the window overflowed") {
+                                continue
+                            }
+                        }
+                        throw Self.generationFailed(fmUserFacingError(error))
+                    }
+                    // "Did not throw" is NOT "finished". Cancelling the task iterating
+                    // `streamResponse` usually makes the framework END the stream early rather
+                    // than throw, so `checkCancellation` above only fires if another snapshot
+                    // happens to arrive after the cancel. Asking directly is what guarantees a
+                    // cancelled pass still forces the session rebuild in recordTurn - without it
+                    // the next prompt reuses a post-cancel session, which traps and kills the
+                    // process.
+                    completed = !Task.isCancelled
+
+                    let finished = Date()
+                    // Token counts are 26.4+; below that estimate rather than report zeros, since
+                    // Agent derives tok/s from these and a zero reads as a stall.
+                    let promptTokens = await Self.tokenCount(for: prompt) ?? (prompt.utf8.count / 4)
+                    let answerTokens =
+                        await Self.tokenCount(for: streamed) ?? (streamed.utf8.count / 4)
+                    let decodeStart = firstToken ?? finished
+                    continuation.yield(
+                        .info(
+                            GenerateCompletionInfo(
+                                promptTokenCount: promptTokens,
+                                generationTokenCount: answerTokens,
+                                promptTime: decodeStart.timeIntervalSince(started),
+                                generationTime: finished.timeIntervalSince(decodeStart))))
+                    return
+                }
             }
         #else
             throw Self.unavailable("this build has no Foundation Models support")
@@ -329,6 +437,110 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             return try? await SystemLanguageModel.default.tokenCount(for: text)
         }
     #endif
+
+    // MARK: - Condensing
+
+    #if canImport(FoundationModels)
+        /// Would the next pass not fit?
+        ///
+        /// Two-stage on purpose. The byte estimate is free and answers "no" for every short
+        /// conversation, which is nearly all of them; only when it says the window is at risk do we
+        /// spend an actual `tokenCount` call to confirm. Asking the OS on every turn would put a
+        /// real API round trip in front of every prompt to answer a question whose answer is
+        /// almost always the same.
+        ///
+        /// Pre-26.4 there is no exact counter, so the estimate decides alone. `estimateTokens`
+        /// takes the larger of bytes/4 and the non-ASCII scalar count precisely so that case errs
+        /// toward condensing early rather than late - a bytes-only rule under-reports CJK by about
+        /// a third, and under-reporting here means arriving at the un-retryable mid-answer
+        /// overflow instead of condensing before it.
+        @available(macOS 26.0, *)
+        private func needsCondensingBefore(prompt: String) async -> Bool {
+            guard digestPolicy != nil else { return false }
+            let history = lock.withLock { seedHistory }
+            guard !history.isEmpty else { return false }
+            let text = history.map(\.content).joined(separator: "\n") + "\n" + prompt
+            let window = FMAvailability.contextSize() ?? 4096
+            // Room for the answer, plus the instructions and template the framework adds.
+            //
+            // The answer allowance is CAPPED at a quarter of the window rather than taken from
+            // `maxTokens` directly. ACP's default is 4096 - the entire window - which is a "no
+            // practical limit" sentinel rather than a prediction, and reserving all of it would
+            // make this check fire on literally every turn that has any history at all, condensing
+            // conversations that fit comfortably. A caller who asks for SHORT answers still gets
+            // the smaller reserve, which is the case where the number means something.
+            let reserve = min(parameters.maxTokens ?? 512, window / 4) + 256
+            guard DigestPlanner.estimateTokens(text) + reserve > window else { return false }
+            if let exact = await Self.tokenCount(for: text) { return exact + reserve > window }
+            return true
+        }
+
+        /// Summarize the older part of the conversation and rebuild the session around it.
+        ///
+        /// Returns false when nothing changed - the caller must then treat the situation as it
+        /// would have without this path, because the history is exactly as it was. Every reason
+        /// for a false is logged: this is the only trace, and a condensation that silently did not
+        /// happen looks identical to one that did nothing useful.
+        @available(macOS 26.0, *)
+        private func condenseHistory(because reason: String) async -> Bool {
+            guard let policy = digestPolicy else { return false }
+            let history = lock.withLock { seedHistory }
+            guard !history.isEmpty else { return false }
+
+            let result = await DigestPlanner.condense(
+                history: history.map(Self.digestTurn(from:)),
+                using: FMDigestGenerator(policy: policy, timeout: digestTimeout, log: log),
+                policy: policy,
+                generator: FMDigestGenerator.name)
+
+            guard let digest = result.digest else {
+                log(
+                    "foundation backend: \(reason), but the history was left whole - "
+                        + (result.reason ?? "no reason given"))
+                return false
+            }
+
+            // The verbatim tail is spliced from the ORIGINAL messages, not from the planner's
+            // round-tripped copies. DigestTurn carries role and text only, so rebuilding the tail
+            // from it would quietly discard tool-call metadata on any turn that had it. Only the
+            // turns the planner PRODUCED are converted, and it reports both halves rather than
+            // leaving this to arithmetic on a count.
+            let tail = Array(history.dropFirst(result.tailStartIndex))
+            let injected = result.injected.map(Self.chatMessage(from:))
+            rebuildSession(replacingHistoryWith: injected + tail)
+
+            log(
+                "foundation backend: \(reason); summarized \(result.droppedTurns) turns "
+                    + "(\(result.droppedBytes) bytes) into digest \(digest.sourceSHA256.prefix(8)), "
+                    + "kept \(tail.count) verbatim")
+            return true
+        }
+    #endif
+
+    /// Our conversation currency, in the summarizer's.
+    ///
+    /// Tool turns are carried across (unlike `transcript`, which drops them) because a tool result
+    /// is often where the only hard fact in an exchange lives, and a summary of it is safe in a way
+    /// that replaying the call is not.
+    private static func digestTurn(from message: Chat.Message) -> DigestTurn {
+        let role: DigestRole
+        switch message.role {
+        case .user: role = .user
+        case .assistant: role = .assistant
+        case .system: role = .system
+        case .tool: role = .tool
+        }
+        return DigestTurn(role: role, content: message.content)
+    }
+
+    private static func chatMessage(from turn: DigestTurn) -> Chat.Message {
+        switch turn.role {
+        case .user: return .user(turn.content)
+        case .assistant: return .assistant(turn.content)
+        case .system: return .system(turn.content)
+        case .tool: return Chat.Message(role: .tool, content: turn.content)
+        }
+    }
 
     /// Record a finished pass into our own history, and replace the session if the pass did not
     /// finish cleanly.
@@ -357,7 +569,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         // A clean pass leaves the session healthy and already holding this exchange, so keep it -
         // that is what preserves whatever prefix reuse the framework does internally.
         guard !completed else { return }
-        rebuildSessionLocked()
+        rebuildSession()
     }
 
     // Codes 2-7 in domain "mlx-agent" are taken (main.swift, Backend, Bench, Map). Nothing

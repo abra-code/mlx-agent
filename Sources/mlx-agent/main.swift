@@ -658,12 +658,15 @@ func usage() {
                                                           512-token prompt chunking; 2048 matches
                                                           mlx_lm's default, measured equal on M5)
           mlx-agent fm-check [--prompt <text>]            report whether Apple's on-device system
-                                                          model (Foundation Models, macOS 26+) is
+                    [--digest <text>]                     model (Foundation Models, macOS 26+) is
                                                           usable here: availability, context size,
                                                           language support, and one real generation
                                                           to prove a pass completes. Loads no MLX
                                                           model. Exit 0 only if generation worked;
-                                                          prints a RESULT_JSON line for scripts
+                                                          prints a RESULT_JSON line for scripts.
+                                                          --digest summarizes the given text into
+                                                          the session-digest schema instead, which
+                                                          also proves guided generation works
           mlx-agent --version                             print "mlx-agent <version>" and exit 0
                                                           (loads no model, reads no config;
                                                           "-version" and bare "version" work too)
@@ -970,7 +973,19 @@ do {
     // model is usable on this machine, which is what an embedding app needs before deciding to
     // offer anything built on it.
     case "fm-check":
-        exit(Int32(await runFoundationCheck(prompt: option("--prompt", in: cliArgs))))
+        // A bare `--digest` with no value would otherwise fall through to the plain generation
+        // path and report success, which reads as "the digest schema works" when it was never
+        // exercised.
+        let digestSource = option("--digest", in: cliArgs)
+        if digestSource == nil, cliArgs.contains("--digest") {
+            FileHandle.standardError.write(
+                Data("fm-check --digest requires the text to summarize\n".utf8))
+            exit(2)
+        }
+        exit(
+            Int32(
+                await runFoundationCheck(
+                    prompt: option("--prompt", in: cliArgs), digestSource: digestSource)))
     case "bench":
         let code = try await runBench(
             model: requireModelDir(),
