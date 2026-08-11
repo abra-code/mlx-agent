@@ -485,6 +485,21 @@ func runOneshot(
         try await OpenAIBackend.waitForHealth(baseURL: baseURL)
         backend = OpenAIBackend(
             baseURL: baseURL, parameters: parameters, systemPrompt: systemPrompt)
+    case .foundation:
+        // Nothing to load and nothing to reach: the model is the OS's and already resident.
+        // Availability is the only thing that can be wrong, and resolveEngine already checked
+        // it - re-checking here keeps oneshot honest when called from somewhere else.
+        let status = FMAvailability.probe()
+        guard status.isAvailable else {
+            FileHandle.standardError.write(
+                Data("[oneshot] on-device model unavailable: \(status.summary)\n".utf8))
+            return 2
+        }
+        backend = FoundationBackend(
+            parameters: parameters, systemPrompt: systemPrompt,
+            log: { message in
+                FileHandle.standardError.write(Data("[oneshot] \(message)\n".utf8))
+            })
     }
 
     var registry: MCPToolRegistry? = nil
@@ -599,12 +614,14 @@ func usage() {
         mlx-agent \(agentVersion) - native MLX ACP agent (chat + tools)
 
         USAGE:
-          mlx-agent acp     [--backend mlx|openai] [--model <dir> | --base-url <url>]
+          mlx-agent acp     [--backend mlx|openai|foundation]
+                            [--model <dir> | --base-url <url>]
                             [--mcp-config <json>] [--mode chat|agent] [guardrails]
                                                           ACP server over stdio (chat + agentic tools);
                                                           session/prime replaces the session context with a
                                                           supplied transcript (resume/fresh, see docs/session-prime.md)
-          mlx-agent oneshot [--backend mlx|openai] [--model <dir> | --base-url <url>]
+          mlx-agent oneshot [--backend mlx|openai|foundation]
+                            [--model <dir> | --base-url <url>]
                             --prompt <text> [--mcp-config <json>]
                             [--auto-permission allow|deny] [guardrails]
                                                           run one agent turn, print to stdout
@@ -652,10 +669,19 @@ func usage() {
                                                           "-version" and bare "version" work too)
 
         OPTIONS:
-          --backend mlx|openai     generation engine for acp/oneshot/map (default: mlx).
-                                   mlx    = in-process mlx-swift-lm on a safetensors --model
-                                   openai = a remote OpenAI-compatible --base-url (llama-server);
-                                            no model is loaded here and the RAM gate is skipped
+          --backend mlx|openai|foundation
+                                   generation engine for acp/oneshot (default: mlx; map takes
+                                   mlx or openai).
+                                   mlx        = in-process mlx-swift-lm on a safetensors --model
+                                   openai     = a remote OpenAI-compatible --base-url
+                                                (llama-server); no model is loaded here and the
+                                                RAM gate is skipped
+                                   foundation = Apple's on-device system model (macOS 26+, Apple
+                                                Intelligence enabled). No --model, no download,
+                                                no weights resident. Its context is 4096 tokens
+                                                and it does not do tool calling here yet, so
+                                                agent mode degrades to chat. Check the machine
+                                                with `mlx-agent fm-check`.
           --base-url <url>         OpenAI-compatible endpoint root, required by --backend openai
                                    (e.g. http://127.0.0.1:8099/v1); its /health is checked at
                                    session/new (acp) or at load (map). The MODEL is whatever that
@@ -822,7 +848,7 @@ func requireModelDir() -> String {
     return dir
 }
 
-/// Resolve `--backend mlx|openai` (default mlx) into the engine the acp/oneshot modes run.
+/// Resolve `--backend mlx|openai|foundation` (default mlx) into the engine acp/oneshot run.
 /// The model directory is required ONLY by the mlx path - resolving the engine before
 /// asking for it is what lets `--backend openai` run with no --model at all (its weights
 /// live in llama-server, which the applet owns).
@@ -841,9 +867,20 @@ func resolveEngine(_ args: [String]) -> EngineSpec {
             exit(2)
         }
         return .openai(baseURL: url)
+    case "foundation":
+        // Refuse at resolve time rather than at the first prompt: the reasons are actionable
+        // (enable Apple Intelligence, wait for assets, upgrade macOS) and a caller that picked
+        // this backend explicitly should be told now, not two round trips later.
+        let status = FMAvailability.probe()
+        guard status.isAvailable else {
+            FileHandle.standardError.write(
+                Data("--backend foundation is not usable here: \(status.summary)\n".utf8))
+            exit(2)
+        }
+        return .foundation
     case let other:
         FileHandle.standardError.write(
-            Data("unknown --backend \"\(other)\": expected mlx or openai\n".utf8))
+            Data("unknown --backend \"\(other)\": expected mlx, openai or foundation\n".utf8))
         exit(2)
     }
 }
@@ -902,9 +939,18 @@ do {
                 Data("map mode requires --spool <dir>\n".utf8))
             exit(2)
         }
-        // Same --backend selector as acp/oneshot (default mlx; mlx requires --model, openai
-        // requires --base-url). The openai path serves the spool from a separately-launched
-        // llama-server - no weights load here, so the RAM gate and idle-unload do not apply.
+        // Same --backend selector as acp/oneshot, MINUS foundation: map chunks whole documents,
+        // and the on-device system model's 4096-token context is too small to do that well.
+        // Refused here, where the message can name the mode, rather than inside MapServer.
+        if (option("--backend", in: cliArgs)?.lowercased() ?? "mlx") == "foundation" {
+            FileHandle.standardError.write(
+                Data(
+                    "map mode does not support --backend foundation (context is 4096 tokens); use mlx or openai\n"
+                        .utf8))
+            exit(2)
+        }
+        // The openai path serves the spool from a separately-launched llama-server - no weights
+        // load here, so the RAM gate and idle-unload do not apply.
         await MapServer(
             engine: resolveEngine(cliArgs), spoolDir: spool,
             gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens,

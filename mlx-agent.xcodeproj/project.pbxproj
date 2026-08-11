@@ -10,6 +10,7 @@
 		01E1D2A9E2E6E32F6F676939 /* PassGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 469312102E94520E403591DB /* PassGate.swift */; };
 		13981E15C13B9D17C3A191B2 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = D48F23012CFB20A5E0D96BE8 /* main.swift */; };
 		1584244719EEB6837D6C9778 /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 827C6811CE82BFC82433EC25 /* MLXLMCommon */; };
+		1D7E9FB135F1C031CB7230AE /* FoundationBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09F0848AE28D17FE54BC0D99 /* FoundationBackend.swift */; };
 		22D759D2EFD906BF9B2DA6FF /* ThinkSplitter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EDC523FDD56FB3B551B220A /* ThinkSplitter.swift */; };
 		2457B4E63AF76C591578AC1F /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 6C78FD41F6E002ED4F26B8A8 /* MLXHuggingFace */; };
 		2B57DEE4D7B7A56BCA06A2B8 /* libAgentText.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 4C39AF4A4F8886F17DA2142C /* libAgentText.a */; };
@@ -71,6 +72,7 @@
 
 /* Begin PBXFileReference section */
 		08EAC0C65B2AC05C4ECA0EC9 /* ACPServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ACPServer.swift; sourceTree = "<group>"; };
+		09F0848AE28D17FE54BC0D99 /* FoundationBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationBackend.swift; sourceTree = "<group>"; };
 		1BC3EC6FD00DD8AB3FC5CCB9 /* mlx-agent */ = {isa = PBXFileReference; includeInIndex = 0; path = "mlx-agent"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1EDC523FDD56FB3B551B220A /* ThinkSplitter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThinkSplitter.swift; sourceTree = "<group>"; };
 		26B40FABDF95D50D51933874 /* FoundationSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FoundationSupport.swift; sourceTree = "<group>"; };
@@ -139,6 +141,7 @@
 				3E02C37297C02B773BFDE264 /* Agent.swift */,
 				BDE3300A74A3119AE3FDAFC3 /* Backend.swift */,
 				B550B67CB6DC34E5A5CF1038 /* Bench.swift */,
+				09F0848AE28D17FE54BC0D99 /* FoundationBackend.swift */,
 				E215391877375B24A31BA7BF /* FoundationCheck.swift */,
 				26B40FABDF95D50D51933874 /* FoundationSupport.swift */,
 				78778B1B914C9AD92CD750EA /* IdleUnload.swift */,
@@ -439,6 +442,7 @@
 				A36328C0CE787951150B351C /* Agent.swift in Sources */,
 				9F95AFB406372E7CD13AC93D /* Backend.swift in Sources */,
 				63B093CB88E3C0D6AE085BF4 /* Bench.swift in Sources */,
+				1D7E9FB135F1C031CB7230AE /* FoundationBackend.swift in Sources */,
 				86EDF73B84309E37483074DA /* FoundationCheck.swift in Sources */,
 				D2C1CCB40B437EF4F0C40175 /* FoundationSupport.swift in Sources */,
 				BCB89A7DFFF472D2E60253C8 /* IdleUnload.swift in Sources */,

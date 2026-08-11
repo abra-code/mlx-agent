@@ -35,13 +35,17 @@ import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
 
-/// Which engine generates. Chosen once at launch (`--backend`), never at runtime: the two
-/// have different lifecycles - the MLX path loads a model container into this process and
-/// can switch models on the fly, while the openai path talks to a server the APPLET owns
-/// (it launches, restarts and reaps llama-server), so model choice is not ours to make.
+/// Which engine generates. Chosen once at launch (`--backend`), never at runtime: they have
+/// different lifecycles - the MLX path loads a model container into this process and can switch
+/// models on the fly, the openai path talks to a server the APPLET owns (it launches, restarts
+/// and reaps llama-server), and the foundation path uses the OS's own resident model, which has
+/// no model to choose at all.
 enum EngineSpec: Sendable {
     case mlx(modelDir: String)
     case openai(baseURL: URL)
+    /// Apple's on-device system model (macOS 26+, Apple Intelligence enabled). No weights of
+    /// ours, nothing to load, nothing to switch. See FoundationBackend.
+    case foundation
 }
 
 final class ACPServer: @unchecked Sendable, AgentDelegate {
@@ -58,9 +62,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// needed to read it.
     ///
     /// This used to be `openaiBaseURL: URL?`, with nil meaning "the MLX path" - a binary switch
-    /// that read `openaiBaseURL == nil` at seven call sites. That encoding does not survive a
-    /// third engine: every one of those sites means "MLX only" (weights to unload, a shadow
-    /// transcript to replay, a model that can be switched), and under the old spelling a new
+    /// read as `openaiBaseURL == nil` (five sites) or `if let` (three more). That encoding does
+    /// not survive a third engine: every one of those sites means "MLX only" (weights to unload,
+    /// a shadow transcript to replay, a model that can be switched), and under the old spelling a new
     /// backend would silently inherit all of them. `isMLXEngine` says what is actually meant.
     private let engine: EngineSpec
 
@@ -76,6 +80,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private var openaiBaseURL: URL? {
         if case .openai(let baseURL) = engine { return baseURL }
         return nil
+    }
+
+    /// True only for Apple's on-device system model.
+    private var isFoundationEngine: Bool {
+        if case .foundation = engine { return true }
+        return false
     }
     /// MLX path only; "" on the openai backend (the applet decides what llama-server serves).
     private var currentModelDir: String
@@ -205,8 +215,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         switch engine {
         case .mlx(let modelDir):
             self.currentModelDir = modelDir
-        case .openai:
-            // The applet decides what llama-server serves; there is no model dir on this side.
+        case .openai, .foundation:
+            // The applet decides what llama-server serves, and the OS decides what the system
+            // model is; there is no model dir on either side.
             self.currentModelDir = ""
         }
         self.mcpConfigPath = mcpConfigPath
@@ -221,9 +232,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // MARK: - Run loop
 
     func serve() async {
-        if let openaiBaseURL {
-            log("ACP server ready (stdio JSON-RPC). backend: openai at \(openaiBaseURL.absoluteString)")
-        } else {
+        switch engine {
+        case .openai(let baseURL):
+            log("ACP server ready (stdio JSON-RPC). backend: openai at \(baseURL.absoluteString)")
+        case .foundation:
+            log("ACP server ready (stdio JSON-RPC). backend: foundation (on-device system model)")
+        case .mlx:
             log("ACP server ready (stdio JSON-RPC). initial model: \(currentModelDir)")
         }
         installSignalHandlers()
@@ -429,11 +443,42 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // a bare "/") so we never inject a misleading directory into the model's context.
         let cwd = (params["cwd"] as? String).flatMap { $0.hasPrefix("/") && $0 != "/" ? $0 : nil }
         lock.withLock { self.sessionCwd = cwd }
-        if let openaiBaseURL {
-            await handleNewSessionOpenAI(id: id, baseURL: openaiBaseURL)
-        } else {
+        switch engine {
+        case .openai(let baseURL):
+            await handleNewSessionOpenAI(id: id, baseURL: baseURL)
+        case .foundation:
+            await handleNewSessionFoundation(id: id)
+        case .mlx:
             await handleNewSessionMLX(id: id)
         }
+    }
+
+    /// foundation: nothing to load and no server to reach - the model is the OS's and already
+    /// resident. The one thing that CAN be wrong is availability, so it is checked here, which
+    /// makes an unusable machine one clean error at session/new instead of a failure on every
+    /// prompt (the same reason the openai path health-checks).
+    private func handleNewSessionFoundation(id: Int?) async {
+        let status = FMAvailability.probe()
+        guard status.isAvailable else {
+            respondError(id, -32000, "session/new failed: \(status.summary)")
+            return
+        }
+        let registry = await ensureRegistry()
+        let (backend, agent) = buildFoundationStack(history: [])
+        let sid = "mlx-session-1"
+        let modeNow = lock.withLock { () -> String in
+            self.backend = backend
+            self.agent = agent
+            self.sessionID = sid
+            // A new conversation is a new consent context: standing permissions do not survive it.
+            resetSessionPermissionsLocked()
+            return mode
+        }
+        let toolCount = agent.hasTools ? (registry?.toolSpecs.count ?? 0) : 0
+        log(
+            "session ready: \(sid) on foundation backend "
+                + "[mode=\(modeNow), tools=\(toolCount)]")
+        respond(id, ["sessionId": sid, "configOptions": configOptionsJSON()])
     }
 
     /// openai: nothing to load - the applet already launched llama-server on a pinned port.
@@ -541,6 +586,22 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         let backend = OpenAIBackend(
             baseURL: baseURL, parameters: parameters, systemPrompt: effectiveSystemPrompt(),
             seedHistory: history)
+        let registry = lock.withLock { self.registry }
+        let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
+        agent.delegate = self
+        let modeNow = lock.withLock { mode }
+        agent.setToolsEnabled(modeNow == "agent")
+        return (backend, agent)
+    }
+
+    /// The foundation counterpart of buildSessionStack: no container and no server - the OS owns
+    /// the model. Same generation defaults and the same registry + mode re-application, though
+    /// the registry cannot reach the model yet (see FoundationBackend's `tools`).
+    private func buildFoundationStack(history: [Chat.Message]) -> (FoundationBackend, Agent) {
+        let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
+        let backend = FoundationBackend(
+            parameters: parameters, systemPrompt: effectiveSystemPrompt(), seedHistory: history,
+            log: { [weak self] message in self?.log(message) })
         let registry = lock.withLock { self.registry }
         let agent = Agent(backend: backend, registry: registry, guardrails: guardrails)
         agent.delegate = self
@@ -760,7 +821,14 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // survives, which IS the desired continue-with-a-new-model semantics. Nothing
             // for us to switch, and silently succeeding would be a lie.
             if !isMLXEngine {
-                respondError(id, -32601, "model is applet-managed on the openai backend")
+                // Silently succeeding would be a lie on either engine, for different reasons:
+                // the applet restarts llama-server to change models, and the foundation backend
+                // has exactly one model, which belongs to the OS.
+                let why =
+                    isFoundationEngine
+                    ? "the foundation backend has a single OS-provided model"
+                    : "model is applet-managed on the openai backend"
+                respondError(id, -32601, why)
                 return
             }
             guard let target = availableModels().first(where: { $0.value == value }) else {
@@ -826,6 +894,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         let agent: Agent?
         if let openaiBaseURL {
             let (b, a) = buildOpenAIStack(baseURL: openaiBaseURL, history: history)
+            (backend, agent) = (b, a)
+        } else if case .foundation = engine {
+            let (b, a) = buildFoundationStack(history: history)
             (backend, agent) = (b, a)
         } else if let container {
             let (b, a) = buildSessionStack(container: container, history: history)
@@ -1184,7 +1255,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             )
         }
         let options: [[String: Any]] = []
-        // NO model picker, on EITHER backend - so no client renders one, and session/new's
+        // NO model picker, on ANY backend - so no client renders one, and session/new's
         // configOptions is always empty.
         //
         // The openai backend never had one: the applet picks the gguf and restarts llama-server

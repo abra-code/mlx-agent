@@ -193,6 +193,18 @@ final class MapServer: @unchecked Sendable {
             engine = MLXMapEngine(modelDir: modelDir, extraEOSTokens: extraEOSTokens)
         case .openai(let baseURL):
             engine = OpenAIMapEngine(baseURL: baseURL)
+        case .foundation:
+            // Refused rather than silently substituted. map exists to translate or classify whole
+            // DOCUMENTS chunk by chunk, and the on-device system model's context is 4096 tokens
+            // total - it would force chunks small enough that stitching quality collapses, on a
+            // model with no control over the target language. `map` deliberately takes mlx or
+            // openai only; main.swift refuses this earlier, and this is the backstop for a caller
+            // that builds a MapServer directly.
+            FileHandle.standardError.write(
+                Data(
+                    "map mode does not support --backend foundation: the on-device model's 4096-token context is too small for document chunking\n"
+                        .utf8))
+            exit(2)
         }
         self.init(engine: engine, spoolDir: spoolDir, gen: gen, idleUnloadSeconds: idleUnloadSeconds)
     }
