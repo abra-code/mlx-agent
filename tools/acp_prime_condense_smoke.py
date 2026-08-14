@@ -17,7 +17,18 @@
 #     it guards against is silent history loss.
 #   - --digest-dir writes an artifact holding the digest AND the text it was made from
 #
-# Usage: python3 tools/acp_prime_condense_smoke.py /path/to/mlx-agent [--backend foundation | --model <dir>]
+# WHICH model summarizes is a separate axis (--digest-backend), and the contract above is the same
+# on all of them: either a valid digest, or the full history with a reason. So this script does not
+# branch on the engine. `--expect` states which of the two outcomes the caller is testing for, and
+# it is what turns "the session's own model can summarize" into an assertion rather than a hope.
+#
+# Usage: python3 tools/acp_prime_condense_smoke.py /path/to/mlx-agent \
+#            [--expect condensed|declined|any] [--backend foundation | --model <dir>] [acp args]
+#
+#   python3 tools/acp_prime_condense_smoke.py "$BIN" --backend foundation --expect condensed
+#   python3 tools/acp_prime_condense_smoke.py "$BIN" --model "$M" --digest-backend session --expect condensed
+#   python3 tools/acp_prime_condense_smoke.py "$BIN" --model "$M" --digest-backend none --expect declined
+#
 # Exit code = number of failed checks (0 = all good).
 
 import json
@@ -114,6 +125,18 @@ def main():
         print("usage: acp_prime_condense_smoke.py /path/to/mlx-agent [backend args]")
         return 2
     binary, backend_args = sys.argv[1], sys.argv[2:]
+    # --expect is ours; everything else is passed through to `mlx-agent acp` untouched.
+    expect = "any"
+    if "--expect" in backend_args:
+        i = backend_args.index("--expect")
+        if i + 1 >= len(backend_args):
+            print("--expect requires condensed|declined|any")
+            return 2
+        expect = backend_args[i + 1]
+        del backend_args[i:i + 2]
+        if expect not in ("condensed", "declined", "any"):
+            print(f"unknown --expect {expect}")
+            return 2
     failures = []
 
     def check(name, ok, detail=""):
@@ -127,7 +150,7 @@ def main():
     if not sid:
         print("[FAIL] session/new")
         return 1
-    foundation = any("--backend" == a for a in backend_args) and "foundation" in backend_args
+    want_session = "session" in backend_args and "--digest-backend" in backend_args
 
     # 1. A plain prime must be untouched by this feature.
     history = long_history()
@@ -149,11 +172,14 @@ def main():
     elapsed = time.time() - started
     print(f"       condensing prime took {elapsed:.1f} s")
 
-    if not foundation:
-        # Every non-foundation backend must DECLINE and prime everything. Silent truncation here
-        # would be the worst possible outcome, so the fallback is the assertion.
-        check("a backend that cannot summarize declines", res.get("condensed") is False,
+    condensed = res.get("condensed") is True
+    if expect != "any":
+        check(f"the condensing prime {expect}", condensed == (expect == "condensed"),
               f"result={res}")
+
+    if not condensed:
+        # The fallback is the clause that matters most: a summarizer that cannot run must prime
+        # EVERYTHING and say so. Silent truncation here would be the worst possible outcome.
         check("declining primes the FULL history", res.get("primed") == len(history),
               f"primed={res.get('primed')} of {len(history)}")
         check("declining says why", bool(res.get("reason")), f"result={res}")
@@ -163,8 +189,13 @@ def main():
         print("ALL PASS" if not failures else f"{len(failures)} FAILED: " + ", ".join(failures))
         return len(failures)
 
-    check("the condensing prime succeeded", res.get("condensed") is True, f"result={res}")
     check("it reports which model summarized", bool(res.get("summarizer")), f"result={res}")
+    if want_session:
+        # --digest-backend session must not quietly resolve to the on-device model: the whole
+        # point of the flag is to pin WHICH model reads the conversation.
+        check("--digest-backend session summarized with the session's model",
+              str(res.get("summarizer", "")).startswith("session:"),
+              f"summarizer={res.get('summarizer')}")
 
     digest = res.get("digest") or {}
     check("the digest parses as schemaVersion 1", digest.get("schemaVersion") == 1,
@@ -242,6 +273,7 @@ def main():
     print("concurrency: requests sent DURING a condensation")
     concurrency_checks(binary, backend_args, check)
 
+
     print("-" * 60)
     print("ALL PASS" if not failures else f"{len(failures)} FAILED: " + ", ".join(failures))
     return len(failures)
@@ -253,12 +285,9 @@ SECRET = "ZEBRA-77"
 def concurrency_checks(binary, backend_args, check):
     """Send a competing request mid-condensation and assert the discarded context stays discarded.
 
-    Only meaningful where condensation actually runs; on a backend that declines, the prime returns
-    instantly and there is no window to race.
+    Reached only when the earlier condensation actually ran - on a configuration that declines, the
+    prime returns instantly and there is no window to race.
     """
-    if "foundation" not in backend_args:
-        print("[skip] this backend declines to condense, so there is no window to race")
-        return
 
     def secret_history():
         h = long_history(pairs=34)

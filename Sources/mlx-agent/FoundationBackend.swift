@@ -146,11 +146,10 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
 
     /// Sized from the model's actual window rather than a constant.
     ///
-    /// The budget has to hold FOUR things at once: this slice of conversation, the running digest
-    /// carried into the prompt as prior context, the digest being generated, and the instructions
-    /// plus the schema the framework echoes into the prompt. Hence two digest allowances, not one.
-    /// `PrimePolicy` clamps whatever comes out, so a future model with a tiny window degrades to
-    /// the floor instead of producing a negative budget.
+    /// The arithmetic - and the reasoning about what the window has to hold at once - lives in
+    /// `PrimePolicy.sized(window:)`, because the session-backed summarizer needs exactly the same
+    /// derivation from a different window. `PrimePolicy` clamps whatever comes out, so a future
+    /// model with a tiny window degrades to the floor instead of producing a negative budget.
     ///
     /// `maxSlices` has to move with the budget, not stay at the library default. A slice here is
     /// about 1900 tokens against the library's 2800, so the same conversation needs ~45% more
@@ -159,13 +158,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// overflow the condense exists to prevent. 24 slices is roughly 180 KB of conversation, and
     /// at the measured 3-5 s per slice it is also the point where the wait stops being defensible.
     static func defaultDigestPolicy() -> PrimePolicy {
-        let context = FMAvailability.contextSize() ?? 4096
-        let maxDigestTokens = 700
-        let promptOverhead = 768
-        return PrimePolicy(
-            maxDigestTokens: maxDigestTokens,
-            sliceBudgetTokens: context - 2 * maxDigestTokens - promptOverhead,
-            maxSlices: 24)
+        .sized(window: FMAvailability.contextSize() ?? 4096, maxSlices: 24)
     }
 
     /// Build a fresh session from `instructions` + `seedHistory`, optionally replacing the history
@@ -481,6 +474,15 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         }
 
         /// Summarize the older part of the conversation and rebuild the session around it.
+        ///
+        /// THE SUMMARIZER HERE IS ALWAYS FMDigestGenerator, AND MUST BE. `BackendDigestGenerator`
+        /// (BackendDigest.swift) summarizes with the session's own model and looks like the obvious
+        /// generalization of this call, but it cannot run here: this method is reached from inside
+        /// a pass, `PassGate.acquire()` is non-reentrant and non-cancellable, so calling a
+        /// backend's `stream()` from within its own pass deadlocks permanently - no timeout, no
+        /// cancel. FMDigestGenerator is safe precisely because it opens its own
+        /// `LanguageModelSession` and never touches this backend's gate. Backend-backed
+        /// summarization is a prime-time capability; see the header of BackendDigest.swift.
         ///
         /// Returns false when nothing changed - the caller must then treat the situation as it
         /// would have without this path, because the history is exactly as it was. Every reason

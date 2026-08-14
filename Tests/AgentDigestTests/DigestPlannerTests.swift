@@ -658,4 +658,143 @@ struct PrimePolicyTests {
         #expect(p.mergedCap(slices: 3) == 12)
         #expect(p.mergedCap(slices: 50) == 12)
     }
+
+    /// The whole point of `windowTokens`: the 8192 clamp is a ceiling sized for a 4096-token
+    /// model, and applying it to a 32k one made it slice four times where once would do.
+    @Test("a stated window raises the ceiling the slice budget is clamped to")
+    func windowRaisesTheCeiling() {
+        let small = PrimePolicy.sized(window: 4096)
+        #expect(small.sliceBudgetTokens == 4096 - 1400 - 768)
+        #expect(small.windowTokens == 4096)
+
+        let large = PrimePolicy.sized(window: 32768)
+        #expect(large.sliceBudgetTokens == 32768 - 1400 - 768)
+
+        // The same number through the memberwise init, which states no window, is clamped.
+        #expect(PrimePolicy(sliceBudgetTokens: 30600).sliceBudgetTokens == 8192)
+    }
+
+    @Test("a window too small for the allowances degrades to the floor")
+    func tinyWindow() {
+        let p = PrimePolicy.sized(window: 1024)
+        #expect(p.sliceBudgetTokens == 256)
+    }
+
+    /// THE invariant a stated window buys: whatever a caller or a client asks for, one slice plus
+    /// the prior digest plus the generated digest plus the template still fits.
+    ///
+    /// It is checked against hostile values because `maxDigestTokens` arrives over the wire, and
+    /// deriving the budget from the UNCLAMPED value once let `maxDigestTokens: -5000` produce a
+    /// slice budget of the entire window - an overflow through the one field the clamps exist to
+    /// make safe.
+    @Test("the budget always leaves room for what the window has to hold")
+    func budgetNeverOverflowsTheWindow() {
+        for window in [2048, 4096, 8192, 32768, 131_072] {
+            for requested in [-5000, 0, 1, 128, 700, 2048, 99_999] {
+                let direct = PrimePolicy.sized(window: window, maxDigestTokens: requested)
+                let viaWith = PrimePolicy.sized(window: window).with(maxDigestTokens: requested)
+                for policy in [direct, viaWith] {
+                    let needed =
+                        policy.sliceBudgetTokens + 2 * policy.maxDigestTokens
+                        + PrimePolicy.promptOverheadTokens
+                    // Below `256 + 2 * maxDigestTokens + overhead` the window cannot hold the
+                    // allowances AND the smallest slice the floor permits, so the floor wins and
+                    // the identity genuinely does not hold. Deriving that boundary from the policy
+                    // in hand rather than accepting "or it is the floor" is the difference between
+                    // an invariant and a hole: written the loose way, 10 of these 70 cases passed
+                    // on the escape clause, so a regression landing in the floor region would have
+                    // gone unnoticed.
+                    let smallest = 256 + 2 * policy.maxDigestTokens + PrimePolicy.promptOverheadTokens
+                    if window >= smallest {
+                        #expect(needed <= window)
+                    } else {
+                        #expect(policy.sliceBudgetTokens == 256)
+                    }
+                }
+                #expect(direct.sliceBudgetTokens == viaWith.sliceBudgetTokens)
+                #expect(direct.maxDigestTokens == viaWith.maxDigestTokens)
+            }
+        }
+    }
+
+    /// The floor region is a real degradation, not a rounding artifact, so it is worth one case
+    /// that names it: a window this small produces a policy that can only refuse, and the caller
+    /// (`ACPServer.sessionOption`) is expected to check for that rather than slice at 256.
+    @Test("a window too small for the allowances yields a budget that cannot work")
+    func floorRegionIsRecognizable() {
+        let starved = PrimePolicy.sized(window: 1024)
+        #expect(starved.sliceBudgetTokens == 256)
+        #expect(
+            starved.sliceBudgetTokens + 2 * starved.maxDigestTokens
+                + PrimePolicy.promptOverheadTokens > 1024)
+    }
+
+    /// `with(...)` is what the wire overrides go through, and it must not silently re-clamp.
+    @Test("with() preserves the window and re-derives the budget")
+    func withPreservesWindow() {
+        let base = PrimePolicy.sized(window: 32768, maxSlices: 6)
+        let adjusted = base.with(keepRecentTurns: 12, maxDigestTokens: 2048)
+        #expect(adjusted.keepRecentTurns == 12)
+        #expect(adjusted.maxDigestTokens == 2048)
+        #expect(adjusted.maxSlices == 6)
+        #expect(adjusted.windowTokens == 32768)
+        // Re-derived, not carried: a bigger digest allowance has to come out of the slice.
+        #expect(adjusted.sliceBudgetTokens == 32768 - 2 * 2048 - 768)
+        // Unstated arguments change nothing.
+        #expect(base.with() == base)
+    }
+
+    @Test("with() on a window-less policy keeps its budget")
+    func withoutWindow() {
+        let base = PrimePolicy(sliceBudgetTokens: 3000)
+        let adjusted = base.with(maxDigestTokens: 900)
+        #expect(adjusted.sliceBudgetTokens == 3000)
+        #expect(adjusted.maxDigestTokens == 900)
+        #expect(adjusted.windowTokens == nil)
+    }
+}
+
+/// `sliceCount` decides WHICH summarizer runs, so it has to answer the same question `condense`
+/// asks - not a similar one.
+@Suite("DigestPlanner: slice estimation")
+struct SliceCountTests {
+
+    @Test("the estimate equals the number of model calls condense makes")
+    func matchesCondense() async {
+        let policy = PrimePolicy(sliceBudgetTokens: 512, maxSlices: 64)
+        for count in [8, 14, 30] {
+            let history = bulky(count)
+            let estimate = DigestPlanner.sliceCount(of: history, policy: policy)
+            let model = RecordingModel([])
+            _ = await DigestPlanner.condense(
+                history: history, using: model, policy: policy, generator: "fake")
+            #expect(estimate == model.sources.count)
+            #expect(estimate > 1)
+        }
+    }
+
+    @Test("nothing to summarize counts as zero passes")
+    func nothingToSummarize() {
+        #expect(DigestPlanner.sliceCount(of: alternating(4)) == 0)
+        #expect(DigestPlanner.sliceCount(of: []) == 0)
+    }
+
+    @Test("system turns are not counted: they are hoisted, not summarized")
+    func systemTurnsExcluded() {
+        let history = [DigestTurn.system(String(repeating: "s", count: 40_000))] + alternating(20)
+        let policy = PrimePolicy(sliceBudgetTokens: 256)
+        #expect(
+            DigestPlanner.sliceCount(of: history, policy: policy)
+                == DigestPlanner.sliceCount(of: alternating(20), policy: policy))
+    }
+
+    @Test("a bigger budget needs fewer passes")
+    func budgetMovesTheCount() {
+        let history = bulky(16)
+        let small = DigestPlanner.sliceCount(of: history, policy: PrimePolicy(sliceBudgetTokens: 512))
+        let large = DigestPlanner.sliceCount(
+            of: history, policy: PrimePolicy.sized(window: 32768))
+        #expect(small > large)
+        #expect(large >= 1)
+    }
 }

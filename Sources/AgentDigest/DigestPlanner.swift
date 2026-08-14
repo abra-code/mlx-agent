@@ -38,8 +38,25 @@ public struct PrimePolicy: Sendable, Equatable {
     /// client sends, and each slice is a sequential generation on the critical path of a restore.
     /// Exceeding it falls back to the full history, which is the safe direction.
     public private(set) var maxSlices: Int
+    /// The summarizing model's context window, when the caller knew it. nil means "unstated", and
+    /// then `sliceBudgetTokens` is clamped at `defaultSliceBudgetCeiling` - a bound sized for a
+    /// 4096-token model, which is the only safe assumption in the absence of information.
+    ///
+    /// Stored rather than consumed at construction so `with(...)` can RE-derive the budget when a
+    /// caller changes `maxDigestTokens`. The two are not independent: the window has to hold the
+    /// slice, the prior digest, the generated digest and the framework's own preamble at once, so
+    /// raising the digest allowance has to lower the slice budget or it overflows.
+    public private(set) var windowTokens: Int?
 
     public static let `default` = PrimePolicy()
+
+    /// What the slice budget is clamped to when no window is stated. See `windowTokens`.
+    public static let defaultSliceBudgetCeiling = 8192
+
+    /// Room reserved, beyond the two digest allowances, for whatever the summarizer's own stack
+    /// puts in the window: instructions, a chat template, and - on Foundation Models - the schema
+    /// the framework echoes into the prompt.
+    public static let promptOverheadTokens = 768
 
     /// Values outside the ranges below are CLAMPED, not rejected. They come from a client, and a
     /// nonsense number is not worth failing a restore over - but honoring `sliceBudgetTokens:
@@ -55,16 +72,78 @@ public struct PrimePolicy: Sendable, Equatable {
         maxDigestTokens: Int = 700,
         sliceBudgetTokens: Int = 2800,
         maxItemsPerList: Int = 8,
-        maxSlices: Int = 16
+        maxSlices: Int = 16,
+        windowTokens: Int? = nil
     ) {
         self.keepRecentTurns = min(max(keepRecentTurns, 2), 64)
         self.maxDigestTokens = min(max(maxDigestTokens, 128), 2048)
-        self.sliceBudgetTokens = min(max(sliceBudgetTokens, 256), 8192)
+        self.windowTokens = windowTokens
+        // THE CEILING IS THE DERIVATION, and it is here rather than in `sized` so that no path can
+        // route around it. The window has to hold four things at once - the slice, the prior digest
+        // carried into the prompt, the digest being generated, and the instructions and template
+        // around them - so the budget a stated window allows is what is left after the other three.
+        //
+        // Doing this arithmetic in `sized` instead was wrong in a way worth recording: it
+        // subtracted the CALLER's `maxDigestTokens` rather than the clamped one, so a client
+        // sending `maxDigestTokens: -5000` over the wire got a slice budget of the entire window -
+        // an overflow arriving through the one field the clamps were supposed to make safe. Using
+        // `self.maxDigestTokens`, after its own clamp, is what closes that.
+        //
+        // Fixed at 8192 this used to be a ceiling sized for a 4096-token model applied to every
+        // model: a 32k-window one then sliced at 8192 and did four sequential passes where one
+        // would have done.
+        let digestAllowance = self.maxDigestTokens
+        let ceiling =
+            windowTokens.map { max(256, $0 - 2 * digestAllowance - Self.promptOverheadTokens) }
+            ?? Self.defaultSliceBudgetCeiling
+        self.sliceBudgetTokens = min(max(sliceBudgetTokens, 256), max(256, ceiling))
         // The floor is 3, not 1. A one-item-per-list digest standing in for thirty turns passes
         // every emptiness check and is still useless - the caller is told `condensed: true` and
         // has no way to know the summary is a stub.
         self.maxItemsPerList = min(max(maxItemsPerList, 3), 32)
         self.maxSlices = min(max(maxSlices, 1), 256)
+    }
+
+    /// Sizing derived from the summarizing model's context window: ask for the whole window and
+    /// let the ceiling in `init` take out what the window has to hold alongside the slice.
+    ///
+    /// This is the constructor every caller that knows its window should use; the memberwise one
+    /// is for a caller that only knows what it wants and has to be clamped conservatively.
+    ///
+    /// The window passed here must already have room taken out for whatever the SUMMARIZER will
+    /// generate beyond one digest - a backend that will happily produce `maxTokens` of reasoning
+    /// before its answer is spending window this arithmetic does not know about. See
+    /// `ACPServer.sessionOption`.
+    public static func sized(
+        window: Int,
+        keepRecentTurns: Int = 6,
+        maxDigestTokens: Int = 700,
+        maxItemsPerList: Int = 8,
+        maxSlices: Int = 16
+    ) -> PrimePolicy {
+        PrimePolicy(
+            keepRecentTurns: keepRecentTurns,
+            maxDigestTokens: maxDigestTokens,
+            sliceBudgetTokens: window,
+            maxItemsPerList: maxItemsPerList,
+            maxSlices: maxSlices,
+            windowTokens: window)
+    }
+
+    /// The same policy with the two knobs a client may set over the wire changed.
+    ///
+    /// Not a pair of `var`s: those would let a caller set one knob past every clamp here. Where a
+    /// window is known the budget is RE-DERIVED (by asking for the window again and letting the
+    /// ceiling do its work) rather than carried, because `maxDigestTokens` is one of the things
+    /// that window has to hold - raising it has to lower the slice.
+    public func with(keepRecentTurns: Int? = nil, maxDigestTokens: Int? = nil) -> PrimePolicy {
+        PrimePolicy(
+            keepRecentTurns: keepRecentTurns ?? self.keepRecentTurns,
+            maxDigestTokens: maxDigestTokens ?? self.maxDigestTokens,
+            sliceBudgetTokens: windowTokens ?? sliceBudgetTokens,
+            maxItemsPerList: maxItemsPerList,
+            maxSlices: maxSlices,
+            windowTokens: windowTokens)
     }
 
     /// The cap that applies to the MERGED digest: the per-slice cap, scaled by how many slices
@@ -211,6 +290,20 @@ public enum DigestPlanner {
         }
         flush()
         return out
+    }
+
+    /// How many model passes `condense` would need for this history under `policy`.
+    ///
+    /// Pure, cheap (string arithmetic, no model, no availability probe) and - the part that
+    /// matters - derived by running the SAME steps `condense` runs, so it cannot answer a
+    /// different question than the one the caller is about to ask. It exists so a caller choosing
+    /// between summarizers can compare a 4096-token window against a 32k one on the conversation
+    /// it actually has, rather than preferring one on principle.
+    ///
+    /// 0 means there is nothing to summarize, and `condense` would fall back to the full history.
+    public static func sliceCount(of history: [DigestTurn], policy: PrimePolicy = .default) -> Int {
+        let (older, _) = split(history, policy: policy)
+        return slices(of: older.filter { $0.role != .system }, policy: policy).count
     }
 
     /// Split on character boundaries so no piece exceeds `maxTokens` by `estimateTokens`.

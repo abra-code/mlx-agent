@@ -100,6 +100,24 @@ struct DigestRendererTests {
         #expect(!rendered.contains("()"))
     }
 
+    /// The block every `DigestModel` conformance puts in front of the next slice. Golden for the
+    /// same reason the preamble is: it is prompt text shared by two summarizers, so a change here
+    /// changes what both of them record.
+    @Test("prior context is compact and carries only what a next slice needs")
+    func priorContext() {
+        #expect(
+            DigestRenderer.renderPriorContext(filledContent) == """
+                - goal: finish the notarization step
+                - the binary is arm64-only
+                - ship a pkg
+                - open: stapling untested
+                """)
+        // Tool events and stated preferences are deliberately absent: the next slice is being told
+        // what NOT to repeat, and neither is something it could repeat by accident.
+        #expect(!DigestRenderer.renderPriorContext(filledContent).contains("read_file"))
+        #expect(DigestRenderer.renderPriorContext(DigestContent()).isEmpty)
+    }
+
     @Test("rendering is deterministic")
     func deterministic() {
         let d = Self.digest(filledContent)

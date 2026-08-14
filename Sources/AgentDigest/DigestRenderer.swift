@@ -61,6 +61,25 @@ public enum DigestRenderer {
         return out.joined(separator: "\n\n")
     }
 
+    /// What earlier slices of the SAME conversation established, as the compact block that goes
+    /// into the next slice's prompt.
+    ///
+    /// Deliberately not `renderPreamble`. That one addresses a model about to RESUME a
+    /// conversation and says so at length; this one addresses a model about to summarize the next
+    /// section, whose only need is to avoid repeating what is already recorded and to resolve a
+    /// pronoun backward. Every token spent here is a token of conversation that does not fit.
+    ///
+    /// Shared by every `DigestModel` conformance - the on-device one and the backend-backed one
+    /// build different prompts around the same block.
+    public static func renderPriorContext(_ content: DigestContent) -> String {
+        var lines: [String] = []
+        if let intent = content.unresolvedIntent { lines.append("- goal: \(intent)") }
+        lines += content.establishedFacts.map { "- \($0)" }
+        lines += content.decisions.map { "- \($0)" }
+        lines += content.openThreads.map { "- open: \($0)" }
+        return lines.joined(separator: "\n")
+    }
+
     private static func appendList(_ out: inout [String], _ heading: String, _ items: [String]) {
         let kept = items.compactMap(nonEmpty)
         guard !kept.isEmpty else { return }

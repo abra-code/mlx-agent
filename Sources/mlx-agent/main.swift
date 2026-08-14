@@ -708,6 +708,21 @@ func usage() {
                                    holds the digest AND the exact text it was made from, so what
                                    a summary dropped can be diffed after the fact. Off by
                                    default - it writes conversation text to disk
+          --digest-backend <x>     acp: which model summarizes when a client sends session/prime
+                                   with `condense` (default: auto).
+                                   auto       = the on-device model when it can do the job within
+                                                its 4096-token budget, else the session's own
+                                                model, else decline (the full history is primed)
+                                   foundation = the on-device model only (macOS 26+)
+                                   session    = the session's own model only; costs a generation
+                                                on the loaded model but takes far fewer passes
+                                   none       = never summarize; condense primes everything and
+                                                says so
+          --digest-window <n>      acp: the summarizing model's context window in tokens, for
+                                   --digest-backend session. Only needed with --backend openai,
+                                   where the window belongs to a llama-server this process did
+                                   not start (assumed 8192); the mlx path reads it from the
+                                   model's config.json and foundation asks the framework
           --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
                                    message at all (default: helpful-assistant prompt)
 
@@ -773,6 +788,45 @@ func digestArchiveOption(in args: [String]) -> DigestArchive? {
     return DigestArchive(path: raw) { message in
         FileHandle.standardError.write(Data("[mlx-agent acp] \(message)\n".utf8))
     }
+}
+
+/// --digest-backend, rejected rather than defaulted when it is not one of the four words.
+///
+/// A typo here is silent otherwise: `--digest-backend sesssion` would fall back to `auto`, which
+/// summarizes with a DIFFERENT model than the operator asked for and reports that fact only in a
+/// field most clients ignore.
+func digestBackendOption(in args: [String]) -> DigestBackendChoice {
+    // Absent is `auto`; PRESENT-but-valueless is an error. `option()` answers nil for both, so
+    // without this check `--digest-backend` as the last argument runs `auto` silently - the exact
+    // outcome this function exists to prevent, arriving through the one case it did not test.
+    guard !args.contains("--digest-backend") || option("--digest-backend", in: args) != nil,
+        let choice = DigestBackendChoice.parse(option("--digest-backend", in: args))
+    else {
+        let raw = option("--digest-backend", in: args) ?? ""
+        FileHandle.standardError.write(
+            Data(
+                ("invalid --digest-backend \"\(raw)\": expected \(DigestBackendChoice.usage)\n")
+                    .utf8))
+        exit(2)
+    }
+    return choice
+}
+
+/// --digest-window: the summarizing model's context window in tokens.
+///
+/// Only needed for `--backend openai`, where the window belongs to a llama-server this process did
+/// not start and cannot interrogate; the MLX path reads it from the model's own config.json and
+/// the foundation path asks the framework. A number well below any real window is still accepted
+/// (`PrimePolicy` clamps to a floor) - what is refused is a non-number, which would otherwise be
+/// ignored while the operator believed it took effect.
+func digestWindowOption(in args: [String]) -> Int? {
+    guard args.contains("--digest-window") else { return nil }
+    guard let raw = option("--digest-window", in: args), let value = Int(raw), value > 0 else {
+        FileHandle.standardError.write(
+            Data("--digest-window requires a positive number of tokens\n".utf8))
+        exit(2)
+    }
+    return value
 }
 
 func idleUnloadSecondsOption(in args: [String]) -> Double {
@@ -943,7 +997,12 @@ do {
             // Off unless asked for: the artifact contains the SUMMARIZED CONVERSATION, so an
             // agent that wrote it by default would be spooling the user's transcripts to disk
             // without being told to. Same explicit-spool philosophy as map.
-            digestArchive: digestArchiveOption(in: cliArgs)
+            digestArchive: digestArchiveOption(in: cliArgs),
+            // Who may summarize a condensing session/prime. `auto` measures the conversation
+            // against the on-device model's budget and uses the session's own model when that
+            // would take too many passes - see DigestSelection.swift.
+            digestBackend: digestBackendOption(in: cliArgs),
+            digestWindowOverride: digestWindowOption(in: cliArgs)
         ).serve()
     case "oneshot":
         guard let prompt = option("--prompt", in: cliArgs) else {

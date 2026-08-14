@@ -110,6 +110,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// Where condensations are recorded, when --digest-dir asked for one. Handed to the backend
     /// too, so an overflow condensation inside a turn lands in the same place as a prime-time one.
     private let digestArchive: DigestArchive?
+    /// Which model may summarize at prime time (`--digest-backend`). See DigestSelection.swift.
+    private let digestBackend: DigestBackendChoice
+    /// `--digest-window`: the summarizing model's context window, when the operator states it.
+    /// nil means "work it out", which is exact for foundation, read from config.json for mlx, and
+    /// a conservative guess for openai - the one case where nothing on this side knows.
+    private let digestWindowOverride: Int?
     private let idleQueue = DispatchQueue(label: "com.abracode.mlx-agent.idle")
     private var idleTimer: DispatchSourceTimer?
     // True once the model has been idle-unloaded: the session is still "live" (sessionID set,
@@ -223,9 +229,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         guardrails: AgentGuardrails = .init(), initialMode: String? = nil,
         systemPrompt: String? = defaultSystemPrompt, gen: GenConfig = .init(),
         extraEOSTokens: Set<String> = [], idleUnloadSeconds: TimeInterval = IdleUnload.defaultSeconds,
-        digestArchive: DigestArchive? = nil
+        digestArchive: DigestArchive? = nil, digestBackend: DigestBackendChoice = .auto,
+        digestWindowOverride: Int? = nil
     ) {
         self.digestArchive = digestArchive
+        self.digestBackend = digestBackend
+        self.digestWindowOverride = digestWindowOverride
         self.idleUnloadSeconds = idleUnloadSeconds
         self.engine = engine
         switch engine {
@@ -793,16 +802,19 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     private func handleCancel(params: [String: Any]) {
+        // The session check comes FIRST. It used to sit after the condense cancel below, so a
+        // cancel naming somebody else's session killed this one's summarization while logging
+        // "ignoring - unknown session".
+        let (task, ourSid) = lock.withLock { (promptTask, sessionID) }
+        if let reqSid = params["sessionId"] as? String, let ourSid, reqSid != ourSid {
+            log("cancel: ignoring - unknown session \(reqSid)")
+            return
+        }
         // A condensation is cancellable and can otherwise hold the session for minutes; Stop
         // must reach it too, not just a running prompt.
         if let condense = lock.withLock({ self.condenseTask }) {
             condense.cancel()
             log("session/cancel: cancelling an in-flight context summarization")
-        }
-        let (task, ourSid) = lock.withLock { (promptTask, sessionID) }
-        if let reqSid = params["sessionId"] as? String, let ourSid, reqSid != ourSid {
-            log("cancel: ignoring - unknown session \(reqSid)")
-            return
         }
         log(task == nil ? "cancel: no in-flight turn" : "cancel: cancelling in-flight turn")
         // Unblock any in-flight permission wait so the loop can observe cancellation.
@@ -840,10 +852,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respond(id, ["configOptions": configOptionsJSON()])
 
         case "model":
-            // Latent until a backend-independent summarizer lands (model switching is MLX-only
-            // and condensing is foundation-only today), but this branch publishes container,
-            // backend, agent AND mlxTranscript with no busy check at all - the one stack mutation
-            // in this file that had none.
+            // No longer latent. This branch publishes container, backend, agent AND mlxTranscript,
+            // and it was the one stack mutation in this file with no busy check at all; now that a
+            // condensing prime can borrow the LIVE MLX backend to summarize with, switching the
+            // model underneath it would leave that summarization generating against a backend
+            // nobody holds while a new one loads over the same container.
             if let blocker = lock.withLock({ busyReasonLocked() }) {
                 respondError(id, -32003, blocker)
                 return
@@ -952,7 +965,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
 
-        let policy = Self.condensePolicy(from: request, base: digestPolicyForEngine())
+        // Only the client's two knobs are read here. WHICH summarizer runs - and therefore which
+        // window the slice budget is derived from - depends on how many slices the history needs,
+        // which is not known until the history has been parsed. So the policy is finished inside
+        // the Task, next to the choice it belongs to.
+        let overrides = Self.condenseOverrides(from: request)
         // Boxed because `Chat.Message` is not Sendable and the raw wire array is a function
         // PARAMETER, which strict concurrency treats as belonging to the caller's region rather
         // than a disconnected one - so neither can simply be captured. The box is honest here:
@@ -976,12 +993,21 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // `condensing`, which we are holding, so no unload can free the container underneath
             // us for as long as this runs.
             let container = self.lock.withLock { self.container }
-            let outcome = await self.condenseForPrime(history: boxed.messages, policy: policy)
+            let outcome = await self.condenseForPrime(
+                history: boxed.messages, overrides: overrides)
             self.finishPrime(
                 id: id, container: container, history: outcome.history, suppliedCount: accepted,
                 wireBytes: wireBytes, extra: outcome.extra, expectedEpoch: epoch)
         }
-        lock.withLock { condenseTask = task }
+        // Publish ONLY if the condensation is still running, for the reason spelled out on
+        // `promptTask` above: this class is not an actor, so the Task can finish - defer included -
+        // before this line runs, and storing a dead handle would leave `condenseTask` non-nil
+        // forever. Newly easy to reach: with `--digest-backend none` the whole body is synchronous.
+        // The consequence is smaller here (a later cancel logs a cancellation that is not
+        // happening, and can cancel the dead task instead of a live one) but it is the same bug.
+        lock.withLock {
+            if condensing { condenseTask = task }
+        }
     }
 
     /// Why a stack-mutating request must be refused right now, or nil when it may proceed.
@@ -1100,29 +1126,206 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // MARK: - session/prime condensation
 
-    /// Policy for a condensing prime: engine-derived sizing, with the two knobs the wire exposes
-    /// layered on top. `PrimePolicy` clamps whatever arrives, so a hostile value cannot get past
-    /// this into the slicing loop.
+    /// The two knobs a condensing prime exposes on the wire.
     ///
-    /// `sliceBudgetTokens` and `maxSlices` are deliberately NOT on the wire: they are properties of
-    /// the summarizing model's context window, which the agent knows and the client does not.
-    private static func condensePolicy(from request: [String: Any], base: PrimePolicy)
-        -> PrimePolicy
-    {
-        func int(_ key: String) -> Int? { (request[key] as? NSNumber)?.intValue }
-        return PrimePolicy(
-            keepRecentTurns: int("keepRecentTurns") ?? base.keepRecentTurns,
-            maxDigestTokens: int("maxDigestTokens") ?? base.maxDigestTokens,
-            sliceBudgetTokens: base.sliceBudgetTokens,
-            maxItemsPerList: base.maxItemsPerList,
-            maxSlices: base.maxSlices)
+    /// `sliceBudgetTokens` and `maxSlices` are deliberately NOT among them: they are properties of
+    /// the summarizing model's context window, which the agent knows and the client does not - and
+    /// which is not even decided until a summarizer has been chosen. `PrimePolicy` clamps whatever
+    /// arrives, so a hostile value cannot get past this into the slicing loop.
+    struct CondenseOverrides: Sendable {
+        var keepRecentTurns: Int?
+        var maxDigestTokens: Int?
     }
 
-    /// Sizing for whichever engine will do the summarizing. Only foundation can today; the
-    /// library's defaults stand in for the others so the shape is already right when step 12 adds
-    /// a backend-backed summarizer.
-    private func digestPolicyForEngine() -> PrimePolicy {
-        isFoundationEngine ? FoundationBackend.defaultDigestPolicy() : .default
+    private static func condenseOverrides(from request: [String: Any]) -> CondenseOverrides {
+        func int(_ key: String) -> Int? { (request[key] as? NSNumber)?.intValue }
+        return CondenseOverrides(
+            keepRecentTurns: int("keepRecentTurns"), maxDigestTokens: int("maxDigestTokens"))
+    }
+
+    /// A summarizer that could run, or why one could not.
+    private enum SummarizerOption {
+        /// `backend == nil` means Apple's on-device model: `FMDigestGenerator` opens its own
+        /// session and never touches this session's backend. Otherwise the session's LIVE backend
+        /// drives the generation - never a second one built for the purpose, which would have its
+        /// own PassGate and therefore no mutual exclusion with this one (see BackendDigest.swift).
+        case ready(backend: GenerationBackend?, policy: PrimePolicy, name: String)
+        /// Reported to the client verbatim as the `reason` the history was primed whole.
+        case unavailable(String)
+    }
+
+    /// A slice on the session's own model is a full generation - prefill of the slice plus up to
+    /// `maxDigestTokens` of decode - so it is tens of seconds, not the on-device model's 3-5.
+    ///
+    /// Four, not six, because four is what fits `condenseDeadline`: a slice measured up to a minute
+    /// on a large model, and a limit the deadline cannot honor is a limit that spends five minutes
+    /// and then throws away every slice it finished. At the budget a 32k window gives (about 103 KB
+    /// of text per slice, after the generation reserve below) four still covers far more
+    /// conversation than any client sends; past it the planner primes the full history, which is
+    /// slow but immediate.
+    private static let sessionMaxSlices = 4
+    /// Hard bound on ONE session-backed pass. A 30k-token prefill plus 700 tokens of decode on a
+    /// large local model is a minute in the worst case measured; this is twice that, and it is a
+    /// wedged-model backstop rather than an expected wait.
+    ///
+    /// It is NOT the bound on a condensation: a slice can take two passes (the repair retry gets
+    /// its own), so this alone would allow `sessionMaxSlices * 2 * 120` = 16 minutes with the busy
+    /// slot held the whole time. `condenseDeadline` is what actually bounds it.
+    private static let sessionSliceTimeout: TimeInterval = 120
+    /// Bound on the WHOLE condensation - every pass, every retry, and BOTH summarizers when `auto`
+    /// falls back. Captured once as an absolute time in `condenseForPrime` and handed to each
+    /// generator, so "how long can a condensing prime take" has one answer rather than one per
+    /// attempt.
+    ///
+    /// Five minutes is already past what a restore should cost; what it really guards is the case
+    /// where every pass is slow rather than wedged, which no per-pass timeout can see. An
+    /// interactive client can escape with `session/cancel`; an automated one cannot, and this is
+    /// what it has instead.
+    private static let condenseDeadline: TimeInterval = 300
+    /// How little time may remain and a second summarizer still be worth starting. Below this it
+    /// would burn the rest of the deadline to arrive at the full-history prime that is already
+    /// available for free.
+    private static let secondChanceMinimumRemaining: TimeInterval = 60
+
+    /// The most a session-backed summarization pass can generate, in tokens.
+    ///
+    /// `GenerateParameters.maxTokens` is the only real bound on a pass - `BackendDigestGenerator`'s
+    /// byte caps stop a runaway, but for a reasoning model they sit above this - so it is what the
+    /// slice budget has to make room for. Reserving it exactly is what makes the reservation
+    /// honest; an earlier version clamped it at 8192, which made the "exact" claim false for
+    /// anyone passing a larger `--max-new-tokens`.
+    ///
+    /// Mirrors the 4096 default in `buildSessionStack`/`buildOpenAIStack`. Lowering
+    /// `--max-new-tokens` buys bigger slices, which is the correct trade; raising it past what the
+    /// window can hold makes `sessionOption` decline and say so.
+    private static func sessionGenerationCeiling(_ gen: GenConfig) -> Int {
+        max(gen.maxNewTokens ?? 4096, 256)
+    }
+    /// Below this a slice is too small to be worth the passes it would take: at 1024 tokens a pass
+    /// reads about 4 KB, so an ordinary conversation needs dozens of them and the planner refuses
+    /// on slice count anyway - with a message about the conversation's size that points away from
+    /// the actual cause.
+    private static let minimumSliceTokens = 1024
+
+    /// The on-device summarizer, or why it cannot run.
+    private func foundationOption(overrides: CondenseOverrides) -> SummarizerOption {
+        let status = FMAvailability.probe()
+        guard status.isAvailable else { return .unavailable(status.summary) }
+        #if canImport(FoundationModels)
+            guard #available(macOS 26.0, *) else { return .unavailable(status.summary) }
+            return .ready(
+                backend: nil,
+                policy: FoundationBackend.defaultDigestPolicy().with(
+                    keepRecentTurns: overrides.keepRecentTurns,
+                    maxDigestTokens: overrides.maxDigestTokens),
+                name: foundationSummarizerName)
+        #else
+            return .unavailable("this build has no Foundation Models support")
+        #endif
+    }
+
+    /// The session's own model as the summarizer, or why it cannot be one.
+    private func sessionOption(overrides: CondenseOverrides) -> SummarizerOption {
+        if isFoundationEngine {
+            // Driving FoundationBackend through the generic generator would summarize with the
+            // same model, in the same window, minus the guided generation that makes its output
+            // parseable. There is no version of that which is the better choice.
+            return .unavailable(
+                "on the foundation engine the session's model IS the on-device model - "
+                    + "use --digest-backend foundation")
+        }
+        let (live, modelDir, unloaded) = lock.withLock {
+            (self.backend, self.currentModelDir, self.idleUnloaded)
+        }
+        guard let live else {
+            // Deliberately not a reload. Priming does not reload weights (the KV prefill is lazy
+            // anyway), and loading a multi-gigabyte model in order to summarize is not what a
+            // client asking for a fast restore wants.
+            return .unavailable(
+                unloaded
+                    ? "the model is idle-unloaded; the full history was primed rather than "
+                        + "reloading it to summarize"
+                    : "this session has no live backend to summarize with")
+        }
+        // The window is capped even when the model claims more: see DigestWindow.practicalCeiling.
+        let window = min(
+            DigestWindow.forSession(
+                override: digestWindowOverride, modelDir: isMLXEngine ? modelDir : ""),
+            DigestWindow.practicalCeiling)
+        // Room taken out for what the backend may GENERATE, before the policy divides up what is
+        // left. `PrimePolicy` reserves one digest allowance for the answer, which is what the
+        // on-device model actually produces - it is told `maximumResponseTokens`. This one is not:
+        // there is no per-pass token limit on `GenerationBackend`, so a pass generates up to the
+        // session's own `maxTokens`, and a reasoning model spends most of that thinking before it
+        // writes a character of the answer. Reserving the whole session ceiling is exact rather
+        // than optimistic; it double-counts one digest allowance, which is the safe direction.
+        let reserve = Self.sessionGenerationCeiling(gen)
+        let policy = PrimePolicy.sized(
+            window: max(256, window - reserve), maxSlices: Self.sessionMaxSlices)
+            .with(
+                keepRecentTurns: overrides.keepRecentTurns,
+                maxDigestTokens: overrides.maxDigestTokens)
+        // The reserve can eat the window: `--backend openai --max-new-tokens 8192` against the
+        // assumed 8192 window leaves nothing, and the arithmetic then produces a 256-token slice
+        // that "works" - a 40 KB conversation needs 51 passes, the planner refuses on slice count,
+        // and the client is told its conversation is too large when the truth is that this model
+        // was configured to generate its own entire window. Say the true thing instead, and name
+        // both ways out.
+        guard policy.sliceBudgetTokens >= Self.minimumSliceTokens else {
+            return .unavailable(
+                "the session's model is configured to generate up to \(reserve) tokens of its "
+                    + "\(window)-token window, which leaves no room to summarize in - lower "
+                    + "--max-new-tokens, or state the model's real window with --digest-window")
+        }
+        return .ready(
+            backend: live, policy: policy,
+            name: BackendDigestGenerator.name(engine: isMLXEngine ? "mlx" : "openai"))
+    }
+
+    /// Pick the summarizer for THIS history.
+    ///
+    /// `auto` measures rather than prefers. The on-device model costs the session nothing - no
+    /// weights, no disturbance to the loaded model - so it wins whenever it can do the job; but its
+    /// 4096-token window turns a long conversation into many sequential passes, and past its
+    /// `maxSlices` it refuses outright. `DigestPlanner.sliceCount` answers "how many passes would
+    /// this actually take" from the real history with pure string arithmetic, which turns the
+    /// choice into a measurement.
+    private func chooseSummarizer(history: [DigestTurn], overrides: CondenseOverrides)
+        -> SummarizerOption
+    {
+        switch digestBackend {
+        case .none:
+            return .unavailable("summarization is disabled (--digest-backend none)")
+        case .foundation:
+            return foundationOption(overrides: overrides)
+        case .session:
+            return sessionOption(overrides: overrides)
+        case .auto:
+            let foundation = foundationOption(overrides: overrides)
+            var why: String
+            switch foundation {
+            case .ready(_, let policy, _):
+                let passes = DigestPlanner.sliceCount(of: history, policy: policy)
+                // A count of 0 means there is nothing to summarize at all, and the on-device model
+                // is the cheapest way to arrive at that answer - the planner reports it without
+                // generating anything.
+                if passes <= policy.maxSlices { return foundation }
+                why =
+                    "the on-device model would need \(passes) passes, above its limit of "
+                    + "\(policy.maxSlices)"
+            case .unavailable(let reason):
+                why = reason
+            }
+            let session = sessionOption(overrides: overrides)
+            switch session {
+            case .ready(_, _, let name):
+                log("digest backend: chose \(name) because \(why)")
+                return session
+            case .unavailable(let reason):
+                // Both reasons, because either one alone reads as the whole story and is not.
+                return .unavailable("\(why); and \(reason)")
+            }
+        }
     }
 
     /// Summarize the older part of `history`, or explain why not.
@@ -1131,7 +1334,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// returns nothing usable results in the FULL history being primed with `condensed: false` and
     /// a reason the client can show. That guarantee is `DigestPlanner.condense`'s; this method's
     /// job is only to not undermine it.
-    private func condenseForPrime(history: [Chat.Message], policy: PrimePolicy) async -> (
+    private func condenseForPrime(history: [Chat.Message], overrides: CondenseOverrides) async -> (
         history: [Chat.Message], extra: [String: Any]
     ) {
         func declined(_ reason: String) -> ([Chat.Message], [String: Any]) {
@@ -1139,65 +1342,153 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return (history, ["condensed": false, "reason": reason])
         }
 
-        // Only the foundation engine summarizes today. Step 12 adds a conformance that drives
-        // whichever backend the session already has; until then say so plainly rather than
-        // silently priming everything and letting the client believe it was condensed.
-        guard isFoundationEngine else {
-            return declined(
-                "this session's backend cannot summarize yet; only --backend foundation can")
+        let turns = digestTurns(from: history)
+        let first = chooseSummarizer(history: turns, overrides: overrides)
+        guard case .ready(let firstBackend, _, _) = first else {
+            if case .unavailable(let reason) = first { return declined(reason) }
+            return declined("no summarizer is available")
         }
-        let status = FMAvailability.probe()
-        guard status.isAvailable else { return declined(status.summary) }
 
-        #if canImport(FoundationModels)
-            guard #available(macOS 26.0, *) else { return declined(status.summary) }
-            let started = Date()
-            let result = await DigestPlanner.condense(
-                history: digestTurns(from: history),
-                using: FMDigestGenerator(
-                    policy: policy, timeout: 25,
-                    log: { [weak self] message in self?.log(message) }),
-                policy: policy,
-                generator: FMDigestGenerator.name)
+        // `auto` gets a SECOND chance, and only `auto`. Preferring the on-device model is a
+        // judgment about cost, not about reliability: its guided generation fails outright on some
+        // ordinary content (measured, repeatably: "Failed to deserialize a Generable type from
+        // model output" on a repetitive 7 KB transcript that it summarizes fine when the same text
+        // arrives in one block). Falling back to the model already loaded costs one more pass on a
+        // restore that was going to prime everything anyway. An EXPLICIT --digest-backend gets no
+        // fallback: the operator named a summarizer, and quietly using the other one would make
+        // `summarizer` in the response the only trace of a decision they thought they had made.
+        var attempts: [SummarizerOption] = [first]
+        if digestBackend == .auto, firstBackend == nil {
+            let session = sessionOption(overrides: overrides)
+            if case .ready = session { attempts.append(session) }
+        }
 
-            guard let digest = result.digest else {
-                return declined(result.reason ?? "the summarizer produced nothing")
+        let started = Date()
+        // ONE deadline for the whole request, not one per attempt: a client asking "how long can a
+        // condensing prime take" deserves a single number, and a fallback that got its own fresh
+        // budget would double it.
+        let deadline = started.addingTimeInterval(Self.condenseDeadline)
+        var lastReason = "the summarizer produced nothing"
+        var winner: (result: CondenseResult, summarizer: String)?
+        for (index, attempt) in attempts.enumerated() {
+            guard case .ready(let backend, let policy, let name) = attempt else { continue }
+            let model: DigestModel
+            if let backend {
+                model = BackendDigestGenerator(
+                    backend: backend, name: name, policy: policy,
+                    timeout: Self.sessionSliceTimeout, deadline: deadline,
+                    log: { [weak self] message in self?.log(message) })
+            } else {
+                guard
+                    let fm = Self.foundationGenerator(
+                        policy: policy, deadline: deadline,
+                        log: { [weak self] message in self?.log(message) })
+                else { return declined("this build has no Foundation Models support") }
+                model = fm
             }
-            digestArchive?.record(
-                result, summarizer: FMDigestGenerator.name, trigger: "session/prime",
-                log: { [weak self] message in self?.log(message) })
 
-            // The verbatim tail is spliced from the ORIGINAL messages so tool-call metadata is not
-            // lost in a round trip through DigestTurn; only the turns the planner produced are
-            // converted. See DigestSupport.
-            let tail = Array(history.dropFirst(result.tailStartIndex))
-            let condensed = chatMessages(from: result.injected) + tail
-            log(
-                "session/prime: summarized \(result.droppedTurns) turns "
-                    + "(\(result.droppedBytes) bytes) into digest "
-                    + "\(digest.sourceSHA256.prefix(8)) in "
-                    + "\(String(format: "%.1f", Date().timeIntervalSince(started))) s; "
-                    + "kept \(tail.count) verbatim")
-            return (
-                condensed,
-                [
-                    "condensed": true,
-                    // The count `primed` and `dropped.turns` are both relative to: primeHistory
-                    // legitimately filters empty turns, orphan tool messages, unknown roles and a
-                    // trailing unanswered tool announcement, so the client's own message count
-                    // does NOT close the arithmetic and a client checking it would compute a
-                    // negative injected count on a transcript with any of those.
-                    "accepted": history.count,
-                    // Which model made it. "The digest is thin" and "the digest was made by a 3B
-                    // model" are the same observation from the client's side; it should be able to
-                    // tell them apart.
-                    "summarizer": FMDigestGenerator.name,
-                    "digest": digest.jsonObject,
-                    "dropped": ["turns": result.droppedTurns, "bytes": result.droppedBytes],
-                ]
-            )
+            let result = await DigestPlanner.condense(
+                history: turns, using: model, policy: policy, generator: name)
+
+            if backend != nil {
+                // THE DRAIN. Not tidying - this is the join. On `MLXBackend` `clear()` takes the
+                // same PassGate a pass holds, so it cannot return until the last summarization
+                // pass has fully torn down, including one the generator's timeout cancelled but
+                // did not wait for (see BackendDigest.answer). That matters because `finishPrime`
+                // is about to build a SECOND backend over the same ModelContainer, and two live
+                // passes over one container is the measured [broadcast_shapes] SIGTRAP.
+                //
+                // On `OpenAIBackend` there is no gate and `clear()` returns immediately - it is
+                // only tidying there. Nothing is shared between two of those, so there is nothing
+                // to join; if a third engine ever holds process-wide state, it needs its own
+                // answer here rather than inheriting this one.
+                //
+                // The conversation this drops is the summarizer's own; the session's history is
+                // whatever we are about to prime.
+                await backend?.clear()
+            }
+
+            if result.digest != nil {
+                winner = (result, name)
+                break
+            }
+            lastReason = result.reason ?? lastReason
+            guard index + 1 < attempts.count else { break }
+            // A cancel is a decision, not a failure to work around; trying the other model would
+            // ignore a Stop the user is waiting on.
+            if Task.isCancelled { break }
+            // An EMPTY source means the planner refused before it called a model at all - nothing
+            // old enough to summarize, or nothing but instructions. Those depend on the history and
+            // `keepRecentTurns`, which both attempts share, so the second would refuse identically:
+            // it would cost a config.json read, a re-slice, and a `clear()` of the live backend's
+            // conversation to arrive at the same answer. Only a summarizer that actually tried and
+            // failed is worth replacing.
+            guard !result.source.isEmpty else { break }
+            // And not if there is no time left to do it in: the deadline is shared, so a second
+            // summarizer starting now would spend what remains and arrive at the full-history
+            // prime that is already available for free.
+            guard deadline.timeIntervalSinceNow >= Self.secondChanceMinimumRemaining else {
+                log("session/prime: \(name) failed with too little time left to try another")
+                break
+            }
+            log("session/prime: \(name) did not produce a digest (\(lastReason)); trying next")
+        }
+
+        guard let winner, let digest = winner.result.digest else {
+            return declined(lastReason)
+        }
+        let result = winner.result
+        let summarizer = winner.summarizer
+        digestArchive?.record(
+            result, summarizer: summarizer, trigger: "session/prime",
+            log: { [weak self] message in self?.log(message) })
+
+        // The verbatim tail is spliced from the ORIGINAL messages so tool-call metadata is not
+        // lost in a round trip through DigestTurn; only the turns the planner produced are
+        // converted. See DigestSupport.
+        let tail = Array(history.dropFirst(result.tailStartIndex))
+        let condensed = chatMessages(from: result.injected) + tail
+        log(
+            "session/prime: \(summarizer) summarized \(result.droppedTurns) turns "
+                + "(\(result.droppedBytes) bytes) into digest "
+                + "\(digest.sourceSHA256.prefix(8)) in "
+                + "\(String(format: "%.1f", Date().timeIntervalSince(started))) s; "
+                + "kept \(tail.count) verbatim")
+        return (
+            condensed,
+            [
+                "condensed": true,
+                // The count `primed` and `dropped.turns` are both relative to: primeHistory
+                // legitimately filters empty turns, orphan tool messages, unknown roles and a
+                // trailing unanswered tool announcement, so the client's own message count
+                // does NOT close the arithmetic and a client checking it would compute a
+                // negative injected count on a transcript with any of those.
+                "accepted": history.count,
+                // Which model made it. "The digest is thin" and "the digest was made by a 3B
+                // model" are the same observation from the client's side; it should be able to
+                // tell them apart.
+                "summarizer": summarizer,
+                "digest": digest.jsonObject,
+                "dropped": ["turns": result.droppedTurns, "bytes": result.droppedBytes],
+            ]
+        )
+    }
+
+    /// The on-device generator, behind the two guards that cannot be expressed at a call site that
+    /// also has to compile without the framework. nil only in a build that has no FoundationModels
+    /// at all - `chooseSummarizer` has already established that the model itself is available.
+    private static func foundationGenerator(
+        policy: PrimePolicy, deadline: Date, log: @escaping @Sendable (String) -> Void
+    ) -> DigestModel? {
+        #if canImport(FoundationModels)
+            guard #available(macOS 26.0, *) else { return nil }
+            // 25 s per slice, not the session path's 120: a slice on the on-device model measures
+            // 3-5 s, and this bound is also how long a Stop can go unheard while one is in flight.
+            // The deadline is the same one the session path gets - 24 slices at 25 s apiece is ten
+            // minutes of held busy slot otherwise, which is the bound this path used to have.
+            return FMDigestGenerator(policy: policy, timeout: 25, deadline: deadline, log: log)
         #else
-            return declined("this build has no Foundation Models support")
+            return nil
         #endif
     }
 

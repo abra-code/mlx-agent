@@ -107,7 +107,7 @@ it.
 ### Response, not condensed
 
 ```json
-{ "primed": 70, "condensed": false, "reason": "this session's backend cannot summarize yet; only --backend foundation can" }
+{ "primed": 70, "condensed": false, "reason": "summarization is disabled (--digest-backend none)" }
 ```
 
 **The fallback is full fidelity, never truncation.** Every failure - no summarizer, Apple
@@ -117,9 +117,14 @@ too large to slice within budget - primes the COMPLETE history and says why. A c
 
 ### What changes for the client
 
-- **Latency.** A condensing prime GENERATES. Measured on Apple's on-device model: about 8 seconds
-  for a 70-message, 19 KB conversation. A plain prime remains near-instant. Do not put a condensing
-  prime on a path where the user is waiting without an indicator.
+- **Latency.** A condensing prime GENERATES, and how long depends on which model does it. Measured
+  with Apple's on-device model: about 8 seconds for a 70-message, 19 KB conversation. Measured with
+  the session's own model (gemma-4-E4B on an M5 Air): 7 seconds for the same shape, 166 seconds for
+  a 240-message, 210 KB one - it takes far fewer passes but each is a full generation on a bigger
+  model. A plain prime remains near-instant. Do not put a condensing prime on a path where the user
+  is waiting without an indicator. A condensing prime gives up after 5 minutes and primes the full
+  history - that is one budget for the whole request, whichever model summarizes and including
+  `auto`'s fallback, so the wait has a ceiling even on a slow model.
 - **Ordering.** The agent refuses a prompt, a model switch, an idle-unload and a second condensing
   prime for the whole condensation, with `-32003` and a message naming the summarization rather
   than a nonexistent prompt. The same cancel-then-prime ordering rule as before applies, with a
@@ -128,8 +133,9 @@ too large to slice within budget - primes the COMPLETE history and says why. A c
   during a condensation - a New Chat should never fail. They win: the condensation notices the
   session was replaced and discards its result with `-32003` ("the session was replaced while its
   context was being summarized") rather than publishing a context the user already dismissed.
-- **`session/cancel` reaches it.** Cancelling during a condensation stops it within one slice and
-  primes the full history, `condensed: false`.
+- **`session/cancel` reaches it.** Cancelling during a condensation primes the full history,
+  `condensed: false`. On the session's own model it interrupts the pass in flight; on the
+  on-device model it lands between passes, so allow one pass of latency there.
 - **Fidelity.** The client owns the original transcript; the agent never persists it. Priming the
   full history again restores full fidelity, so a digest is never a one-way door.
 
@@ -140,12 +146,41 @@ is a `set_config_option` followed by a re-prime - that IS the cross-model handof
 request it for short conversations: the agent will decline with a reason, having wasted a round
 trip, and a summary of six messages is worse than the six messages.
 
-### Availability
+### Which model summarizes
 
-Only `--backend foundation` can summarize today. Every other backend declines with a reason and
-primes everything. A backend-independent summarizer that drives whichever model the session already
-has is planned; the wire contract above does not change when it lands - only which values of
-`summarizer` appear.
+Condensation is a capability of the agent, not of one backend. Two summarizers exist: Apple's
+on-device model (macOS 26+, `apple-foundation-models`), and the session's own model, whatever it
+is (`session:mlx`, `session:openai`). The wire contract is identical either way; only `summarizer`
+tells them apart.
+
+`--digest-backend` chooses, and defaults to `auto`:
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | the on-device model when this conversation fits its budget, else the session's own model, else decline |
+| `foundation` | the on-device model only |
+| `session` | the session's own model only |
+| `none` | never summarize; `condense` primes everything and says so |
+
+`auto` measures rather than prefers. The on-device model costs the session nothing - no weights,
+no disturbance to the loaded model - but its 4096-token window turns a long conversation into many
+sequential passes, and past its limit it refuses outright; a 32k-window model that is already
+loaded does the same job in one or two. So the agent counts the passes THIS history would need on
+the on-device budget and picks accordingly. Under `auto` only, an on-device attempt that fails
+outright falls back to the session's model; an explicit `--digest-backend` never silently switches.
+
+Sizing follows the summarizing model's context window: reported by the framework on the on-device
+path, read from the model's `config.json` on the MLX path, and assumed to be 8192 on
+`--backend openai`, where the window belongs to a llama-server this process did not start -
+`--digest-window <tokens>` states it when that is wrong.
+
+Three things `--digest-backend session` cannot do. It is refused on `--backend foundation` (the
+session's model IS the on-device model there - use `foundation`); it declines while the MLX model
+is idle-unloaded rather than reloading multiple gigabytes of weights in order to summarize; and it
+declines when the model is configured to generate so much that nothing is left to summarize in.
+That last one is reachable with `--backend openai --max-new-tokens 8192` against the assumed 8192
+window: a summarization pass may generate up to `--max-new-tokens`, so that has to come out of the
+window before anything else does. The reason names both ways out.
 
 ### Audit
 

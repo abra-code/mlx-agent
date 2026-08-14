@@ -124,8 +124,9 @@ import Foundation
     @available(macOS 26.0, *)
     struct FMDigestGenerator: DigestModel {
 
-        /// Recorded in every digest this produces.
-        static let name = "apple-foundation-models"
+        /// Recorded in every digest this produces. The string itself lives in DigestSelection.swift,
+        /// which compiles even where this type does not.
+        static let name = foundationSummarizerName
 
         let policy: PrimePolicy
         /// Hard bound on one slice. Guided generation on this model is NOT bounded by the schema -
@@ -139,7 +140,24 @@ import Foundation
         /// a cancel lands only between slices. `DigestPlanner` checks cancellation at the top of
         /// each slice, so the residual is exactly one slice: measured at 3-5 s, capped here.
         let timeout: TimeInterval
+        /// When the whole condensation must be over, whatever it has managed by then.
+        ///
+        /// `.distantFuture` for the backend's own mid-turn overflow condensation, which is already
+        /// inside a pass the caller is waiting on and has nothing better to do than finish. The
+        /// prime path passes a real one: 24 slices at `timeout` apiece is ten minutes of a held
+        /// busy slot, and no per-slice bound can see that.
+        let deadline: Date
         let log: @Sendable (String) -> Void
+
+        init(
+            policy: PrimePolicy, timeout: TimeInterval, deadline: Date = .distantFuture,
+            log: @escaping @Sendable (String) -> Void
+        ) {
+            self.policy = policy
+            self.timeout = timeout
+            self.deadline = deadline
+            self.log = log
+        }
 
         func digest(source: String, priorDigest: DigestContent?) async throws -> DigestContent {
             // Cheap, and it means the conformance does not depend on the planner remembering to
@@ -148,6 +166,9 @@ import Foundation
             let prompt = Self.prompt(source: source, prior: priorDigest)
             let policy = self.policy
             let started = Date()
+            // Whichever runs out first: this slice's own bound, or the whole condensation's.
+            let timeout = min(timeout, deadline.timeIntervalSinceNow)
+            guard timeout > 0 else { throw DigestCondenseDeadline() }
             let content = try await withTimeout(timeout) {
                 // A FRESH session per slice, not one reused across the loop. A session's transcript
                 // is append-only, so reusing it would carry every previous slice into the window
@@ -198,24 +219,13 @@ import Foundation
             var out = ""
             if let prior, !prior.isEmpty {
                 out += "Earlier parts of this same conversation already established:\n"
-                out += Self.renderPrior(prior)
+                out += DigestRenderer.renderPriorContext(prior)
                 out += "\n\nDo not repeat those. "
             }
             out += "Record what the following section of the conversation establishes.\n\n"
             out += "CONVERSATION SECTION:\n"
             out += source
             return out
-        }
-
-        /// Prior context, compact. Not `DigestRenderer.renderPreamble` - that one addresses a
-        /// model about to resume a conversation, which is a different reader with different needs.
-        private static func renderPrior(_ content: DigestContent) -> String {
-            var lines: [String] = []
-            if let intent = content.unresolvedIntent { lines.append("- goal: \(intent)") }
-            lines += content.establishedFacts.map { "- \($0)" }
-            lines += content.decisions.map { "- \($0)" }
-            lines += content.openThreads.map { "- open: \($0)" }
-            return lines.joined(separator: "\n")
         }
     }
 
