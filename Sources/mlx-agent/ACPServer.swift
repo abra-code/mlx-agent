@@ -1187,26 +1187,6 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// available for free.
     private static let secondChanceMinimumRemaining: TimeInterval = 60
 
-    /// The most a session-backed summarization pass can generate, in tokens.
-    ///
-    /// `GenerateParameters.maxTokens` is the only real bound on a pass - `BackendDigestGenerator`'s
-    /// byte caps stop a runaway, but for a reasoning model they sit above this - so it is what the
-    /// slice budget has to make room for. Reserving it exactly is what makes the reservation
-    /// honest; an earlier version clamped it at 8192, which made the "exact" claim false for
-    /// anyone passing a larger `--max-new-tokens`.
-    ///
-    /// Mirrors the 4096 default in `buildSessionStack`/`buildOpenAIStack`. Lowering
-    /// `--max-new-tokens` buys bigger slices, which is the correct trade; raising it past what the
-    /// window can hold makes `sessionOption` decline and say so.
-    private static func sessionGenerationCeiling(_ gen: GenConfig) -> Int {
-        max(gen.maxNewTokens ?? 4096, 256)
-    }
-    /// Below this a slice is too small to be worth the passes it would take: at 1024 tokens a pass
-    /// reads about 4 KB, so an ordinary conversation needs dozens of them and the planner refuses
-    /// on slice count anyway - with a message about the conversation's size that points away from
-    /// the actual cause.
-    private static let minimumSliceTokens = 1024
-
     /// The on-device summarizer, or why it cannot run.
     private func foundationOption(overrides: CondenseOverrides) -> SummarizerOption {
         let status = FMAvailability.probe()
@@ -1247,39 +1227,25 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                         + "reloading it to summarize"
                     : "this session has no live backend to summarize with")
         }
-        // The window is capped even when the model claims more: see DigestWindow.practicalCeiling.
-        let window = min(
-            DigestWindow.forSession(
+        // Window, generation reserve and the starvation check all live in DigestSizing: the
+        // offline `digest` mode drives a backend the same way, and a reservation that differed
+        // between the two would be silent in both. The reason it can return is client-facing here
+        // and names flags that exist in both modes.
+        let policy = DigestSizing.backendPolicy(
+            window: DigestSizing.window(
                 override: digestWindowOverride, modelDir: isMLXEngine ? modelDir : ""),
-            DigestWindow.practicalCeiling)
-        // Room taken out for what the backend may GENERATE, before the policy divides up what is
-        // left. `PrimePolicy` reserves one digest allowance for the answer, which is what the
-        // on-device model actually produces - it is told `maximumResponseTokens`. This one is not:
-        // there is no per-pass token limit on `GenerationBackend`, so a pass generates up to the
-        // session's own `maxTokens`, and a reasoning model spends most of that thinking before it
-        // writes a character of the answer. Reserving the whole session ceiling is exact rather
-        // than optimistic; it double-counts one digest allowance, which is the safe direction.
-        let reserve = Self.sessionGenerationCeiling(gen)
-        let policy = PrimePolicy.sized(
-            window: max(256, window - reserve), maxSlices: Self.sessionMaxSlices)
-            .with(
-                keepRecentTurns: overrides.keepRecentTurns,
-                maxDigestTokens: overrides.maxDigestTokens)
-        // The reserve can eat the window: `--backend openai --max-new-tokens 8192` against the
-        // assumed 8192 window leaves nothing, and the arithmetic then produces a 256-token slice
-        // that "works" - a 40 KB conversation needs 51 passes, the planner refuses on slice count,
-        // and the client is told its conversation is too large when the truth is that this model
-        // was configured to generate its own entire window. Say the true thing instead, and name
-        // both ways out.
-        guard policy.sliceBudgetTokens >= Self.minimumSliceTokens else {
-            return .unavailable(
-                "the session's model is configured to generate up to \(reserve) tokens of its "
-                    + "\(window)-token window, which leaves no room to summarize in - lower "
-                    + "--max-new-tokens, or state the model's real window with --digest-window")
+            generationCeiling: DigestSizing.generationCeiling(gen),
+            maxSlices: Self.sessionMaxSlices,
+            keepRecentTurns: overrides.keepRecentTurns,
+            maxDigestTokens: overrides.maxDigestTokens)
+        switch policy {
+        case .refused(let reason):
+            return .unavailable(reason)
+        case .sized(let policy):
+            return .ready(
+                backend: live, policy: policy,
+                name: BackendDigestGenerator.name(engine: isMLXEngine ? "mlx" : "openai"))
         }
-        return .ready(
-            backend: live, policy: policy,
-            name: BackendDigestGenerator.name(engine: isMLXEngine ? "mlx" : "openai"))
     }
 
     /// Pick the summarizer for THIS history.

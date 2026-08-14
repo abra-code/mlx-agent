@@ -110,3 +110,87 @@ enum DigestWindow {
         return fromModelDirectory(modelDir) ?? conservativeDefault
     }
 }
+
+/// Turning "a model with this window, allowed to generate this much" into a `PrimePolicy`.
+///
+/// Shared by the two callers that drive a `GenerationBackend` as a summarizer - `session/prime`
+/// with `--digest-backend session`, and the offline `digest` mode - because the reservation below
+/// is not obvious and getting it wrong is silent: the condensation runs, every pass overflows the
+/// window, and the client is told its conversation was too large. One derivation, one place to fix.
+///
+/// Not applicable to Foundation Models: that path is told `maximumResponseTokens` and so generates
+/// exactly one digest, which `PrimePolicy` already reserves for. See `FoundationBackend
+/// .defaultDigestPolicy`.
+enum DigestSizing {
+
+    /// A policy to summarize with, or the reason this model cannot be a summarizer at all.
+    ///
+    /// Not `Result`: the failure is a sentence for a person, not an error to be thrown, and both
+    /// callers turn it straight into client-facing text.
+    enum Outcome {
+        case sized(PrimePolicy)
+        case refused(String)
+    }
+
+    /// Below this a slice is too small to be worth the passes it would take: at 1024 tokens a pass
+    /// reads about 4 KB, so an ordinary conversation needs dozens of them and the planner refuses
+    /// on slice count anyway - with a message about the conversation's size that points away from
+    /// the actual cause.
+    static let minimumSliceTokens = 1024
+
+    /// The most one summarization pass can generate, in tokens.
+    ///
+    /// `GenerateParameters.maxTokens` is the only real bound on a pass - `BackendDigestGenerator`'s
+    /// byte caps stop a runaway, but for a reasoning model they sit above this - so it is what the
+    /// slice budget has to make room for. Reserving it exactly is what makes the reservation
+    /// honest; an earlier version clamped it at 8192, which made the "exact" claim false for
+    /// anyone passing a larger `--max-new-tokens`.
+    ///
+    /// Mirrors the 4096 default that `ACPServer.buildSessionStack` and the digest mode both start
+    /// from. Lowering `--max-new-tokens` buys bigger slices, which is the correct trade; raising it
+    /// past what the window can hold makes `backendPolicy` refuse and say so.
+    static func generationCeiling(_ gen: GenConfig) -> Int { max(gen.maxNewTokens ?? 4096, 256) }
+
+    /// The window to size for, from the CLI override and the model directory, capped at
+    /// `DigestWindow.practicalCeiling`. Pass an empty `modelDir` where there is no local model to
+    /// read a `config.json` from (the llama-server case), which lands on the conservative default.
+    static func window(override: Int?, modelDir: String) -> Int {
+        min(
+            DigestWindow.forSession(override: override, modelDir: modelDir),
+            DigestWindow.practicalCeiling)
+    }
+
+    /// The policy to summarize with, or the reason this model cannot summarize at all.
+    ///
+    /// Room is taken out for what the backend may GENERATE before the policy divides up what is
+    /// left. `PrimePolicy` reserves one digest allowance for the answer, which is what the
+    /// on-device model actually produces - it is told `maximumResponseTokens`. A
+    /// `GenerationBackend` is not: there is no per-pass token limit on it, so a pass generates up
+    /// to the model's own `maxTokens`, and a reasoning model spends most of that thinking before it
+    /// writes a character of the answer. Reserving the whole ceiling is exact rather than
+    /// optimistic; it double-counts one digest allowance, which is the safe direction.
+    ///
+    /// The reserve can eat the window: `--backend openai --max-new-tokens 8192` against the assumed
+    /// 8192 window leaves nothing, and the arithmetic then produces a 256-token slice that "works" -
+    /// a 40 KB conversation needs 51 passes, the planner refuses on slice count, and the caller is
+    /// told its conversation is too large when the truth is that this model was configured to
+    /// generate its own entire window. Say the true thing instead, and name both ways out.
+    ///
+    /// The two overrides are applied BEFORE the check, not after, because `maxDigestTokens` is one
+    /// of the things the window has to hold: raising it lowers the slice budget (see
+    /// `PrimePolicy.with`), so checking first would bless a budget that no longer exists.
+    static func backendPolicy(
+        window: Int, generationCeiling reserve: Int, maxSlices: Int,
+        keepRecentTurns: Int? = nil, maxDigestTokens: Int? = nil
+    ) -> Outcome {
+        let policy = PrimePolicy.sized(window: max(256, window - reserve), maxSlices: maxSlices)
+            .with(keepRecentTurns: keepRecentTurns, maxDigestTokens: maxDigestTokens)
+        guard policy.sliceBudgetTokens >= minimumSliceTokens else {
+            return .refused(
+                "the model is configured to generate up to \(reserve) tokens of its "
+                    + "\(window)-token window, which leaves no room to summarize in - lower "
+                    + "--max-new-tokens, or state the model's real window with --digest-window")
+        }
+        return .sized(policy)
+    }
+}

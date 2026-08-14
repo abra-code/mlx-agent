@@ -19,6 +19,9 @@ mlx-agent chat      [--model <dir>] --prompt <text>
 mlx-agent map       [--backend mlx|openai] [--model <dir> | --base-url <url>]
                     --spool <dir> [--extra-eos-token <t>] [gen flags]
 mlx-agent tools     --mcp-config <json>
+mlx-agent digest    [--backend mlx|openai|foundation] [--model <dir> | --base-url <url>]
+                    [--in <file>] [--out <file>] [--render]
+                    [--keep-recent <n>] [--max-digest-tokens <n>]
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
@@ -32,6 +35,12 @@ mlx-agent --version
 - **map** - long-lived, spool-driven map over document chunks. See below.
 - **tools** - launch the `--mcp-config` servers and dump their tool surface as JSON, no
   model load; for inspecting exactly what schemas the model would see.
+- **digest** - summarize a saved transcript into a session digest, offline. Input is the same wire
+  shape as `session/prime`'s `messages` (stdin or `--in`); output is the digest as JSON, or with
+  `--render` the preamble text that would actually be primed. Here `--backend` names the
+  SUMMARIZER, since no session is involved. Exit 0 condensed, 3 not condensed with a reason on
+  stderr (a fallback, not a crash), 2 usage. See
+  [`docs/session-digest.md`](docs/session-digest.md).
 - **gate** - a self-contained tool-calling correctness check (a handful of fixed cases),
   useful to catch a regression in the underlying engine without the full ACP stack.
 - **bench** - inference speed benchmark using the methodology of Apple's M5 MLX post

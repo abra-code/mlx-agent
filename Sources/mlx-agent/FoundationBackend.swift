@@ -157,8 +157,12 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// library's own sizing considers well within range, and the pass would then fail on the very
     /// overflow the condense exists to prevent. 24 slices is roughly 180 KB of conversation, and
     /// at the measured 3-5 s per slice it is also the point where the wait stops being defensible.
-    static func defaultDigestPolicy() -> PrimePolicy {
-        .sized(window: FMAvailability.contextSize() ?? 4096, maxSlices: 24)
+    ///
+    /// The default is what a person is waiting on: a mid-turn overflow condense or a restore. The
+    /// offline `digest` mode raises it, because nothing there is interactive and the only cost of
+    /// another slice is time in a script.
+    static func defaultDigestPolicy(maxSlices: Int = 24) -> PrimePolicy {
+        .sized(window: FMAvailability.contextSize() ?? 4096, maxSlices: maxSlices)
     }
 
     /// Build a fresh session from `instructions` + `seedHistory`, optionally replacing the history

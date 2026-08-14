@@ -182,6 +182,13 @@ That last one is reachable with `--backend openai --max-new-tokens 8192` against
 window: a summarization pass may generate up to `--max-new-tokens`, so that has to come out of the
 window before anything else does. The reason names both ways out.
 
+### Producing a digest without a session
+
+`mlx-agent digest` applies the same summarization to a transcript FILE - same wire shape in, the
+digest (or the preamble it renders to) out, no ACP session and no client. It is how a conversation
+can be condensed once and stored, how two summarizers can be compared on the same input, and how
+this feature is tested offline. See [`session-digest.md`](session-digest.md).
+
 ### Audit
 
 `--digest-dir <dir>` records every condensation (prime-time and the backend's own overflow

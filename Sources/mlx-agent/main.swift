@@ -6,6 +6,7 @@
 //   chat     - load a model and stream a single completion
 //   map      - long-lived, spool-driven map over document chunks (see Map.swift)
 //   tools    - launch the --mcp-config servers, dump their tool surface as JSON (no model)
+//   digest   - summarize a saved transcript into a session digest, offline (see DigestMode.swift)
 //   gate     - built-in tool-calling correctness check (5 fixed cases)
 //   bench    - inference speed benchmark (TTFT, prefill/generation tok/s; see Bench.swift)
 //
@@ -625,6 +626,25 @@ func usage() {
                             --prompt <text> [--mcp-config <json>]
                             [--auto-permission allow|deny] [guardrails]
                                                           run one agent turn, print to stdout
+          mlx-agent digest  [--backend mlx|openai|foundation]
+                            [--model <dir> | --base-url <url>]
+                            [--in <file>] [--out <file>] [--render]
+                            [--keep-recent <n>] [--max-digest-tokens <n>]
+                            [--digest-window <n>]
+                                                          summarize a saved transcript into a
+                                                          session digest, offline. Input is JSON on
+                                                          stdin (or --in): the same wire shape as
+                                                          session/prime's `messages`, either as a
+                                                          bare array or as the whole params object.
+                                                          Output is the digest as JSON on stdout (or
+                                                          --out), or with --render the preamble text
+                                                          that would actually be primed. Here
+                                                          --backend names the SUMMARIZER, since no
+                                                          session is involved. Exit 0 condensed,
+                                                          3 not condensed (reason on stderr - a
+                                                          fallback, not a crash), 2 usage. A
+                                                          RESULT_JSON line goes to STDERR, so stdout
+                                                          stays the artifact
           mlx-agent gate    [--model <dir>]               built-in tool-calling gate
           mlx-agent chat    [--model <dir>] --prompt <text>  load + stream one completion
           mlx-agent map     [--backend mlx|openai] [--model <dir> | --base-url <url>]
@@ -718,11 +738,21 @@ func usage() {
                                                 on the loaded model but takes far fewer passes
                                    none       = never summarize; condense primes everything and
                                                 says so
-          --digest-window <n>      acp: the summarizing model's context window in tokens, for
-                                   --digest-backend session. Only needed with --backend openai,
-                                   where the window belongs to a llama-server this process did
-                                   not start (assumed 8192); the mlx path reads it from the
-                                   model's config.json and foundation asks the framework
+          --digest-window <n>      acp/digest: the summarizing model's context window in tokens.
+                                   Only needed with --backend openai, where the window belongs to
+                                   a llama-server this process did not start (assumed 8192); the
+                                   mlx path reads it from the model's config.json and foundation
+                                   asks the framework
+          --in <file>              digest: the transcript to summarize (default: stdin)
+          --out <file>             digest: where to write the result (default: stdout)
+          --render                 digest: print the preamble the digest renders to - the text
+                                   that actually gets primed - instead of the digest as JSON
+          --keep-recent <n>        digest: trailing messages kept verbatim rather than summarized
+                                   (default 6, clamped to 2...64). The session/prime equivalent is
+                                   condense.keepRecentTurns
+          --max-digest-tokens <n>  digest: ceiling on the generated summary (default 700, clamped
+                                   to 128...2048). The session/prime equivalent is
+                                   condense.maxDigestTokens
           --system-prompt <text>   system instructions (acp/oneshot/chat); "" = no system
                                    message at all (default: helpful-assistant prompt)
 
@@ -746,6 +776,8 @@ func usage() {
           mlx-agent acp --backend openai --base-url http://127.0.0.1:8099/v1 --mcp-config mcp.json
           mlx-agent acp --system-prompt "" --temperature 0 --max-new-tokens 2048
           mlx-agent oneshot --prompt "Read /etc/hosts" --mcp-config mcp.json --auto-permission allow
+          mlx-agent digest --backend foundation --in chat.json --render
+          mlx-agent digest --in chat.json --out digest.json --keep-recent 4
           mlx-agent gate
         """
     print(text)
@@ -812,21 +844,40 @@ func digestBackendOption(in args: [String]) -> DigestBackendChoice {
     return choice
 }
 
+/// A flag whose value must be a positive integer, refused rather than ignored when it is not.
+///
+/// `intOption` answers nil for "absent", "valueless" and "not a number" alike, which for these
+/// flags means an operator's typo runs the default while they believe their value took effect. The
+/// three digest sizing knobs are all in that shape, so they share this.
+func positiveIntOption(_ name: String, _ expected: String, in args: [String]) -> Int? {
+    guard args.contains(name) else { return nil }
+    guard let raw = option(name, in: args), let value = Int(raw), value > 0 else {
+        FileHandle.standardError.write(Data("\(name) requires \(expected)\n".utf8))
+        exit(2)
+    }
+    return value
+}
+
 /// --digest-window: the summarizing model's context window in tokens.
 ///
 /// Only needed for `--backend openai`, where the window belongs to a llama-server this process did
 /// not start and cannot interrogate; the MLX path reads it from the model's own config.json and
 /// the foundation path asks the framework. A number well below any real window is still accepted
-/// (`PrimePolicy` clamps to a floor) - what is refused is a non-number, which would otherwise be
-/// ignored while the operator believed it took effect.
+/// (`PrimePolicy` clamps to a floor) - what is refused is a non-number.
 func digestWindowOption(in args: [String]) -> Int? {
-    guard args.contains("--digest-window") else { return nil }
-    guard let raw = option("--digest-window", in: args), let value = Int(raw), value > 0 else {
-        FileHandle.standardError.write(
-            Data("--digest-window requires a positive number of tokens\n".utf8))
+    positiveIntOption("--digest-window", "a positive number of tokens", in: args)
+}
+
+/// A flag naming a file to read or write. Same reasoning as `--digest-dir`: `option()` hands back
+/// whatever the next argv element is, so `--out --render` would write the artifact to a file named
+/// "--render" and `--in` as the last argument would silently read stdin instead.
+func pathOption(_ name: String, in args: [String]) -> String? {
+    guard args.contains(name) else { return nil }
+    guard let raw = option(name, in: args), !raw.isEmpty, !raw.hasPrefix("-") else {
+        FileHandle.standardError.write(Data("\(name) requires a file path\n".utf8))
         exit(2)
     }
-    return value
+    return raw
 }
 
 func idleUnloadSecondsOption(in args: [String]) -> Double {
@@ -1015,6 +1066,22 @@ do {
             guardrails: parseGuardrails(cliArgs),
             autoPermission: parseAutoPermission(cliArgs),
             systemPrompt: resolveSystemPrompt(cliArgs),
+            gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens)
+        exit(Int32(code))
+    // The one mode whose --backend names the SUMMARIZER rather than a chat engine: there is no
+    // session here, so the model that summarizes is the only model involved.
+    case "digest":
+        let code = try await runDigestMode(
+            engine: resolveEngine(cliArgs),
+            options: DigestModeOptions(
+                inputPath: pathOption("--in", in: cliArgs),
+                outputPath: pathOption("--out", in: cliArgs),
+                render: cliArgs.contains("--render"),
+                keepRecentTurns: positiveIntOption(
+                    "--keep-recent", "a positive number of messages", in: cliArgs),
+                maxDigestTokens: positiveIntOption(
+                    "--max-digest-tokens", "a positive number of tokens", in: cliArgs),
+                windowOverride: digestWindowOption(in: cliArgs)),
             gen: parseGenConfig(cliArgs), extraEOSTokens: extraEOSTokens)
         exit(Int32(code))
     case "gate":
