@@ -151,7 +151,12 @@ trip, and a summary of six messages is worse than the six messages.
 Condensation is a capability of the agent, not of one backend. Two summarizers exist: Apple's
 on-device model (macOS 26+, `apple-foundation-models`), and the session's own model, whatever it
 is (`session:mlx`, `session:openai`). The wire contract is identical either way; only `summarizer`
-tells them apart.
+tells them apart. What a digest KEEPS and DROPS is the same either way - same schema, and the same
+verbatim tail, which follows from `keepRecentTurns` and nothing else. See
+[`session-digest.md`](session-digest.md). What differs is how many PASSES the summarized half takes,
+since each sizes its slices from its own context window; that is a cost, and past a limit it is
+also a refusal. For the on-device model as an engine rather than a summarizer, see
+[`foundation-models.md`](foundation-models.md).
 
 `--digest-backend` chooses, and defaults to `auto`:
 

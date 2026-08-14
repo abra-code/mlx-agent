@@ -63,7 +63,9 @@ Two summarizers, same output either way:
 
 - **Apple's on-device model** (`apple-foundation-models`), macOS 26+ with Apple Intelligence. Costs
   no weights and does not disturb a loaded model, but its window is 4096 tokens, so a long
-  conversation becomes many sequential passes.
+  conversation becomes many sequential passes. See
+  [`foundation-models.md`](foundation-models.md); note that summarizing is the job it is best at
+  even where it is a poor chat engine.
 - **A regular generation backend** (`session:mlx`, `session:openai`) - a model that is already
   loaded, or one loaded for the purpose in batch mode. Far fewer passes, but each is a full
   generation.

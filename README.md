@@ -10,9 +10,9 @@ permission gate before any mutating tool.
 ## Modes
 
 ```
-mlx-agent acp       [--backend mlx|openai] [--model <dir> | --base-url <url>]
+mlx-agent acp       [--backend mlx|openai|foundation] [--model <dir> | --base-url <url>]
                     [--mcp-config <json>] [--mode chat|agent] [guardrails]
-mlx-agent oneshot   [--backend mlx|openai] [--model <dir> | --base-url <url>]
+mlx-agent oneshot   [--backend mlx|openai|foundation] [--model <dir> | --base-url <url>]
                     --prompt <text> [--mcp-config <json>]
                     [--auto-permission allow|deny] [guardrails]
 mlx-agent chat      [--model <dir>] --prompt <text>
@@ -25,6 +25,7 @@ mlx-agent digest    [--backend mlx|openai|foundation] [--model <dir> | --base-ur
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
+mlx-agent fm-check  [--prompt <text>] [--digest <text>]
 mlx-agent --version
 ```
 
@@ -52,6 +53,13 @@ mlx-agent --version
   a fanless Air throttles the GPU by ~40% for minutes after a sustained CPU load
   (e.g. a build).
 
+- **fm-check** - report whether Apple's on-device system model is usable on this machine:
+  availability, context size, language support, and one real generation to prove a pass completes.
+  `--digest <text>` summarizes into the session-digest schema instead, which also proves guided
+  generation works. Loads no MLX model and reads no config, so it is safe on a machine with
+  nothing installed. Exit 0 only if a generation actually worked, plus a `RESULT_JSON:` line. See
+  [`docs/foundation-models.md`](docs/foundation-models.md).
+
 - **--version** - print `mlx-agent <version>` and exit 0 (`-version` and a bare `version`
   are accepted too). Loads no model and reads no config, so it doubles as a liveness probe
   on a deployed, codesigned binary. The version is one constant
@@ -61,10 +69,28 @@ mlx-agent --version
 Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <sec>`
 (60), `--tool-result-bytes <n>` (32768).
 
-`--backend` (default `mlx`) on `acp`, `oneshot`, and `map` picks the engine: `mlx` loads a
-local safetensors `--model` in-process; `openai` serves from a separately-launched
-llama-server addressed by `--base-url` (see the map section for the tradeoffs - they apply
-to all three modes).
+### Backends (`--backend`, default `mlx`)
+
+| | `mlx` | `openai` | `foundation` |
+| --- | --- | --- | --- |
+| What runs the model | in-process mlx-swift-lm | a separately-launched llama-server | macOS itself (Apple Foundation Models) |
+| Selected by | `--model <dir>` (safetensors) | `--base-url <url>` | nothing - the model is the OS's |
+| Weights resident | yes, ours | yes, llama-server's | none of ours |
+| Context window | the model's, read from `config.json` | the server's, not visible from here | 4096 tokens |
+| Tool calling | yes | yes | **no** - agent mode degrades to chat |
+| Model switchable at runtime | yes (`session/set_config_option`) | no, the applet restarts the server | no, there is one |
+| Idle unload | yes, `--idle-unload-seconds` | llama-server does its own | nothing to unload |
+| RAM gate | yes | skipped | skipped |
+| Modes | `acp` `oneshot` `map` `digest` | `acp` `oneshot` `map` `digest` | `acp` `oneshot` `digest` |
+| Requires | a downloaded model | a running server | macOS 26 + Apple Intelligence |
+
+`mlx` is the default and the one everything else is measured against. `openai` exists for gguf
+models and for keeping the weights in a process this one does not own (see the map section for the
+tradeoffs - they apply to every mode). `foundation` needs no download, no server and no memory
+budget, which makes it the answer to "this Mac has no model installed yet" and to short bounded
+work - on the understanding that it is a ~3B model with a 4096-token window and no tools. Check a
+machine with `mlx-agent fm-check`, and see
+[`docs/foundation-models.md`](docs/foundation-models.md) for what it can and cannot do.
 
 Idle unload (`acp` and `map`, MLX backend only): `--idle-unload-seconds <sec>` (default
 600, `0` disables) unloads the resident weights after that much idle time and reloads them
