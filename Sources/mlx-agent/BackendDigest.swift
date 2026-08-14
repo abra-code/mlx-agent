@@ -152,9 +152,9 @@ struct BackendDigestGenerator: DigestModel {
         // one is minutes). Child tasks inherit cancellation, so a cancel reaches the stream.
         //
         // What this does NOT do is wait for the backend's own pass to finish unwinding. Exiting
-        // the group awaits the two children here, but a cancelled AsyncThrowingStream terminates
+        // the group awaits the two children here, but a canceled AsyncThrowingStream terminates
         // and resumes the consumer with nil while the producer is still tearing down - so after a
-        // timeout the pass is cancelled, not drained. `ACPServer.condenseForPrime` does the actual
+        // timeout the pass is canceled, not drained. `ACPServer.condenseForPrime` does the actual
         // join with `clear()`, which takes the backend's PassGate.
         let text = try await withThrowingTaskGroup(of: String.self) { group in
             group.addTask {
@@ -197,9 +197,9 @@ struct BackendDigestGenerator: DigestModel {
             guard let first = try await group.next() else { throw CancellationError() }
             return first
         }
-        // A cancelled stream FINISHES rather than throwing, so the loop above returns a partial
-        // answer instead of failing. Asking directly is what turns a Stop into "cancelled" rather
-        // than into a decode failure and a pointless repair pass.
+        // A canceled stream FINISHES rather than throwing, so the loop above returns a partial
+        // answer instead of failing. Asking directly is what makes a Stop report itself as a
+        // cancellation rather than as a decode failure and a pointless repair pass.
         try Task.checkCancellation()
         return text
     }

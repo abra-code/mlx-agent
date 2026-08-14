@@ -53,8 +53,8 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     /// The conversation this backend owns, in our currency rather than the framework's.
     ///
     /// It exists because a session cannot be reconfigured in place - changing tools, clearing, or
-    /// recovering from a cancelled pass all mean constructing a new one - and because the
-    /// framework's own transcript is not a usable substitute: a CANCELLED exchange is purged from
+    /// recovering from a canceled pass all mean constructing a new one - and because the
+    /// framework's own transcript is not a usable substitute: a CANCELED exchange is purged from
     /// it entirely (measured), so reading history back out of the session would silently lose
     /// exactly the turns that need preserving. Completed turns are appended here as they finish.
     private var seedHistory: [Chat.Message]
@@ -323,7 +323,7 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
                 // user turn with no reply, and repeated failures would stack consecutive user
                 // turns into the transcript.
                 var reachedModel = false
-                // A pass that does NOT reach the end - cancelled, or failed mid-answer - leaves
+                // A pass that does NOT reach the end - canceled, or failed mid-answer - leaves
                 // the framework's session in a state that must not be reused. See recordTurn.
                 defer {
                     if reachedModel {
@@ -400,11 +400,11 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
                         }
                         throw Self.generationFailed(fmUserFacingError(error))
                     }
-                    // "Did not throw" is NOT "finished". Cancelling the task iterating
+                    // "Did not throw" is NOT "finished". Canceling the task iterating
                     // `streamResponse` usually makes the framework END the stream early rather
                     // than throw, so `checkCancellation` above only fires if another snapshot
                     // happens to arrive after the cancel. Asking directly is what guarantees a
-                    // cancelled pass still forces the session rebuild in recordTurn - without it
+                    // canceled pass still forces the session rebuild in recordTurn - without it
                     // the next prompt reuses a post-cancel session, which traps and kills the
                     // process.
                     completed = !Task.isCancelled
@@ -538,14 +538,14 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     ///
     /// TWO separate problems, both measured on macOS 26.6.1, both solved by the same rebuild:
     ///
-    /// 1. REUSING A SESSION AFTER A CANCELLED PASS CRASHES THE PROCESS. Starting the next
-    ///    generation on a session whose previous `streamResponse` was cancelled traps inside
-    ///    FoundationModels (EXC_BREAKPOINT/SIGTRAP), even though the cancelled pass has fully
+    /// 1. REUSING A SESSION AFTER A CANCELED PASS CRASHES THE PROCESS. Starting the next
+    ///    generation on a session whose previous `streamResponse` was canceled traps inside
+    ///    FoundationModels (EXC_BREAKPOINT/SIGTRAP), even though the canceled pass has fully
     ///    unwound, `isResponding` is false and the transcript reads back fine. Reproduced 14
     ///    times in 20 with a gap under a second; a fresh session survived every attempt. This is
     ///    exactly the ACP flow - Stop, then ask again - so without this the whole agent dies on
     ///    an ordinary user action.
-    /// 2. A CANCELLED EXCHANGE IS PURGED from the framework's transcript, so the model's context
+    /// 2. A CANCELED EXCHANGE IS PURGED from the framework's transcript, so the model's context
     ///    would silently lose a turn the user can still see on screen, and "why did you stop?"
     ///    would confabulate. MLXBackend deliberately records the partial answer and OpenAIBackend
     ///    keeps `abandonedText` for the same reason; this is that mechanism here.

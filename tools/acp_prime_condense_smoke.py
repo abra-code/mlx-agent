@@ -340,7 +340,7 @@ def concurrency_checks(binary, backend_args, check):
     check("session/cancel reaches an in-flight condensation",
           r != {} and elapsed < 30 and res.get("condensed") is not True,
           f"took {elapsed:.1f} s after cancel, result={res or r.get('error')}")
-    check("a cancelled condensation still primes the full history",
+    check("a canceled condensation still primes the full history",
           res.get("condensed") is False and res.get("primed", 0) > KEEP_RECENT,
           f"result={res}")
     agent.p.kill()

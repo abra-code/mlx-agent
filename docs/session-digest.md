@@ -53,7 +53,7 @@ conversation's early section cannot fill the cap and silence its most recent one
 transcript and the agent never persists it, so priming the full history again restores everything.
 
 **And condensation never truncates.** Every failure - no summarizer, the model refused, timed out,
-returned nothing usable, the work was cancelled, or the conversation needed more slices than the
+returned nothing usable, the work was canceled, or the conversation needed more slices than the
 budget allows - resolves to the FULL history, with a reason. Condensing is an optimization;
 truncating is data loss wearing an optimization's clothes.
 

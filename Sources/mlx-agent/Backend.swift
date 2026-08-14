@@ -178,7 +178,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
 
     /// The KV cache, and the prompt tokens it is known to hold. The cache also holds whatever the
     /// model generated after that prompt, whose token ids we never see; the surplus is trimmed on
-    /// the next pass, which is also how a cancelled or failed pass self-heals. Gate-owned.
+    /// the next pass, which is also how a canceled or failed pass self-heals. Gate-owned.
     private var cache: [KVCache] = []
     private var cachedTokens: [Int] = []
 
@@ -198,7 +198,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
         set { lock.withLock { toolSpecs = newValue } }
     }
 
-    /// The library's `Generation` values, relabelled as `BackendEvent`. This path never yields
+    /// The library's `Generation` values, relabeled as `BackendEvent`. This path never yields
     /// `.reasoning`: mlx-swift-lm streams raw text, so any <think> markers are inline and it is
     /// ThinkSplitter's job to find them.
     ///
@@ -250,7 +250,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
     /// than spoiling one turn.
     ///
     /// - An assistant turn announcing tool calls that were never answered - the iteration cap fires
-    ///   between announcement and dispatch, a permission is cancelled, or a cancel lands mid-
+    ///   between announcement and dispatch, a permission is canceled, or a cancel lands mid-
     ///   dispatch. Reachable today with `--max-tool-iters 1`.
     /// - Two user turns in a row, when a pass throws and records no assistant reply.
     private func reconcileHistory(before new: [Chat.Message]) {
@@ -511,7 +511,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
     }
 
     /// session/prime builds a REPLACEMENT backend on every restore, so the outgoing one has
-    /// to release its session rather than accumulate one per primed conversation. Cancelling
+    /// to release its session rather than accumulate one per primed conversation. Canceling
     /// is right at deinit: nothing references this backend, so any request still in flight is
     /// generating for a stack nobody will read (a live turn holds `self` inside runStream).
     deinit {
@@ -536,7 +536,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
     ///
     /// This runs at the START of the next pass rather than in the abandoned pass's own catch
     /// block, and that is the whole point: cancellation resolves the turn as soon as the
-    /// stream terminates, so the cancelled task's unwinding races the next prompt. Flushing
+    /// stream terminates, so the canceled task's unwinding races the next prompt. Flushing
     /// under the same lock acquisition that appends the next input makes the ordering a fact
     /// rather than a hope. Caller must hold `lock`.
     private func flushAbandonedTextLocked() {
@@ -602,7 +602,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
                     try await self.runStream(continuation: continuation, handle: handle)
                     continuation.finish()
                 } catch {
-                    // A cancelled URLSession task surfaces as URLError.cancelled; report it
+                    // A canceled URLSession task surfaces as URLError.cancelled; report it
                     // as cancellation so the loop reads it as such rather than a failure.
                     if (error as? URLError)?.code == .cancelled || error is CancellationError {
                         continuation.finish(throwing: CancellationError())

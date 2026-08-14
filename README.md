@@ -186,7 +186,7 @@ Spool protocol (writes are atomic - temp file + rename - except the append-only 
   `text`, a job may set `"text_file": "<name>"` to read the source from that file in the spool
   dir (basename only) - handy for a shell producer avoiding JSON-encoding, and for large inputs.
 - **in** `stop` - an empty flag file; requests cancellation of the current job. Checked
-  between chunks and during generation (an in-flight chunk is cancelled).
+  between chunks and during generation (an in-flight chunk is canceled).
 - **out** `status.json` - `{"state": loading|ready|mapping|done|cancelled|error, "epoch": N,
   "chunk": k, "total": N, "message": "..."}`, plus optional progress fields while mapping
   (`tok_per_sec`, `tokens_done`, `tokens_total`, `eta_sec`).

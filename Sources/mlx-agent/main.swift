@@ -522,7 +522,7 @@ func runOneshot(
         FileHandle.standardError.write(Data("[oneshot] stopReason=\(reason)\n".utf8))
         return 0
     case .cancelled:
-        FileHandle.standardError.write(Data("[oneshot] cancelled\n".utf8))
+        FileHandle.standardError.write(Data("[oneshot] canceled\n".utf8))
         return 1
     case .failed(let message):
         FileHandle.standardError.write(Data("[oneshot] failed: \(message)\n".utf8))

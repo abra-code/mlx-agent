@@ -422,9 +422,12 @@ final class MapServer: @unchecked Sendable {
         for (i, chunk) in chunks.enumerated() {
             if stopRequested() {
                 await stopReporter()
+                // `state` is the wire contract a reader switches on and keeps its spelling;
+                // `message` is display prose and follows house style. Not a typo - do not
+                // "fix" either one to match the other.
                 writeStatus(
-                    state: "cancelled", epoch: job.epoch, chunk: i, total: total, message: "Cancelled")
-                log("job \(job.epoch): cancelled before chunk \(i + 1)")
+                    state: "cancelled", epoch: job.epoch, chunk: i, total: total, message: "Canceled")
+                log("job \(job.epoch): canceled before chunk \(i + 1)")
                 return
             }
             meter.beginChunk(i)
@@ -452,13 +455,13 @@ final class MapServer: @unchecked Sendable {
                 appendRecord(
                     ["index": i, "source": chunk.text, "output": result.text, "sep": chunk.sep])
             }
-            // A stop that arrived mid-chunk (generate() cancelled/drained) lands here.
+            // A stop that arrived mid-chunk (generate() canceled/drained) lands here.
             if stopRequested() {
                 await stopReporter()
                 writeStatus(
                     state: "cancelled", epoch: job.epoch, chunk: i + 1, total: total,
-                    message: "Cancelled")
-                log("job \(job.epoch): cancelled after chunk \(i + 1)")
+                    message: "Canceled")
+                log("job \(job.epoch): canceled after chunk \(i + 1)")
                 return
             }
         }

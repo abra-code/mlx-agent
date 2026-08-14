@@ -568,7 +568,7 @@ struct DigestPlannerCondenseTests {
         #expect(model.sources.count <= policy.maxSlices)
     }
 
-    @Test("cancelling mid-condensation falls back rather than grinding through every slice")
+    @Test("canceling mid-condensation falls back rather than grinding through every slice")
     func cancellation() async {
         let history = bulky(40)
         let model = GateModel()
@@ -586,7 +586,7 @@ struct DigestPlannerCondenseTests {
 
         #expect(!result.condensed)
         #expect(result.history == history)
-        #expect(result.reason?.contains("cancelled") == true)
+        #expect(result.reason?.contains("canceled") == true)
     }
 
     @Test("system turns are kept verbatim rather than summarized into a bullet")

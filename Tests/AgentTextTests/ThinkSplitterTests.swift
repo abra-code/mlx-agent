@@ -28,7 +28,7 @@ struct ThinkSplitterTests {
         #expect(joined(out, .message) == "answer")
     }
 
-    @Test("a marker split across chunk boundaries is still recognised")
+    @Test("a marker split across chunk boundaries is still recognized")
     func markerStraddlesChunks() {
         let s = ThinkSplitter()
         var out: [(ThinkSplitter.Kind, String)] = []
@@ -119,7 +119,7 @@ struct ThinkSplitterTests {
         #expect(joined(out, .message) == "It is 3:17 PM.")
     }
 
-    @Test("Gemma 4 markers arriving one character at a time are still recognised")
+    @Test("Gemma 4 markers arriving one character at a time are still recognized")
     func gemma4MarkersStraddleChunks() {
         let s = ThinkSplitter()
         var out: [(ThinkSplitter.Kind, String)] = []

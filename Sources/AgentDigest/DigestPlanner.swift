@@ -9,7 +9,7 @@
 //
 // THE RULE THAT OUTRANKS EVERYTHING ELSE HERE: history is never lost. A digest REPLACES turns in
 // what gets primed, so any doubt - the model threw, timed out, returned nothing usable, the work
-// was cancelled, there were more slices than the budget allows, or there was nothing old enough to
+// was canceled, there were more slices than the budget allows, or there was nothing old enough to
 // summarize - resolves to priming the FULL history unchanged. Condensing is an optimization;
 // truncating is data loss wearing an optimization's clothes. `condense` cannot throw, and that is
 // the enforcement.
@@ -510,7 +510,7 @@ public enum DigestPlanner {
             // condensation is the difference between a Stop that takes a second and one that takes
             // minutes, and this loop is the only place that knows how many are left.
             guard !Task.isCancelled else {
-                return fallback(history, reason: "summarization was cancelled", source: source)
+                return fallback(history, reason: "summarization was canceled", source: source)
             }
             do {
                 // The running merge goes in as prior context so a later slice can resolve
@@ -563,7 +563,7 @@ public enum DigestPlanner {
     /// "The operation couldn't be completed" - which would replace a useful message with a useless
     /// one for exactly the errors this seam throws.
     private static func describe(_ error: Error) -> String {
-        if error is CancellationError { return "summarization was cancelled" }
+        if error is CancellationError { return "summarization was canceled" }
         if let localized = (error as? LocalizedError)?.errorDescription,
             !localized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {

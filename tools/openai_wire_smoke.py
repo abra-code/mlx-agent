@@ -14,7 +14,7 @@
 #      every subsequent prompt in the session.
 #   2. function.arguments goes out as a JSON STRING (the OpenAI spec), not the JSON object
 #      the library's MessageGenerator bridge emits.
-#   3. A cancelled turn still records the partial answer, so the conversation never sends
+#   3. A canceled turn still records the partial answer, so the conversation never sends
 #      two user messages in a row.
 #
 # Usage: python3 tools/openai_wire_smoke.py /path/to/mlx-agent
@@ -112,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(payload.encode())
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass    # the client cancelled: exactly what the cancel check wants to cause
+            pass    # the client canceled: exactly what the cancel check wants to cause
 
 def main():
     if len(sys.argv) < 2:
@@ -202,7 +202,7 @@ def main():
         finally:
             agent2.close()
 
-        # A cancelled turn must still record what the user saw.
+        # A canceled turn must still record what the user saw.
         requests_seen.clear()
         script.append(slow_text_response)
         agent3 = Agent([sys.argv[1], "acp", "--backend", "openai", "--base-url", base])
@@ -222,7 +222,7 @@ def main():
                 "sessionId": sid3, "prompt": [{"type": "text", "text": "stop"}]}),
                 on_update=collect_updates({}), timeout=60)
             roles = [m.get("role") for m in requests_seen[-1]["messages"]]
-            check("a cancelled turn leaves no two user turns in a row",
+            check("a canceled turn leaves no two user turns in a row",
                   not any(roles[i] == "user" and roles[i + 1] == "user" for i in range(len(roles) - 1)),
                   f"roles={roles}")
         finally:

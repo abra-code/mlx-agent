@@ -45,7 +45,7 @@ Clients MUST gate all `session/prime` traffic on this key; agents that do not ad
 
 - `-32002` no active session (`session/new` has not run).
 - `-32602` unknown `sessionId`, or `messages` missing / not an array.
-- `-32003` a prompt is in flight. The agent refuses to swap the session under a running turn. A client that cancels a turn and primes immediately can see one transient `-32003` (the busy flag clears when the cancelled prompt RESOLVES, a hair after `session/cancel` is processed); retry once after a short delay. A persistent `-32003` indicates a client ordering bug.
+- `-32003` a prompt is in flight. The agent refuses to swap the session under a running turn. A client that cancels a turn and primes immediately can see one transient `-32003` (the busy flag clears when the canceled prompt RESOLVES, a hair after `session/cancel` is processed); retry once after a short delay. A persistent `-32003` indicates a client ordering bug.
 
 ## Semantics
 
@@ -133,7 +133,7 @@ too large to slice within budget - primes the COMPLETE history and says why. A c
   during a condensation - a New Chat should never fail. They win: the condensation notices the
   session was replaced and discards its result with `-32003` ("the session was replaced while its
   context was being summarized") rather than publishing a context the user already dismissed.
-- **`session/cancel` reaches it.** Cancelling during a condensation primes the full history,
+- **`session/cancel` reaches it.** Canceling during a condensation primes the full history,
   `condensed: false`. On the session's own model it interrupts the pass in flight; on the
   on-device model it lands between passes, so allow one pass of latency there.
 - **Fidelity.** The client owns the original transcript; the agent never persists it. Priming the

@@ -130,9 +130,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // tool calls/results are not replayed, so after an idle reload the model keeps the
     // conversation but not the exact tool outputs. That trade got slightly worse when MLXBackend
     // took ownership of the conversation: its history now also holds tool exchanges and the partial
-    // answers of cancelled turns, none of which are mirrored here, so post-reload context is poorer
+    // answers of canceled turns, none of which are mirrored here, so post-reload context is poorer
     // than the live context in a way it was not when the history was unreadable. (Appended only on
-    // a clean .stop so a cancelled/failed turn never enters the replayed context.) Reset to the primed
+    // a clean .stop so a canceled/failed turn never enters the replayed context.) Reset to the primed
     // history on session/prime and to [] on session/new.
     private var mlxTranscript: [Chat.Message] = []
     // Accumulates THIS turn's assistant answer (kind == .message only, never .thought) so it can
@@ -759,7 +759,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             // but be defensive: resolve any stragglers so no continuation leaks.
             self.failPendingPermissions(with: .cancel)
             // Extend the shadow transcript ONLY on a clean stop and ONLY on the MLX path - it is
-            // solely a reload aid, so a cancelled/failed turn (which the user interrupted or which
+            // solely a reload aid, so a canceled/failed turn (which the user interrupted or which
             // errored) must not enter the replayed context. A turn that produced no answer text
             // (e.g. tool-only, since tool exchanges are not replayed) is skipped whole so the
             // user/assistant pairing never carries an empty assistant message into prefill.
@@ -814,9 +814,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // must reach it too, not just a running prompt.
         if let condense = lock.withLock({ self.condenseTask }) {
             condense.cancel()
-            log("session/cancel: cancelling an in-flight context summarization")
+            log("session/cancel: canceling an in-flight context summarization")
         }
-        log(task == nil ? "cancel: no in-flight turn" : "cancel: cancelling in-flight turn")
+        log(task == nil ? "cancel: no in-flight turn" : "cancel: canceling in-flight turn")
         // Unblock any in-flight permission wait so the loop can observe cancellation.
         failPendingPermissions(with: .cancel)
         task?.cancel()
@@ -1359,7 +1359,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             if backend != nil {
                 // THE DRAIN. Not tidying - this is the join. On `MLXBackend` `clear()` takes the
                 // same PassGate a pass holds, so it cannot return until the last summarization
-                // pass has fully torn down, including one the generator's timeout cancelled but
+                // pass has fully torn down, including one the generator's timeout canceled but
                 // did not wait for (see BackendDigest.answer). That matters because `finishPrime`
                 // is about to build a SECOND backend over the same ModelContainer, and two live
                 // passes over one container is the measured [broadcast_shapes] SIGTRAP.
@@ -1801,7 +1801,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // mode" IS an empty MCP config - same transport, no tools - so a second, live control
         // for the same question could only disagree with the first.
         //
-        // It also could not honour the promise it made. The picker only ever appeared when
+        // It also could not honor the promise it made. The picker only ever appeared when
         // tools were ALREADY spawned (`haveTools`), so it could not turn a chat session
         // agentic - the servers were not there to enable. All it could do was mute tools the
         // user had explicitly asked for, which is not a decision worth a permanent control.

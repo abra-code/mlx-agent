@@ -6,7 +6,7 @@
 # its session. A plain prompt after a cancel never happens there.
 #
 # On the foundation backend, reusing a LanguageModelSession whose previous streamResponse was
-# cancelled traps inside FoundationModels (SIGTRAP), killing the whole agent - reproduced in 14 of
+# canceled traps inside FoundationModels (SIGTRAP), killing the whole agent - reproduced in 14 of
 # 20 attempts before FoundationBackend started rebuilding the session on a non-clean pass. It is
 # exactly what a user does: press Stop, then ask something else.
 #

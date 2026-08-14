@@ -5,7 +5,7 @@
 // passes touch shared state has it.
 //
 // What goes wrong without it. Agent returns `.cancelled` from inside its `for try await`, so
-// the pass Task is only cancelled ASYNCHRONOUSLY (via the stream iterator's deinit), while
+// the pass Task is only canceled ASYNCHRONOUSLY (via the stream iterator's deinit), while
 // ACPServer's `defer` clears `promptTask` at once and accepts the next prompt. The abandoned
 // pass is then still inside `await genTask.value` with its writes pending while the new pass
 // runs against the same state. On MLX that was measured as a hard `[broadcast_shapes]` SIGTRAP

@@ -134,7 +134,7 @@ final class Agent: @unchecked Sendable {
 
             // This pass's stream is over, so no further chunk can complete a marker that
             // straddled a chunk boundary: whatever the splitter is still holding is final
-            // text and must go out NOW. Doing this only at end-of-turn (the old behaviour)
+            // text and must go out NOW. Doing this only at end-of-turn (the old behavior)
             // stranded the tail whenever the pass ended in a tool call, and it resurfaced
             // glued to the front of the next pass's answer. `inThink` survives on purpose -
             // a <think> block may span a tool call.
@@ -206,7 +206,7 @@ final class Agent: @unchecked Sendable {
             switch outcome {
             case .cancel:
                 delegate?.agentToolCallFinished(
-                    id: toolCallID, status: "failed", output: "[cancelled by user]")
+                    id: toolCallID, status: "failed", output: "[canceled by user]")
                 return .cancelled
             case .deny:
                 let msg = "{\"error\": \"permission denied by user for \(name)\"}"
@@ -304,7 +304,7 @@ private final class ResumeGuard: @unchecked Sendable {
 /// detached request task that does not observe the caller's cancellation - a structured
 /// task-group timeout would block at scope exit until the (possibly hung) server replied,
 /// defeating the guardrail. Here the winner resumes the continuation and the loser is
-/// cancelled and abandoned (it holds one pending MCP request until the server replies or
+/// canceled and abandoned (it holds one pending MCP request until the server replies or
 /// the server process is torn down - bounded, one per timed-out call).
 func withTimeout<T: Sendable>(
     _ seconds: TimeInterval, _ operation: @escaping @Sendable () async throws -> T
