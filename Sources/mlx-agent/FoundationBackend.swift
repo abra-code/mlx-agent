@@ -15,12 +15,14 @@
 // Three gates guard every reference to the framework - compile, link and runtime. See
 // FoundationSupport.swift, which is also where availability is decided.
 //
-// NOT HERE YET, deliberately:
-//   tools     - the framework calls tools ITSELF inside respond/streamResponse and has no mode
-//               that surfaces a call for external dispatch, so Agent's loop cannot drive it.
-//               Bridging MCP tools means moving the permission gate, iteration cap, timeout and
-//               dedup inside the call, which is its own change. Setting `tools` logs and is
-//               otherwise ignored, so agent mode degrades to chat rather than pretending.
+// TOOLS ARE INVERTED HERE, and it is the other structural difference worth knowing before
+// reading on. The framework calls tools ITSELF from inside respond/streamResponse and has no
+// mode that surfaces a call for external dispatch, so Agent's loop cannot drive this backend.
+// Instead the loop hands it a runner (see InternalToolDispatchingBackend) and the bridged tools
+// reach back into it, which puts the permission gate, timeout, truncation and dedup on exactly
+// the same code as every other backend. Consequences: a turn is ONE pass, no .toolCall events
+// are ever emitted, and the iteration cap is enforced here rather than by the loop. See
+// FoundationTools.swift.
 
 import AgentDigest
 import AgentText
@@ -36,14 +38,56 @@ import MLXLMCommon
 /// `@unchecked Sendable` with an NSLock, matching the other two backends. `LanguageModelSession`
 /// is itself `@unchecked Sendable` and its respond methods are `nonisolated(nonsending)`, so
 /// nothing here is forced onto an actor; the lock guards this class's own fields.
-final class FoundationBackend: GenerationBackend, @unchecked Sendable {
+final class FoundationBackend: GenerationBackend, InternalToolDispatchingBackend, @unchecked Sendable
+{
 
     private let instructions: String?
     private let parameters: GenerateParameters
     private let lock = NSLock()
     private var toolSpecs: [ToolSpec]?
-    private var warnedAboutTools = false
     private let log: @Sendable (String) -> Void
+
+    /// Reaches back into `Agent.runToolForBackend`. Installed once, at Agent init, before any
+    /// pass - so a nil runner means tools were configured on a backend no agent is driving,
+    /// and the tool set is simply not built.
+    private var toolRunner: (@Sendable (ToolCall) async -> ToolRunOutcome)?
+    /// `AgentGuardrails.maxToolIterations`, arriving with the runner. The default is only what
+    /// stands until then; nothing dispatches before the install.
+    private var maxToolCallsPerPass = 10
+    /// Reset at the top of every pass. Counts what the MODEL asked for, including calls the
+    /// permission gate went on to deny - a model looping on a tool it is not allowed to use is
+    /// exactly the runaway the cap exists to stop.
+    ///
+    /// Counted at the TOP of the runner, before the tool runs, so an increment always lands in
+    /// the attempt that asked for it.
+    private var toolCallsThisPass = 0
+    /// Model-facing tool output so far this attempt, in bytes. Decides whether an overflow is
+    /// worth condensing for - see `runPass` - and bounds what the tools can spend of the window.
+    ///
+    /// Budget is RESERVED when a call starts and reconciled when it returns, both stamped with
+    /// `attemptGeneration`. The stamp is what makes it safe under a framework that dispatches
+    /// concurrently and a timeout that cannot be cancelled: a call outliving its attempt has
+    /// nothing to give back, because its reservation went with the attempt.
+    private var toolResultBytesThisPass = 0
+    /// Bumped whenever the per-attempt counters reset. See `toolResultBytesThisPass`.
+    private var attemptGeneration = 0
+    /// So the pass-budget refusal is logged once rather than per call.
+    private var warnedResultBudget = false
+    /// What the current tool set costs, from `FoundationToolBridge.tokenCost`. Kept rather than
+    /// only logged, because the proactive condense has to reserve it.
+    private var toolTokenCost = 0
+    /// Bumped on every tool-set rebuild. The exact token count is measured asynchronously, so
+    /// without a stamp its Task can land AFTER the tools it measured were replaced or turned off
+    /// - reinstating a reserve for a tool set the model can no longer see, which is the very
+    /// thing zeroing `toolTokenCost` is there to prevent. Two rebuilds racing would settle in
+    /// completion order for the same reason.
+    private var toolsGeneration = 0
+
+    #if canImport(FoundationModels)
+        /// `[MCPBridgedTool]`, typed as Any for the same reason `sessionBox` is: a stored
+        /// property cannot be conditionally available.
+        private var bridgedToolsBox: Any?
+    #endif
 
     /// Serializes whole passes. The framework throws `GenerationError.concurrentRequests` when
     /// two overlap, and the ACP cancel window makes that reachable with a well-behaved client -
@@ -114,20 +158,229 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
     var tools: [ToolSpec]? {
         get { lock.withLock { toolSpecs } }
         set {
-            let count = newValue?.count ?? 0
-            let shouldWarn: Bool = lock.withLock {
-                toolSpecs = newValue
-                guard count > 0, !warnedAboutTools else { return false }
-                warnedAboutTools = true
-                return true
+            lock.withLock { toolSpecs = newValue }
+            // A session's tool set is fixed at construction, so changing it means building a new
+            // one. Free of history loss: the rebuild replays `seedHistory`, which this backend
+            // owns precisely because the framework's own transcript cannot be relied on.
+            //
+            // NOT gated on the PassGate, unlike `clear()` - and that is safe only because of who
+            // calls this. `setToolsEnabled` runs when a session stack is built or the mode
+            // changes, never during a pass. A caller that set tools AROUND a live pass (the shape
+            // `BackendDigest` uses: save, set nil, restore in a defer) would swap the session out
+            // from under it and the answer in flight would be written into an orphaned one. That
+            // path cannot reach here today - `sessionOption` refuses backend-summarizing on the
+            // foundation engine and `DigestMode` only wraps MLX and OpenAI - so this is the
+            // invariant to preserve rather than a bug to fix. If it ever stops holding, gate it.
+            rebuildToolsAndSession()
+        }
+    }
+
+    // MARK: - Tools
+
+    /// Take the loop's tool dispatcher. See `InternalToolDispatchingBackend`.
+    func installToolRunner(
+        maxCallsPerPass: Int,
+        _ runner: @escaping @Sendable (ToolCall) async -> ToolRunOutcome
+    ) {
+        lock.withLock {
+            toolRunner = runner
+            // A cap below 1 would refuse the first call and leave the model insisting on a tool
+            // it can never get - worse than no tools at all, which is what 0 presumably meant.
+            maxToolCallsPerPass = max(1, maxCallsPerPass)
+        }
+        rebuildToolsAndSession()
+    }
+
+    /// Rebuild the bridged tool set from the current specs, then the session that holds it.
+    ///
+    /// Called from the `tools` setter and from `installToolRunner`, because either can arrive
+    /// first: Agent installs the runner in its init, and ACPServer sets the specs when the mode
+    /// is decided. Whichever is second is what produces a usable tool set.
+    private func rebuildToolsAndSession() {
+        #if canImport(FoundationModels)
+            if #available(macOS 26.0, *) {
+                let (specs, runner, generation) = lock.withLock {
+                    () -> ([ToolSpec], (@Sendable (ToolCall) async -> ToolRunOutcome)?, Int) in
+                    toolsGeneration += 1
+                    return (toolSpecs ?? [], toolRunner, toolsGeneration)
+                }
+                guard !specs.isEmpty, let runner else {
+                    let had = lock.withLock { () -> Bool in
+                        let had = bridgedToolsBox != nil
+                        bridgedToolsBox = nil
+                        // Back to zero with the tools. Leaving it set makes `needsCondensingBefore`
+                        // reserve room for a tool set the model can no longer see - so switching
+                        // to chat mode after using tools would condense conversations that fit
+                        // comfortably, which is exactly what that reserve's own comment warns
+                        // against.
+                        toolTokenCost = 0
+                        return had
+                    }
+                    // Only rebuild if there were tools to remove; otherwise this is the ordinary
+                    // chat path and rebuilding would throw away a live session for nothing.
+                    if had { rebuildSession() }
+                    return
+                }
+
+                let built = FoundationToolBridge.tools(
+                    from: specs, runner: gatedRunner(runner), log: { [log] in log($0) })
+                lock.withLock {
+                    bridgedToolsBox = built
+                    // A rough figure NOW rather than nothing until the exact count arrives.
+                    // `tokenCount` is async, and a prompt that lands before it returns would
+                    // otherwise reserve zero for the tool set - the very under-reserve this is
+                    // here to prevent. It is replaced as soon as the Task below finishes.
+                    //
+                    // Estimated from what was actually BUILT, not from every spec: a tool whose
+                    // schema the framework refused is not offered to the model, and reserving
+                    // window for it would be reserving for nothing.
+                    toolTokenCost = FoundationToolBridge.estimatedTokenCost(
+                        of: specs, built: built)
+                }
+                rebuildSession()
+
+                // The window is the binding constraint on this backend, so say what the tool set
+                // costs out of it before the conversation starts rather than after it overflows.
+                let model = SystemLanguageModel.default
+                Task { [weak self, log] in
+                    guard let cost = await FoundationToolBridge.tokenCost(of: built) else { return }
+                    // Stored, not just logged: `needsCondensingBefore` has to reserve it, and a
+                    // reserve that ignores a third of the window is not a reserve.
+                    guard let self else { return }
+                    self.lock.withLock {
+                        // Only if these are still the tools in force. Without the stamp, a mode
+                        // switch to chat between the rebuild and this line would be undone here.
+                        guard self.toolsGeneration == generation else { return }
+                        self.toolTokenCost = cost
+                    }
+                    let percent = Int((Double(cost) / Double(model.contextSize) * 100).rounded())
+                    log(
+                        "foundation backend: \(built.count) tool(s) cost \(cost) of the "
+                            + "\(model.contextSize)-token window (\(percent)%) before any "
+                            + "conversation")
+                }
+                return
             }
-            // Say so once rather than failing quietly at the first tool the model wants. The
-            // framework dispatches tools internally, so Agent's loop cannot mediate them yet.
-            if shouldWarn {
-                log(
-                    "foundation backend: tool calling is not wired up yet - \(count) MCP tool(s) "
-                        + "will not be offered to the model; this turn behaves as chat")
+        #endif
+        if (lock.withLock { toolSpecs })?.isEmpty == false {
+            log(
+                "foundation backend: tools require macOS 26 and the Foundation Models framework; "
+                    + "this turn behaves as chat")
+        }
+    }
+
+    /// How much of a tool result the MODEL is shown, in bytes.
+    ///
+    /// `AgentGuardrails.resultByteBudget` defaults to 32 KB, which is eight times this model's
+    /// entire 4096-token window - measured: a 31 KB result, comfortably inside that guardrail,
+    /// throws `exceededContextWindowSize` reporting 7149 tokens. And the overflow lands where
+    /// nothing can recover it: the oversized text is in the FRAMEWORK's transcript, never in
+    /// `seedHistory`, so condensing summarizes a history that was not the problem, the retry
+    /// calls the same tool, and the turn fails after spending seconds on it.
+    ///
+    /// 1500 bytes is roughly 375 tokens, under a tenth of the window. The CLIENT still sees the
+    /// full output - `Agent.dispatch` has already emitted it - so this shortens what the model
+    /// reads, not what the user gets. mcp_server_fetch alone defaults to 5000 characters, so
+    /// this is one ordinary tool away rather than a hypothetical.
+    static let modelFacingResultBytes = 1500
+
+    /// And the same bound across a whole pass.
+    ///
+    /// Clamping each call is not enough on its own: the iteration cap allows ten of them, so ten
+    /// clamped results still put 15 KB - about 3750 tokens - into a 4096-token window. Past this
+    /// total the model is told the budget is spent, which is the same shape of answer the
+    /// iteration cap gives and something it can act on.
+    static let passResultByteBudget = 6000
+
+    /// Cut a tool result down to what this window can carry, and say so in-band so the model
+    /// knows the answer is partial rather than the whole truth.
+    ///
+    /// Returns the model-facing byte count alongside, so the caller can keep the pass total.
+    private static func clamped(
+        _ outcome: ToolRunOutcome, log: @Sendable (String) -> Void
+    ) -> (ToolRunOutcome, Int) {
+        guard case .result(let text) = outcome else { return (outcome, 0) }
+        guard text.utf8.count > modelFacingResultBytes else { return (outcome, text.utf8.count) }
+        let kept = truncateToBudget(text, modelFacingResultBytes)
+        log(
+            "foundation backend: a tool returned \(text.utf8.count) bytes; the model is shown "
+                + "\(kept.utf8.count) of them (the whole result reached the client)")
+        return (.result(kept), kept.utf8.count)
+    }
+
+    /// Wrap Agent's runner with the per-pass iteration cap.
+    ///
+    /// The cap has to live here because only this backend knows where a pass begins - and it is
+    /// necessarily SOFTER than the loop's version. `Agent.runTurn` can refuse to start another
+    /// pass; nothing can halt the framework mid-`streamResponse` without discarding the answer
+    /// in progress. So the budget is reported to the model as a tool result and the model is
+    /// asked to conclude, which it can act on. That is a real difference in behavior between
+    /// backends, and it is recorded in docs/foundation-models.md rather than hidden.
+    private func gatedRunner(
+        _ runner: @escaping @Sendable (ToolCall) async -> ToolRunOutcome
+    ) -> @Sendable (ToolCall) async -> ToolRunOutcome {
+        return { [weak self] call in
+            guard let self else { return .result("{\"error\": \"backend went away\"}") }
+            let (count, cap) = self.lock.withLock { () -> (Int, Int) in
+                self.toolCallsThisPass += 1
+                return (self.toolCallsThisPass, self.maxToolCallsPerPass)
             }
+            guard count <= cap else {
+                // Once only. A model that keeps asking past the budget gets the same refusal
+                // every time, and a line per attempt would bury everything else in the log.
+                if count == cap + 1 {
+                    self.log(
+                        "foundation backend: tool-call budget of \(cap) reached in one pass; "
+                            + "telling the model to answer with what it has")
+                }
+                return .budgetExhausted(
+                    "{\"error\": \"tool call limit reached; answer with what you have\"}")
+            }
+            // The pass budget is checked BEFORE dispatching, so a tool whose output cannot be
+            // read is not run at all - the server is spared the work and the user is spared a
+            // side effect whose result the model will never see.
+            //
+            // And the budget is RESERVED at the check rather than added at the end. Calls arrive
+            // concurrently here, so a plain check-then-add lets every call in a batch read the
+            // same "spent" before any of them adds: three concurrent calls would all pass a
+            // budget with room for one. Each claims a whole call's worth up front and gives back
+            // the difference once its real size is known.
+            let (spent, alreadyWarned, attempt) = self.lock.withLock { () -> (Int, Bool, Int) in
+                let spent = self.toolResultBytesThisPass
+                let warned = self.warnedResultBudget
+                if spent >= Self.passResultByteBudget {
+                    self.warnedResultBudget = true
+                } else {
+                    self.toolResultBytesThisPass += Self.modelFacingResultBytes
+                }
+                return (spent, warned, self.attemptGeneration)
+            }
+            guard spent < Self.passResultByteBudget else {
+                // Once per pass, like the iteration cap: a model that keeps asking gets the same
+                // refusal every time, and a line each would bury everything else.
+                if !alreadyWarned {
+                    self.log(
+                        "foundation backend: tool output budget of \(Self.passResultByteBudget) "
+                            + "bytes spent in one pass; telling the model to answer with what it "
+                            + "has")
+                }
+                return .budgetExhausted(
+                    "{\"error\": \"tool output limit reached for this turn; answer with what you "
+                        + "have\"}")
+            }
+            let (outcome, bytes) = Self.clamped(await runner(call), log: self.log)
+            self.lock.withLock {
+                // Reconcile against the reservation above - but ONLY against the attempt that
+                // made it. The reconcile is always a refund (`bytes` never exceeds the
+                // reservation), so a straggler landing after its attempt was torn down would
+                // credit an attempt that never reserved anything, driving the counter negative
+                // and disabling the budget outright: ten stragglers refunding ~1400 each leave
+                // the next attempt near -14000 against a 6000 bound. The reservation died with
+                // its attempt; there is nothing to give back.
+                guard self.attemptGeneration == attempt else { return }
+                self.toolResultBytesThisPass += bytes - Self.modelFacingResultBytes
+            }
+            return outcome
         }
     }
 
@@ -180,7 +433,9 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             if #available(macOS 26.0, *) {
                 lock.withLock {
                     if let newHistory { seedHistory = newHistory }
+                    let bridged = bridgedToolsBox as? [MCPBridgedTool] ?? []
                     sessionBox = LanguageModelSession(
+                        tools: bridged as [any FoundationModels.Tool],
                         transcript: Self.transcript(
                             instructions: instructions, history: seedHistory))
                 }
@@ -197,13 +452,21 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
         /// Translate our conversation currency into the framework's.
         ///
         /// Tool turns are DROPPED rather than reconstructed. `Transcript` can express tool calls
-        /// and outputs, but this backend does not run tools yet, and a restored tool exchange
-        /// referring to tools the session was not given is worse than an honest gap - the model
-        /// would see itself calling something it cannot call. ChatView's prime wire carries text
-        /// turns only in practice, so in the common path nothing is lost.
+        /// and outputs, but a RESTORED exchange refers to tools by name, and the set this session
+        /// is given depends on the mode and the servers that launched - so a replayed call to a
+        /// tool that is not in it shows the model itself using something it cannot use. An honest
+        /// gap is better. ChatView's prime wire carries text turns only in practice, so in the
+        /// common path nothing is lost.
         @available(macOS 26.0, *)
         static func transcript(instructions: String?, history: [Chat.Message]) -> Transcript {
             var entries: [Transcript.Entry] = []
+            // No toolDefinitions here, and that is measured rather than assumed. Building a
+            // session as `LanguageModelSession(tools:transcript:)` makes the framework put the
+            // definitions into its own transcript from the `tools:` argument: a session built
+            // from a transcript whose instructions entry carries NONE still ends up with all of
+            // them, and `tokenCount(for: session.transcript)` is identical either way (522 for
+            // the same 3 tools, both ways). So passing them here is redundant, not load-bearing
+            // - and the model does call tools without it, which was the thing worth checking.
             if let instructions, !instructions.isEmpty {
                 entries.append(
                     .instructions(
@@ -344,6 +607,19 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
                 }
 
                 while true {
+                    // The tool budget is per ATTEMPT, and this is where one begins - inside the
+                    // retry loop, not above it. A condense between attempts builds a NEW session,
+                    // so the previous attempt's tool output is not in the transcript the retry
+                    // runs against; carrying its counters forward would bill the retry for bytes
+                    // that no longer occupy the window, and could make it report that tools
+                    // overflowed a session holding almost none. Inside the gate either way, so
+                    // two queued prompts still cannot spend each other's budget.
+                    lock.withLock {
+                        toolCallsThisPass = 0
+                        toolResultBytesThisPass = 0
+                        warnedResultBudget = false
+                        attemptGeneration += 1
+                    }
                     // Re-read inside the loop: a condense between attempts replaces the session.
                     guard let session = lock.withLock({ sessionBox }) as? LanguageModelSession
                     else { throw Self.unavailable(FMAvailability.probe().summary) }
@@ -390,15 +666,49 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
                         // Overflow raised mid-answer (the response itself filled the window)
                         // therefore surfaces as a failure, which is honest - the request cannot
                         // be satisfied by making the history smaller.
+                        // ... and only when the history is plausibly what overflowed.
+                        //
+                        // Tool output lives in the FRAMEWORK's transcript, never in `seedHistory`,
+                        // so condensing cannot remove a byte of it: where tools filled the window,
+                        // summarizing spends seconds on the wrong thing, calls the same tools
+                        // again and fails anyway. But "a tool ran" is far too broad a test for
+                        // that now the results are clamped - one small call contributes a few
+                        // hundred tokens, and an overflow after it is almost certainly history
+                        // plus the tool DEFINITIONS, which condensing does fix. So the test is
+                        // whether tools actually spent their budget.
+                        let toolOverflow =
+                            lock.withLock { toolResultBytesThisPass } >= Self.passResultByteBudget
                         if case .exceededContextWindowSize = error, !triedCondensing,
-                            streamed.isEmpty
+                            streamed.isEmpty, !toolOverflow
                         {
                             triedCondensing = true
                             if await condenseHistory(because: "the window overflowed") {
                                 continue
                             }
                         }
+                        // Only when the model never spoke. An overflow raised MID-ANSWER is the
+                        // response filling the window - measured, with a model that echoed a tool
+                        // result back at 4000 words - and blaming the tool for that would send the
+                        // reader after the wrong thing entirely.
+                        if case .exceededContextWindowSize = error, toolOverflow, streamed.isEmpty {
+                            throw Self.generationFailed(
+                                "the tools this turn returned more than the on-device model's "
+                                    + "\(FMAvailability.contextSize() ?? 4096)-token window can "
+                                    + "hold, and summarizing cannot recover it - ask for less, or "
+                                    + "use --backend mlx for this conversation")
+                        }
                         throw Self.generationFailed(fmUserFacingError(error))
+                    } catch let error as LanguageModelSession.ToolCallError {
+                        // A bridged tool threw. The one case that is not a failure is the user
+                        // answering a permission prompt with Cancel: `MCPBridgedTool.call` throws
+                        // CancellationError for that, because throwing is the only way to stop a
+                        // pass from inside a tool, and the framework wraps whatever it threw. Left
+                        // wrapped it would surface as a failed turn - the client would see an
+                        // error where it asked for a cancel.
+                        if error.underlyingError is CancellationError { throw CancellationError() }
+                        throw Self.generationFailed(
+                            "the tool \(error.tool.name) failed: "
+                                + fmUserFacingError(error.underlyingError))
                     }
                     // "Did not throw" is NOT "finished". Canceling the task iterating
                     // `streamResponse` usually makes the framework END the stream early rather
@@ -471,7 +781,14 @@ final class FoundationBackend: GenerationBackend, @unchecked Sendable {
             // make this check fire on literally every turn that has any history at all, condensing
             // conversations that fit comfortably. A caller who asks for SHORT answers still gets
             // the smaller reserve, which is the case where the number means something.
-            let reserve = min(parameters.maxTokens ?? 512, window / 4) + 256
+            //
+            // The tool set is part of the reserve too, and it is not small: measured at 615
+            // tokens for 3 tools and 1832 for 14, out of 4096. Leaving it out made this check
+            // stop firing on exactly the configuration the tool bridge introduced - it would
+            // conclude there was room, and the pass would then overflow for real.
+            let reserve =
+                min(parameters.maxTokens ?? 512, window / 4) + 256
+                + lock.withLock { toolTokenCost }
             guard DigestPlanner.estimateTokens(text) + reserve > window else { return false }
             if let exact = await Self.tokenCount(for: text) { return exact + reserve > window }
             return true

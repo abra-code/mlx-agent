@@ -19,8 +19,8 @@ the answer to two situations:
   instead of a 4 GB download.
 - **Short, bounded work.** Summaries, classifications, one-line answers.
 
-It is NOT a replacement for a 7B-30B model under MLX. The window is 4096 tokens, it does not do
-tool calling here, and it is a 3B model. Choose it on those terms.
+It is NOT a replacement for a 7B-30B model under MLX. The window is 4096 tokens, tool definitions
+are spent from it, and it is a 3B model. Choose it on those terms.
 
 Supported modes: `acp`, `oneshot`, `digest`. Refused by `map` (chunked document work does not fit a
 4096-token window, and the refusal names the mode rather than failing later inside the broker) and
@@ -174,33 +174,94 @@ to break it. See `Sources/mlx-agent/BackendDigest.swift`.
 
 `--digest-dir` records these condensations alongside the prime-time ones.
 
-## The tool budget
+## Tools
 
-**There is none: tools are not bridged.** The framework calls tools ITSELF inside
-`respond`/`streamResponse` and offers no mode that surfaces a call for external dispatch, so
-mlx-agent's tool loop cannot drive it - and that loop is where the permission gate, the iteration
-cap, the per-call timeout and result-size budget live. Bridging MCP tools means moving all of that
-inside the framework's call, which is its own change.
+MCP tools work here, and the client-visible wire is the same as on the other backends: the same
+`tool_call` and `tool_call_update` updates, the same `session/request_permission` round-trip, the
+same denial text fed back to the model.
 
-So: **agent mode degrades to chat.** Setting tools on this backend logs once and is otherwise
-ignored, rather than pretending. Concretely, with `--backend foundation`:
+What differs is who is in charge. The framework calls tools ITSELF inside
+`respond`/`streamResponse` and offers no mode that surfaces a call for external dispatch, so the
+agent's loop cannot drive this backend. The bridge inverts the arrangement instead: the loop hands
+the backend a runner, and each bridged tool calls back into it - so the permission gate, the
+per-call timeout, the result-size budget and the duplicate-call short-circuit are literally the
+same code that serves MLX and llama-server.
 
-- `--mcp-config` still launches the servers and still selects agent mode, but the model never sees
-  a tool and never calls one.
-- `session/request_permission` is never sent.
-- Tool turns in a primed history are DROPPED when translating into the framework's transcript.
-  `Transcript` can express them, but replaying a tool exchange to a model that cannot run tools
-  invites it to invent more of them.
+The differences are in timing and bounds rather than in the shape of what a client receives:
 
-Use `mlx-agent tools --mcp-config <json>` to inspect a tool surface, and an MLX or llama-server
-backend to actually run one.
+- **A turn is one pass.** The model calls tools, reads the results and answers inside a single
+  `stream()`. `.toolCall` events are never emitted, so nothing double-dispatches.
+- **Tools are called CONCURRENTLY.** Measured: a prompt naming three cities entered three tool
+  calls in the same microsecond, and the pass took as long as the slowest rather than their sum.
+  Every other backend dispatches one at a time. Two visible effects: several
+  `session/request_permission` requests can be outstanding at once, where an MLX session would
+  ask serially; and a call can still be running when the turn it belongs to is cancelled, since
+  the per-call timeout is deliberately uncancellable. Neither loses work - a straggler's result
+  is discarded rather than folded into the next turn.
+- **The iteration cap is softer.** On the other backends the loop simply refuses to start another
+  pass. Nothing can halt the framework mid-answer without discarding it, so past the cap a tool
+  call returns `{"error": "tool call limit reached; answer with what you have"}` to the model
+  rather than stopping the turn. The model is told, and the log records it - but nothing goes on
+  the wire for a refused call, so a model looping past the cap is visible only in stderr.
+- **Tool results are clamped: 1500 bytes per call, 6000 per attempt.** `--tool-result-bytes`
+  defaults to 32 KB, which is eight times this model's entire window: a 31 KB result throws
+  `exceededContextWindowSize` before the model reads a word of it, and no condensation can
+  recover, because the oversized text is in the framework's transcript rather than in the history
+  that gets summarized. The per-pass bound matters for the same reason - ten clamped results
+  would still be most of the window. Past it, a call is refused with the same shape of message
+  the iteration cap uses, without being dispatched. The client still receives every result in
+  full; only what the model reads is shortened, and the log says when it happened.
+- **A condense-and-retry gets fresh budgets.** Both the call cap and the byte budget are per
+  ATTEMPT, not per turn, because a retry runs against a session rebuilt around the summary - the
+  first attempt's tool output is not in its transcript, so billing the retry for it would refuse
+  calls over window that is no longer occupied. A turn that condenses can therefore make up to
+  twice the calls of one that does not.
+- **Mid-turn tool-set changes are gone.** The set is fixed when the session is built.
 
-**And when the bridge does land, the budget is still the window.** Every tool definition - name,
-description and JSON schema - is spent from the same 4096 tokens the conversation lives in. With a
-dozen schema-heavy MCP tools, most of the window is gone before the user types anything. That is a
-property of the model, not of the bridge, so it will not be fixed by building the bridge: expect
-this backend to work with a handful of small tools, and use MLX or llama-server for a real
-registry.
+Tool turns in a primed history are still DROPPED when translating into the framework's transcript:
+a replayed call names a tool that may not be in this session's set, and showing the model itself
+using a tool it does not have is worse than a gap.
+
+### The budget is the window
+
+Every tool definition - name, description and schema - is spent from the same 4096 tokens the
+conversation lives in. Measured on this machine, with real servers:
+
+| Tool set | Tokens | Share of the window |
+| --- | --- | --- |
+| mcp_server_time (2) + mcp_server_fetch (1) | 615 | 15% |
+| the 11-tool schema-torture server in `tools/fm_tools_smoke.py` | 1235 | 30% |
+| all three of those servers together (14 tools) | 1832 | 45% |
+
+So: **a handful of small tools, not a registry.** That is a property of the model rather than of
+the bridge, and building the bridge did not change it. Use MLX or llama-server for a real tool
+surface. The backend logs the real number at startup, so there is no need to guess:
+
+```
+foundation backend: 3 tool(s) cost 615 of the 4096-token window (15%) before any conversation
+```
+
+### Schemas that do not fit
+
+`DynamicGenerationSchema` cannot express all of JSON Schema. Rather than dropping a tool, the
+bridge degrades the part it cannot build to a described string and says so once:
+
+```
+foundation tools: 4 of 8 tool(s) have simplified schemas - with_ref [item: uses $ref, which has
+no equivalent], ...
+```
+
+Degrading is safe because the MCP server validates its own inputs authoritatively - the schema
+only constrains decoding, so what is lost is guidance, not correctness. `$ref`, `allOf`/`oneOf`/
+`anyOf`, mixed-type enums, genuine type unions and typeless properties degrade; `pattern`,
+`format` and length bounds survive as sentences in the description; nested objects, arrays,
+string enums, nullable types and numeric bounds convert exactly. The rules live in the `SchemaIR`
+target and each one has a test.
+
+A tool whose schema the framework rejects outright is dropped with a log line naming it, and the
+rest of the set still works.
+
+Use `mlx-agent tools --mcp-config <json>` to inspect a tool surface without a model.
 
 ## Deliberately not built
 
@@ -251,6 +312,7 @@ a materially smaller number.
 
 ```
 mlx-agent fm-check
+python3 tools/fm_tools_smoke.py              <mlx-agent>
 python3 tools/acp_smoke.py                   <mlx-agent> --backend foundation
 python3 tools/acp_cancel_reprompt_smoke.py   <mlx-agent> --backend foundation 6
 python3 tools/acp_overflow_condense_smoke.py <mlx-agent> --backend foundation

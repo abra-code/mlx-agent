@@ -36,7 +36,7 @@
 #
 # Needs an MCP server exporting a tool the prompt will trigger. Verified against
 # llama-server 9553 + gpt-oss-20b-MXFP4, against gemma-4-12B-it-MLX-8bit on the MLX backend,
-# and the bundled mcp_server_time. Exit code = number of failed checks (0 = all good).
+# and mcp_server_time. Exit code = number of failed checks (0 = all good).
 #
 # --no-expect-thought: Gemma 4 with thinking off emits an EMPTY thought channel, so "some
 # reasoning was captured" is not a fair check there. It stays on by default because for

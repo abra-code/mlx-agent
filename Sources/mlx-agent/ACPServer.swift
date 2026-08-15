@@ -622,8 +622,10 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
 
     /// The foundation counterpart of buildSessionStack: no container and no server - the OS owns
-    /// the model. Same generation defaults and the same registry + mode re-application, though
-    /// the registry cannot reach the model yet (see FoundationBackend's `tools`).
+    /// the model. Same generation defaults and the same registry + mode re-application. Ordering
+    /// matters here in a way it does not for the other two: `Agent.init` installs the tool runner
+    /// this backend dispatches through, so it has to precede `setToolsEnabled` - which it does,
+    /// because the tool set cannot be built until both have arrived.
     private func buildFoundationStack(history: [Chat.Message]) -> (FoundationBackend, Agent) {
         let parameters = gen.apply(to: GenerateParameters(maxTokens: 4096, temperature: 0.7))
         let backend = FoundationBackend(

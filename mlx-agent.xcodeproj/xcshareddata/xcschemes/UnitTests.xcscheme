@@ -49,6 +49,20 @@
                ReferencedContainer = "container:mlx-agent.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "A0018F0AE90A5317771C6BB0"
+               BuildableName = "SchemaIRTests.xctest"
+               BlueprintName = "SchemaIRTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
@@ -97,6 +111,17 @@
                BlueprintIdentifier = "F5A2CDC32BB13C4E4EEA46B7"
                BuildableName = "AgentDigestTests.xctest"
                BlueprintName = "AgentDigestTests"
+               ReferencedContainer = "container:mlx-agent.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "A0018F0AE90A5317771C6BB0"
+               BuildableName = "SchemaIRTests.xctest"
+               BlueprintName = "SchemaIRTests"
                ReferencedContainer = "container:mlx-agent.xcodeproj">
             </BuildableReference>
          </TestableReference>

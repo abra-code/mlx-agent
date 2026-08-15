@@ -78,7 +78,7 @@ Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <
 | Selected by | `--model <dir>` (safetensors) | `--base-url <url>` | nothing - the model is the OS's |
 | Weights resident | yes, ours | yes, llama-server's | none of ours |
 | Context window | the model's, read from `config.json` | the server's, not visible from here | 4096 tokens |
-| Tool calling | yes | yes | **no** - agent mode degrades to chat |
+| Tool calling | yes | yes | yes, but definitions come out of the 4096 tokens - a handful of tools, not a registry |
 | Model switchable at runtime | yes (`session/set_config_option`) | no, the applet restarts the server | no, there is one |
 | Idle unload | yes, `--idle-unload-seconds` | llama-server does its own | nothing to unload |
 | RAM gate | yes | skipped | skipped |

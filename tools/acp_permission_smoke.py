@@ -24,6 +24,8 @@
 #   6. An optionId we never advertised denies. Fail-closed, not fail-open.
 #   7. A permission answer that arrives AFTER the session was replaced does not write a grant
 #      into the new session.
+#   8. Not a permission property, but this is the only harness that scripts a model turn against
+#      real MCP tools: an identical repeat call in one turn is short-circuited, not run twice.
 #
 # EVERY check asserts the tool's OUTCOME, not just the number of permission requests. Counting
 # requests alone cannot tell a standing ALLOW from a standing DENY: both are "no round-trip",
@@ -31,11 +33,15 @@
 # and a mutant that turned Always Allow into a silent deny passed all 12 checks.
 #
 # Usage: python3 tools/acp_permission_smoke.py /path/to/mlx-agent
-#        (needs PYTHONPATH/PYTHONPYCACHEPREFIX for the bundled python - see BUNDLE below)
-# Exit code = number of failed checks (0 = all good).
+#        (run from the repo root - it imports tools/acp_smoke.py by relative path)
+#        (needs an interpreter that can run `-m mcp_server_time` - see INTERPRETER below)
+# Exit code = number of failed checks (0 = all good). "Could not run at all" also exits 2, so
+# read stderr to tell that apart from two failures; either way it is not a pass.
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +64,20 @@ def tool_call_response(name, args):
     return sse([
         {"choices": [{"delta": {"tool_calls": [
             {"index": 0, "id": f"call_{name}", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}}]},
+            "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+         "usage": {"prompt_tokens": 10, "completion_tokens": 5}},
+    ])
+
+
+def dup_tool_call_response(name, args):
+    """One assistant turn emitting the SAME call twice - identical name and arguments."""
+    return sse([
+        {"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "id": f"call_{name}_a", "type": "function",
+             "function": {"name": name, "arguments": json.dumps(args)}},
+            {"index": 1, "id": f"call_{name}_b", "type": "function",
              "function": {"name": name, "arguments": json.dumps(args)}}]},
             "finish_reason": None}]},
         {"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
@@ -116,16 +136,72 @@ def main():
         sys.exit(2)
     agent_bin = sys.argv[1]
 
-    # BUNDLE: mcp_server_time lives in the applet's bundled python. PYTHONPATH makes it
-    # importable; PYTHONPYCACHEPREFIX keeps its bytecode OUT of the signed app bundle (the
-    # applet sets this itself at launch - a test harness spawning bundled python from a plain
-    # shell does not inherit it, and would leave __pycache__ inside the bundle).
-    bundle = os.path.expanduser("~/Development/AIChatApp/V2/AIChat.app")
-    py = f"{bundle}/Contents/Library/Python/bin/python3"
-    env = dict(os.environ)
-    env["PYTHONPATH"] = f"{bundle}/Contents/Library/Packages"
-    env.setdefault("PYTHONPYCACHEPREFIX", "/tmp/Pyc")
-    os.environ.update(env)
+    # INTERPRETER: any python that can run `-m mcp_server_time` (pip install mcp-server-time).
+    # This used to hardcode a path into a sibling app's bundled python, which was wrong twice
+    # over: mlx-agent is a standalone repo and must not take a private peer project as a test
+    # dependency, and the path baked in one machine's directory layout, so on any other machine
+    # every check failed on "no such file" rather than on anything about permissions.
+    #
+    # MLX_AGENT_SMOKE_PYTHON points at a different interpreter - a venv, or an app-bundled one
+    # that has the module. Set PYTHONPATH yourself if that interpreter needs it to find the
+    # module. PYTHONPYCACHEPREFIX is defaulted here because CPython writes __pycache__ next to
+    # each imported module's SOURCE, so a bundled interpreter's packages would collect bytecode
+    # inside a signed app bundle.
+    os.environ.setdefault(
+        "PYTHONPYCACHEPREFIX", os.path.join(tempfile.gettempdir(), "mlx-agent-pyc"))
+    # shutil.which, because the two launchers disagree: subprocess.run below searches PATH, but
+    # the agent spawns this command through Process.executableURL (MCPClients.launch), which does
+    # NOT. So `MLX_AGENT_SMOKE_PYTHON=python3` would pass the probe and then fail to launch, and
+    # a launch failure is only logged - the agent runs on with no servers and every check fails
+    # on "unknown tool". which() only SEARCHES when the value has no separator; anything with a
+    # "/" it merely validates (exists, executable, not a directory) and returns unchanged, so
+    # abspath follows it. The pair makes the probe test the exact string that gets spawned.
+    want = os.environ.get("MLX_AGENT_SMOKE_PYTHON") or sys.executable
+    found = shutil.which(want)
+    py = os.path.abspath(found) if found else ""  # guarded: abspath("") is the cwd
+    try:
+        if not py:
+            raise OSError(f"{want}: not an executable file, and not on PATH")
+        # find_spec, not import: the check has to reach `__main__` (the server is launched as
+        # `-m mcp_server_time`, so an importable package without one would pass a plain import
+        # of the package and then fail to spawn) - but IMPORTING `__main__` RUNS it, since it
+        # has no `if __name__` guard. The server then blocks on stdin for JSON-RPC that never
+        # comes, and the probe reports "cannot run" on a machine where it is installed and
+        # working. A broken dependency chain is still caught, though that is this package's
+        # doing rather than find_spec's: resolving the submodule imports the parent, whose
+        # __init__ imports .server at module scope, which pulls mcp and pydantic in with it.
+        # stdin is pinned closed for the same reason: whether that hang happens
+        # at all depends on what the caller's stdin is, which is how it stayed invisible here -
+        # a shell pipeline gives EOF and passes, a terminal hangs for the full timeout.
+        # sys.exit(str) prints to stderr and exits 1, so the "no __main__" case reports itself
+        # rather than being inferred from a silent status - which cannot be told apart from any
+        # other executable that exits non-zero without output (/usr/bin/false, a wrapper shim).
+        probe = subprocess.run(
+            [py, "-c", "import importlib.util as u, sys; "
+                       "sys.exit(0 if u.find_spec('mcp_server_time.__main__') else "
+                       "'importable, but it has no __main__, so `-m` cannot run it')"],
+            capture_output=True, stdin=subprocess.DEVNULL, timeout=60)
+        bad = probe.returncode
+        why = (probe.stderr or b"").decode(errors="replace").strip().splitlines()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # A nonexistent path raises rather than returning non-zero, and that is the likeliest
+        # way to misconfigure the override - so the instructions below must survive it.
+        bad, why = 1, [str(e)]
+    if bad:
+        # Every probe failure above names itself on stderr, so silence here means the thing being
+        # run is not the interpreter it claims to be: it exited non-zero, or died on a signal
+        # (which leaves no stderr either - the "Killed: 9" line comes from a shell, and there is
+        # none here; an app-bundled python killed for a bad signature is exactly the setup the
+        # comment above invites). Report the status rather than guessing at a cause.
+        if not why:
+            why = [f"exited with status {bad} and wrote nothing to stderr"]
+        # sys.exit, not return: main()'s return value is discarded at the bottom of this file,
+        # so returning a code would still exit 0 - a harness would read "cannot run" as "all
+        # checks passed", which is worse than the stale path this replaced.
+        print(f"{py or want} cannot run mcp_server_time; "
+              "pip install mcp-server-time, or set MLX_AGENT_SMOKE_PYTHON to an interpreter "
+              "that has it" + (f"\n  {why[-1]}" if why else ""), file=sys.stderr)
+        sys.exit(2)
 
     cfg = {"servers": [{
         "name": "time",
@@ -312,6 +388,32 @@ def main():
     seen, upd = prompt("time?", "get_current_time", TIME_ARGS, "allow")
     check("a stale answer does not grant into the NEW session", len(seen) == 1 and ran(upd),
           f"requests={len(seen)}")
+
+    # 8. The duplicate-call short-circuit. Not about permissions, but this is the only harness
+    # that scripts a model turn against REAL MCP tools (openai_wire_smoke.py scripts turns too,
+    # with no servers), and the guardrail is otherwise untested - it was rewritten
+    # when the dup cache moved out of runTurn into Agent state (Foundation Models dispatches
+    # tools concurrently, so a runTurn local could not hold it any more).
+    script.clear()
+    script.append(dup_tool_call_response("convert_time", CONVERT_ARGS))
+    script.append(text_response())
+    outputs = []
+
+    def on_dup(msg):
+        if msg.get("method") == "session/request_permission":
+            agent.reply(msg["id"], {"outcome": {"outcome": "selected", "optionId": "allow"}})
+        elif msg.get("method") == "session/update":
+            u = (msg.get("params") or {}).get("update") or {}
+            if u.get("sessionUpdate") == "tool_call_update" and u.get("status") == "completed":
+                outputs.append(u.get("rawOutput") or "")
+
+    r = agent.send("session/prompt",
+                   {"sessionId": sid, "prompt": [{"type": "text", "text": "convert twice"}]})
+    agent.await_response(r, on_update=on_dup, timeout=90)
+    shorted = [o for o in outputs if "duplicate call short-circuited" in o]
+    check("an identical repeat call is short-circuited, not run twice",
+          len(outputs) == 2 and len(shorted) == 1,
+          f"completed={len(outputs)} shortCircuited={len(shorted)}")
 
     agent.close()
     server.shutdown()

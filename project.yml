@@ -88,6 +88,16 @@ targets:
     sources:
       - Sources/AgentDigest
 
+  # JSON Schema -> a small typed IR, for bridging MCP tools into Foundation Models. Foundation-only
+  # for the sharpest version of the usual reason: the value of this code is entirely in what it
+  # does with schema constructs the framework cannot express, and those decisions are testable
+  # without an on-device model, without Metal, and on a machine that has neither.
+  SchemaIR:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/SchemaIR
+
   mlx-agent:
     type: tool
     platform: macOS
@@ -97,6 +107,7 @@ targets:
       - target: Chunking
       - target: AgentText
       - target: AgentDigest
+      - target: SchemaIR
       # mlx-swift-lm 3.x decoupled swift-transformers into an opt-in integration: the
       # MLXHuggingFace macros expand to code referencing Tokenizers, so the CONSUMER must
       # supply it. That is why swift-transformers is here though mlx-swift-lm does not
@@ -159,6 +170,17 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
 
+  SchemaIRTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/SchemaIRTests
+    dependencies:
+      - target: SchemaIR
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   # Ships the tool. This is what the applet's binary is built from.
   #
@@ -190,6 +212,7 @@ schemes:
         ChunkingTests: [test]
         AgentTextTests: [test]
         AgentDigestTests: [test]
+        SchemaIRTests: [test]
     test:
       config: Debug
       gatherCoverageData: false
@@ -197,3 +220,4 @@ schemes:
         - ChunkingTests
         - AgentTextTests
         - AgentDigestTests
+        - SchemaIRTests
