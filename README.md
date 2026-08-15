@@ -25,7 +25,7 @@ mlx-agent digest    [--backend mlx|openai|foundation] [--model <dir> | --base-ur
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
-mlx-agent fm-check  [--prompt <text>] [--digest <text>]
+mlx-agent fm-check  [--prompt <text>]
 mlx-agent --version
 ```
 
@@ -55,9 +55,10 @@ mlx-agent --version
 
 - **fm-check** - report whether Apple's on-device system model is usable on this machine:
   availability, context size, language support, and one real generation to prove a pass completes.
-  `--digest <text>` summarizes into the session-digest schema instead, which also proves guided
-  generation works. Loads no MLX model and reads no config, so it is safe on a machine with
-  nothing installed. Exit 0 only if a generation actually worked, plus a `RESULT_JSON:` line. See
+  Loads no MLX model and reads no config, so it is safe on a machine with nothing installed.
+  Exit 0 only if a generation actually worked, plus a `RESULT_JSON:` line. It is a cheap GATE and
+  does not prove GUIDED generation works; a caller that wants that follows it with
+  `mlx-agent digest --backend foundation`, which is the expensive half. See
   [`docs/foundation-models.md`](docs/foundation-models.md).
 
 - **--version** - print `mlx-agent <version>` and exit 0 (`-version` and a bare `version`

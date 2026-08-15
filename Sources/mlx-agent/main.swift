@@ -678,15 +678,16 @@ func usage() {
                                                           512-token prompt chunking; 2048 matches
                                                           mlx_lm's default, measured equal on M5)
           mlx-agent fm-check [--prompt <text>]            report whether Apple's on-device system
-                    [--digest <text>]                     model (Foundation Models, macOS 26+) is
+                                                          model (Foundation Models, macOS 26+) is
                                                           usable here: availability, context size,
                                                           language support, and one real generation
                                                           to prove a pass completes. Loads no MLX
                                                           model. Exit 0 only if generation worked;
                                                           prints a RESULT_JSON line for scripts.
-                                                          --digest summarizes the given text into
-                                                          the session-digest schema instead, which
-                                                          also proves guided generation works
+                                                          A cheap GATE: it does not prove guided
+                                                          generation works. Follow it with
+                                                          `mlx-agent digest --backend foundation`
+                                                          when a caller wants that too
           mlx-agent --version                             print "mlx-agent <version>" and exit 0
                                                           (loads no model, reads no config;
                                                           "-version" and bare "version" work too)
@@ -1133,19 +1134,22 @@ do {
     // model is usable on this machine, which is what an embedding app needs before deciding to
     // offer anything built on it.
     case "fm-check":
-        // A bare `--digest` with no value would otherwise fall through to the plain generation
-        // path and report success, which reads as "the digest schema works" when it was never
-        // exercised.
-        let digestSource = option("--digest", in: cliArgs)
-        if digestSource == nil, cliArgs.contains("--digest") {
+        // `--digest <text>` was removed in favor of `mlx-agent digest --backend foundation`.
+        // Refused rather than ignored, and this is not politeness: an unknown flag is silently
+        // dropped here, so a stale caller would get a PLAIN generation and exit 0 - reporting
+        // success for the guided-generation check it asked for and did not get. That is the same
+        // failure the removed flag's own bare-value guard existed to prevent.
+        if cliArgs.contains("--digest") {
             FileHandle.standardError.write(
-                Data("fm-check --digest requires the text to summarize\n".utf8))
+                Data(
+                    ("fm-check --digest was removed: it made this command a second, "
+                        + "Foundation-Models-only way to produce a digest. Run the check itself "
+                        + "instead - `mlx-agent fm-check && mlx-agent digest --backend foundation "
+                        + "--in <transcript.json> --keep-recent 2` - which proves the same thing "
+                        + "for any backend. See docs/foundation-models.md\n").utf8))
             exit(2)
         }
-        exit(
-            Int32(
-                await runFoundationCheck(
-                    prompt: option("--prompt", in: cliArgs), digestSource: digestSource)))
+        exit(Int32(await runFoundationCheck(prompt: option("--prompt", in: cliArgs))))
     case "bench":
         let code = try await runBench(
             model: requireModelDir(),

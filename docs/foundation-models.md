@@ -64,9 +64,8 @@ One is permanent, one is a settings toggle, one just needs a wait.
 Ask the question without running anything expensive:
 
 ```
-mlx-agent fm-check                    # availability, context size, languages, one real generation
-mlx-agent fm-check --prompt "..."     # use your own prompt for the live pass
-mlx-agent fm-check --digest "<text>"  # summarize instead: proves GUIDED generation works
+mlx-agent fm-check                 # availability, context size, languages, one real generation
+mlx-agent fm-check --prompt "..."  # use your own prompt for the live pass
 ```
 
 It reports two different things, and the distinction matters to a caller:
@@ -78,12 +77,64 @@ It reports two different things, and the distinction matters to a caller:
 Exit 0 only when a real generation completed, so `if mlx-agent fm-check >/dev/null; then` is a
 valid probe. A `RESULT_JSON:` line follows the `bench` convention for scripts.
 
-`--digest` is the stronger check. It exercises a custom `@Generable` schema, the permissive
-guardrails and the `.general` use case TOGETHER, which is the combination that actually breaks -
-each of those three has broken the pair before, and a plain generation succeeding proves none of
-it.
-
 Loads no MLX model and reads no config, so it is safe on a machine with no model installed.
+
+### The deeper check, when a caller wants it
+
+**`fm-check` is a gate, not a proof.** Its live pass is a plain `respond(to:)` with no schema, so
+it does not exercise the thing that actually breaks: a custom `@Generable` type, the permissive
+guardrails and the `.general` use case TOGETHER. Each of those three has broken the pair before,
+and a plain generation succeeding proves none of it.
+
+That check is a real summarization, which is expensive, so it is not folded into the gate - it is
+the second step, run only by a caller that wants it:
+
+```
+mlx-agent fm-check >/dev/null \
+  && mlx-agent digest --backend foundation --in probe.json --keep-recent 2
+```
+
+**Copy the probe below rather than shrinking it, and keep the `--keep-recent 2`.** `digest` takes a
+transcript, and the planner summarizes only what is OLDER than the verbatim tail - so a probe that
+leaves nothing older exits 3 without ever calling the model, which reads exactly like a failure and
+is not one. What decides it is not a message count but where the user turns fall: the tail boundary
+snaps BACKWARD to the nearest user turn, and if it reaches index 0 the whole transcript becomes the
+tail. All measured:
+
+- `[user, assistant, user, assistant]` with `--keep-recent 2` summarizes. This is the probe below.
+- `[user, assistant, assistant, assistant]` refuses - four messages, but the only user turn is
+  first, so the boundary drags to 0.
+- `[assistant, user, assistant]` summarizes, on three messages. There is no clean minimum to quote.
+- The same four-message probe with the DEFAULT `--keep-recent 6` refuses, because six messages of
+  tail is more than the file holds.
+
+Four alternating messages from a user turn, with `--keep-recent 2`, is the smallest shape that is
+reliably safe:
+
+```json
+[
+  { "role": "user",      "content": "The installer ships Friday and the codename is QUETZAL-9." },
+  { "role": "assistant", "content": "Noted: Friday, QUETZAL-9." },
+  { "role": "user",      "content": "What is left before then?" },
+  { "role": "assistant", "content": "Signing and notarization." }
+]
+```
+
+The two cases are distinguishable without guessing, in the `RESULT_JSON:` line on stderr:
+
+| | Exit | `ms` | `reason` |
+| --- | --- | --- | --- |
+| guided generation worked | 0 | the real elapsed time | absent |
+| the model was never asked | 3 | `0` | "nothing to summarize ...", or "too large to summarize ..." |
+| the model was asked and failed | 3 | the real elapsed time | "summarization failed ...", or "the summarizer returned an empty digest" |
+
+**`ms` is the reliable signal, not the wording.** It is measured across the condensation only, so a
+refusal the planner makes before calling anything reports 0 - branch on that, and treat `reason` as
+text for a human. Matching on a reason prefix would misread an empty digest (a real model failure)
+as a refusal.
+
+Measured on the probe above: 4.7 s for the guided pass, against 0 ms for the shapes that never
+reached the model.
 
 ## The window
 

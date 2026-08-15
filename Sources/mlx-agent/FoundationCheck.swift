@@ -13,8 +13,10 @@
 // The human-readable block is for a person at a terminal; the RESULT_JSON line is for scripts,
 // following the convention `bench` already established. Exit code is 0 only when a real
 // generation completed, so a shell can branch on `if mlx-agent fm-check >/dev/null; then`.
+//
+// It is a GATE, not a proof - see the doc comment on runFoundationCheck for what it deliberately
+// does not check, and what to run after it when a caller wants that.
 
-import AgentDigest
 import Foundation
 
 #if canImport(FoundationModels)
@@ -23,13 +25,27 @@ import Foundation
 
 /// Probe Foundation Models availability and, when available, run one small generation.
 ///
-/// - Parameter digestSource: when set, the live pass is a guided SUMMARIZATION of this text
-///   instead of a plain one-liner, and the typed digest is printed as JSON. That path exercises
-///   the schema, the guardrail setting and the use case together, which is the combination that
-///   actually breaks - a plain generation succeeding proves none of it.
+/// DELIBERATELY SHALLOW, and it is a gate rather than a proof. It answers "should this machine be
+/// able to use the on-device model", which is a settings, hardware and asset question plus one
+/// cheap generation. It does NOT prove that GUIDED generation works - the schema, the permissive
+/// guardrails and the `.general` use case together - which is the combination that actually breaks
+/// and the one this project depends on for summarizing.
+///
+/// That deeper check used to live here as `--digest <text>`, and it did not belong: it made this
+/// command a second, Foundation-Models-only way to produce a digest, at a moment when the whole
+/// point of `mlx-agent digest` was that summarizing is a capability of the AGENT. The two compose
+/// instead, so a caller pays for the expensive half only when it wants it:
+///
+///     mlx-agent fm-check >/dev/null \
+///       && mlx-agent digest --backend foundation --in probe.json --keep-recent 2
+///
+/// The `--keep-recent 2` is not decoration: the default is 6, and the planner summarizes only what
+/// is OLDER than the verbatim tail, so a small probe under the default has nothing older and exits
+/// 3 without ever calling the model - which reads exactly like a failure. See
+/// docs/foundation-models.md for the probe transcript to use and the shapes that refuse.
 ///
 /// Returns a process exit code: 0 usable, 1 not.
-func runFoundationCheck(prompt: String?, digestSource: String? = nil) async -> Int {
+func runFoundationCheck(prompt: String?) async -> Int {
     let status = FMAvailability.probe()
 
     print("Apple Foundation Models")
@@ -70,10 +86,6 @@ func runFoundationCheck(prompt: String?, digestSource: String? = nil) async -> I
         print("  languages:      \(codes.count) distinct")
         print("                  \(codes.joined(separator: " "))")
 
-        if let digestSource {
-            return await runDigestCheck(source: digestSource)
-        }
-
         // One real pass. Greedy so a repeat run of this check reads the same, which is what
         // makes it usable as a smoke test rather than a curiosity.
         let text =
@@ -108,61 +120,6 @@ func runFoundationCheck(prompt: String?, digestSource: String? = nil) async -> I
         return 1
     #endif
 }
-
-/// The summarization path: one guided generation over `source`, printed as a digest.
-///
-/// Manual only. There is nothing here a unit test can assert - the output is nondeterministic and
-/// depends on the machine's Apple Intelligence state - so what it proves is narrower and more
-/// useful: that a custom `@Generable` schema, permissive guardrails and the `.general` use case
-/// still work together on this OS build. Each of those three has broken the pair before.
-#if canImport(FoundationModels)
-    @available(macOS 26.0, *)
-    private func runDigestCheck(source: String) async -> Int {
-        let policy = FoundationBackend.defaultDigestPolicy()
-        let generator = FMDigestGenerator(
-            policy: policy, timeout: 120,
-            log: { FileHandle.standardError.write(Data("fm-check: \($0)\n".utf8)) })
-        let started = Date()
-        do {
-            let content = try await generator.digest(source: source, priorDigest: nil)
-            let elapsed = Date().timeIntervalSince(started)
-            // Checked BEFORE anything prints "ok". An empty digest is a FAILURE, not a small
-            // answer - the planner treats it that way, so this must too, or the check would bless
-            // a summarizer that summarizes nothing and the human-readable output would contradict
-            // its own exit code.
-            guard !content.isEmpty else {
-                print("  digest:         FAILED after \(String(format: "%.2f", elapsed)) s (empty)")
-                FileHandle.standardError.write(
-                    Data("fm-check: the model returned an empty digest\n".utf8))
-                emitResultJSON(
-                    available: false, detail: "empty digest", generated: nil, seconds: elapsed)
-                return 1
-            }
-            let digest = SessionDigest(
-                content: content,
-                sourceTurnCount: 1,
-                sourceSHA256: SessionDigest.sha256Hex(source),
-                generator: FMDigestGenerator.name,
-                createdAt: Date())
-            print("  digest:         ok in \(String(format: "%.2f", elapsed)) s")
-            print("")
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            if let data = try? encoder.encode(digest) {
-                print(String(decoding: data, as: UTF8.self))
-            }
-            emitResultJSON(available: true, detail: "ok", generated: nil, seconds: elapsed)
-            return 0
-        } catch {
-            let elapsed = Date().timeIntervalSince(started)
-            let message = fmUserFacingError(error)
-            print("  digest:         FAILED after \(String(format: "%.2f", elapsed)) s")
-            FileHandle.standardError.write(Data("fm-check: \(message)\n".utf8))
-            emitResultJSON(available: false, detail: message, generated: nil, seconds: elapsed)
-            return 1
-        }
-    }
-#endif
 
 /// Machine-readable one-liner, mirroring `bench`'s RESULT_JSON convention so the scripts that
 /// already scrape one output shape do not need a second one.
