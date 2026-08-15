@@ -32,8 +32,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    # arm64-only: mlx-agent is Metal/MLX and never runs on Intel (the universal OMC applet
-    # that embeds it is thinned at packaging time).
+    # arm64-only: mlx-agent is Metal/MLX and never runs on Intel (a host app that embeds it
+    # ships universal and is thinned at packaging time).
     ARCHS: arm64
     ONLY_ACTIVE_ARCH: YES
     SWIFT_STRICT_CONCURRENCY: complete
@@ -182,9 +182,9 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
 
 schemes:
-  # Ships the tool. This is what the applet's binary is built from.
+  # Ships the tool. This is what Cadabra's embedded binary is built from.
   #
-  # SHIPPING BUILDS ARE RELEASE. The embedding script (AIChatApp/update-cadabra.sh) passes
+  # SHIPPING BUILDS ARE RELEASE. Cadabra's embedding script (`update-cadabra.sh`) passes
   # `-configuration Release` explicitly, so it does not depend on the per-action configs
   # below - but profile and archive are Release here too, so measuring or exporting from
   # Xcode reflects what actually ships (-O, wholemodule) rather than an -Onone build.

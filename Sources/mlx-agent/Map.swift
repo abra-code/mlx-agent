@@ -908,7 +908,7 @@ private final class OpenAIMapEngine: MapEngine, @unchecked Sendable {
         // Same health gate the acp/oneshot openai path uses, but with a LONG patience window:
         // llama-server answers /health 503 for the whole time it is loading its gguf, which for a
         // 20 GB model is minutes, and the map broker is exactly the component whose job is to sit
-        // in state "loading" until the server is ready (the applet spawns both and does not wait
+        // in state "loading" until the server is ready (the host app spawns both and does not wait
         // itself). 120 attempts x ~2.5 s covers ~5 minutes; a genuinely absent server still fails
         // with the same clean startup error. acp keeps the short default - an interactive
         // session/new should not hang for minutes.
@@ -920,7 +920,7 @@ private final class OpenAIMapEngine: MapEngine, @unchecked Sendable {
     func reloadIfNeeded() async throws {}          // nothing to reload here
     func idleUnload(afterIdle seconds: TimeInterval, log: (String) -> Void) {}  // server idles itself
 
-    /// Best-effort model name for the ready status; the applet owns which gguf is loaded, so a
+    /// Best-effort model name for the ready status; the host app owns which gguf is loaded, so a
     /// failure just leaves the generic "llama-server" label. A short per-request timeout (not the
     /// session's 300s SSE-idle timeout) so a slow/hung /models can never delay "ready" - health is
     /// already confirmed by the time we get here.

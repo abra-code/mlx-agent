@@ -990,7 +990,7 @@ func requireModelDir() -> String {
 /// Resolve `--backend mlx|openai|foundation` (default mlx) into the engine acp/oneshot run.
 /// The model directory is required ONLY by the mlx path - resolving the engine before
 /// asking for it is what lets `--backend openai` run with no --model at all (its weights
-/// live in llama-server, which the applet owns).
+/// live in llama-server, which the host app owns).
 func resolveEngine(_ args: [String]) -> EngineSpec {
     switch option("--backend", in: args)?.lowercased() ?? "mlx" {
     case "mlx":

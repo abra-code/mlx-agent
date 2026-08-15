@@ -183,7 +183,7 @@ def reload_failure_recovery(agent_bin, real_model):
     import tempfile
     import shutil
     # A REAL directory of file-level symlinks into the model. mlx-swift-lm mis-maps a symlinked
-    # model DIRECTORY (the applet resolves it with `pwd -P`), but a real dir whose entries are
+    # model DIRECTORY (the host app resolves it with `pwd -P`), but a real dir whose entries are
     # file symlinks loads fine - and lets us break just config.json to make a reload fast-fail.
     shadow = tempfile.mkdtemp(prefix="mlx-idle-shadow-")
     for name in os.listdir(real_model):

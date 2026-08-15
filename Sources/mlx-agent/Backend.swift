@@ -460,7 +460,7 @@ final class URLTaskHandle: @unchecked Sendable {
 
 /// Remote backend speaking the OpenAI `/chat/completions` streaming API, as served by
 /// llama-server (`--jinja`, so tool calls are grammar-constrained and arrive as streaming
-/// tool-call deltas). The applet owns the server process; this class only talks to it.
+/// tool-call deltas). The host app owns the server process; this class only talks to it.
 ///
 /// State the MLX path keeps in its KV cache, this class keeps explicitly:
 /// `messages` is the running conversation, and every turn re-POSTs it in full (the server
@@ -867,7 +867,7 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
     ///
     /// A pass that produced NO content leaves nothing for `flushAbandonedTextLocked` to
     /// flush, so the conversation can genuinely hold two user turns in a row: the server
-    /// refused the connection (the applet restarting llama-server to switch models is
+    /// refused the connection (the host app restarting llama-server to switch models is
     /// exactly this), Stop landed during prefill before the first token, or a text-less
     /// tool-call announcement hit the iteration cap and lost its message to the strip above.
     /// All three are ordinary, and all three produce a role sequence a strict template

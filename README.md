@@ -79,7 +79,7 @@ Guardrails (`acp` and `oneshot`): `--max-tool-iters <n>` (10), `--tool-timeout <
 | Weights resident | yes, ours | yes, llama-server's | none of ours |
 | Context window | the model's, read from `config.json` | the server's, not visible from here | 4096 tokens |
 | Tool calling | yes | yes | yes, but definitions come out of the 4096 tokens - a handful of tools, not a registry |
-| Model switchable at runtime | yes (`session/set_config_option`) | no, the applet restarts the server | no, there is one |
+| Model switchable at runtime | yes (`session/set_config_option`) | no, restart the server to change models | no, there is one |
 | Idle unload | yes, `--idle-unload-seconds` | llama-server does its own | nothing to unload |
 | RAM gate | yes | skipped | skipped |
 | Modes | `acp` `oneshot` `map` `digest` | `acp` `oneshot` `map` `digest` | `acp` `oneshot` `digest` |
@@ -343,7 +343,7 @@ macros (otherwise xcodebuild blocks on a validation prompt). The binary lands at
 
 Shipping builds are **Release** (`-O`, whole-module): swap `-configuration Release` into
 the command above and the product lands in `build/Build/Products/Release` instead. That is
-what `AIChatApp/update-cadabra.sh` builds and embeds in the app - Debug is for iterating
+what Cadabra's `update-cadabra.sh` builds and embeds - Debug is for iterating
 here, and is what the scheme's run/test actions still use.
 
 Run:

@@ -28,7 +28,6 @@
 //
 // Every other stack that meets Gemma 4 has had to special-case this the same way: vLLM
 // (`vllm/reasoning/gemma4_utils`), llama.cpp (the `peg-gemma4` parser), Ollama, LM Studio.
-// See Private/commit-notes-gemma4-thought-channel.md.
 
 import Foundation
 

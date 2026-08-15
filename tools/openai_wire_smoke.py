@@ -229,7 +229,7 @@ def main():
             agent3.close()
 
         # A turn that fails BEFORE producing a single token (the server 500s mid-session -
-        # what an applet-driven llama-server restart looks like) leaves nothing to flush, so
+        # what a host-app-driven llama-server restart looks like) leaves nothing to flush, so
         # only user-turn normalization keeps the next request well-formed.
         requests_seen.clear()
         script.append(error_response())

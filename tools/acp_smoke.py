@@ -112,7 +112,7 @@ def main():
     # Neither backend advertises anything in configOptions (see ACPServer.configOptionsJSON), so
     # that expectation no longer varies. This flag remains for the one place the backends really
     # do differ: the openai backend REFUSES a model switch outright (check 11), because there the
-    # applet owns llama-server, whereas the MLX path can still switch on the wire.
+    # host app owns llama-server, whereas the MLX path can still switch on the wire.
     openai = "openai" in passthrough
     agent = Agent(argv)
     fails = 0
@@ -303,8 +303,9 @@ def main():
         agent.send("session/cancel", {"sessionId": sid}, notify=True)
         agent.await_response(prompt_id, timeout=60)  # drain the turn before moving on
 
-        # 11. The model is applet-managed on the openai backend: llama-server is restarted
-        # by the applet, so a model switch here must be refused, not silently accepted.
+        # 11. The model belongs to whoever runs llama-server on the openai backend, and it
+        # changes by restarting the server - so a model switch here must be refused, not
+        # silently accepted.
         if openai:
             rid = agent.send("session/set_config_option",
                              {"sessionId": sid, "configId": "model", "value": "anything"})

@@ -38,7 +38,7 @@ import MLXHuggingFace
 
 /// Which engine generates. Chosen once at launch (`--backend`), never at runtime: they have
 /// different lifecycles - the MLX path loads a model container into this process and can switch
-/// models on the fly, the openai path talks to a server the APPLET owns (it launches, restarts
+/// models on the fly, the openai path talks to a server the HOST APP owns (it launches, restarts
 /// and reaps llama-server), and the foundation path uses the OS's own resident model, which has
 /// no model to choose at all.
 enum EngineSpec: Sendable {
@@ -88,7 +88,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         if case .foundation = engine { return true }
         return false
     }
-    /// MLX path only; "" on the openai backend (the applet decides what llama-server serves).
+    /// MLX path only; "" on the openai backend (the host app decides what llama-server serves).
     private var currentModelDir: String
     private let mcpConfigPath: String?
     private let guardrails: AgentGuardrails
@@ -241,7 +241,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         case .mlx(let modelDir):
             self.currentModelDir = modelDir
         case .openai, .foundation:
-            // The applet decides what llama-server serves, and the OS decides what the system
+            // The host app decides what llama-server serves, and the OS decides what the system
             // model is; there is no model dir on either side.
             self.currentModelDir = ""
         }
@@ -508,7 +508,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         respond(id, ["sessionId": sid, "configOptions": configOptionsJSON()])
     }
 
-    /// openai: nothing to load - the applet already launched llama-server on a pinned port.
+    /// openai: nothing to load - the host app already launched llama-server on a pinned port.
     /// Health-check it so a dead server is ONE clean error here rather than a failure on
     /// every prompt, then build the registry + stack exactly as the MLX path does.
     private func handleNewSessionOpenAI(id: Int?, baseURL: URL) async {
@@ -863,18 +863,20 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 respondError(id, -32003, blocker)
                 return
             }
-            // The applet owns llama-server, so it restarts the server to change models and
+            // The host app owns llama-server, so it restarts the server to change models and
             // deliberately does NOT re-inject the transport - the conversation array here
             // survives, which IS the desired continue-with-a-new-model semantics. Nothing
             // for us to switch, and silently succeeding would be a lie.
             if !isMLXEngine {
                 // Silently succeeding would be a lie on either engine, for different reasons:
-                // the applet restarts llama-server to change models, and the foundation backend
-                // has exactly one model, which belongs to the OS.
+                // llama-server is restarted to change models (by the host app, or by whoever
+                // launched it), and the foundation backend has exactly one model, which belongs
+                // to the OS.
                 let why =
                     isFoundationEngine
                     ? "the foundation backend has a single OS-provided model"
-                    : "model is applet-managed on the openai backend"
+                    : "the openai backend's model is whatever llama-server was launched with; "
+                        + "restart the server to change it"
                 respondError(id, -32601, why)
                 return
             }
@@ -1779,23 +1781,23 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // NO model picker, on ANY backend - so no client renders one, and session/new's
         // configOptions is always empty.
         //
-        // The openai backend never had one: the applet picks the gguf and restarts llama-server
+        // The openai backend never had one: the host app picks the gguf and restarts llama-server
         // itself, so a picker here would be a dead control. The MLX backend DID advertise one,
         // and that is what this removes. It produced a picker under the composer in MLX windows
         // and nothing in llama-server windows - an asymmetry that was the visible half of a real
-        // problem: choosing a model there went straight to set_config_option and the APPLET
-        // never saw it. The applet owns the window title, the model label, the RAM advisory and
+        // problem: choosing a model there went straight to set_config_option and the HOST APP
+        // never saw it. The host app owns the window title, the model label, the RAM advisory and
         // the history stamping, so an agent-side switch left all of them describing a model that
         // was no longer loaded.
         //
-        // Model choice belongs to the applet's picker, which is the only place that knows about
+        // Model choice belongs to the host app's picker, which is the only place that knows about
         // both engines, the tools choice that goes with a model, RAM headroom, and the window's
         // identity. Same reasoning that retired the mode picker: a live control for something the
-        // applet owns can only disagree with it.
+        // host app owns can only disagree with it.
         //
         // The MECHANISM stays: session/set_config_option "model" still switches the model (see
         // handleSetConfigOption), and --model still works. Only the advertisement is gone, which
-        // is what the applet's picker will drive for an in-place MLX switch.
+        // is what the host app's picker will drive for an in-place MLX switch.
         //
         // NO chat/agent mode picker. It is deliberately not advertised, so no client renders
         // it: whether a session is agentic is decided ONCE, before the agent is spawned, by

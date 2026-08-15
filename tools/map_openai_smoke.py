@@ -7,7 +7,7 @@
 # via /tokenize then /completion) collects a per-chunk record, and a stop file cancels a job
 # mid-generation - all through job.json in, status.json/result.txt/results.jsonl out.
 #
-# The llama-server is assumed to be launched separately (the applet owns it in production); pass its
+# The llama-server is assumed to be launched separately (the host app owns it in production); pass its
 # OpenAI-compatible base-url. Use a SMALL model - the checks only assert protocol behavior, not
 # translation quality.
 #

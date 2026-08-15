@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, "tools")
 from acp_smoke import Agent
 
-PORT = 8399  # deliberately not 8099: the applet's llama-server owns that one
+PORT = 8399  # deliberately not 8099: the host app's llama-server owns that one
 script = []  # queued SSE responses, one per /chat/completions call
 
 
