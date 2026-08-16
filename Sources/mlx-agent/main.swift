@@ -677,17 +677,27 @@ func usage() {
                                                           --prefill-step overrides the library's
                                                           512-token prompt chunking; 2048 matches
                                                           mlx_lm's default, measured equal on M5)
-          mlx-agent fm-check [--prompt <text>]            report whether Apple's on-device system
+          mlx-agent fm-check [--test-prompt [<text>]]     report whether Apple's on-device system
                                                           model (Foundation Models, macOS 26+) is
-                                                          usable here: availability, context size,
-                                                          language support, and one real generation
-                                                          to prove a pass completes. Loads no MLX
-                                                          model. Exit 0 only if generation worked;
-                                                          prints a RESULT_JSON line for scripts.
-                                                          A cheap GATE: it does not prove guided
-                                                          generation works. Follow it with
-                                                          `mlx-agent digest --backend foundation`
-                                                          when a caller wants that too
+                                                          usable here: availability, context size
+                                                          and language support. Loads no MLX model.
+                                                          Prints a RESULT_JSON line for scripts,
+                                                          whose `reason` is a stable code to branch
+                                                          on (`detail` is prose for a person).
+                                                          Bare, it does NOT generate - the cheap
+                                                          answer (~0.05s), for gating a menu.
+                                                          --test-prompt adds one real generation,
+                                                          the only way to catch a model that
+                                                          reports ready and fails on first use;
+                                                          give it text, or leave it bare to use the
+                                                          built-in probe. Exit 0 = usable, meaning
+                                                          availability said yes, or - with
+                                                          --test-prompt - that a generation
+                                                          completed.
+                                                          A cheap GATE either way: it does not
+                                                          prove guided generation works. Follow it
+                                                          with `mlx-agent digest --backend
+                                                          foundation` when a caller wants that too
           mlx-agent --version                             print "mlx-agent <version>" and exit 0
                                                           (loads no model, reads no config;
                                                           "-version" and bare "version" work too)
@@ -1134,22 +1144,15 @@ do {
     // model is usable on this machine, which is what an embedding app needs before deciding to
     // offer anything built on it.
     case "fm-check":
-        // `--digest <text>` was removed in favor of `mlx-agent digest --backend foundation`.
-        // Refused rather than ignored, and this is not politeness: an unknown flag is silently
-        // dropped here, so a stale caller would get a PLAIN generation and exit 0 - reporting
-        // success for the guided-generation check it asked for and did not get. That is the same
-        // failure the removed flag's own bare-value guard existed to prevent.
-        if cliArgs.contains("--digest") {
-            FileHandle.standardError.write(
-                Data(
-                    ("fm-check --digest was removed: it made this command a second, "
-                        + "Foundation-Models-only way to produce a digest. Run the check itself "
-                        + "instead - `mlx-agent fm-check && mlx-agent digest --backend foundation "
-                        + "--in <transcript.json> --keep-recent 2` - which proves the same thing "
-                        + "for any backend. See docs/foundation-models.md\n").utf8))
-            exit(2)
-        }
-        exit(Int32(await runFoundationCheck(prompt: option("--prompt", in: cliArgs))))
+        // PRESENCE of --test-prompt selects the mode; its VALUE only supplies the text. Split
+        // that way so `--test-prompt` with nothing after it still runs the pass, using the
+        // built-in probe text - `option` returns nil for a trailing flag, so keying the mode off
+        // the value would make `fm-check --test-prompt` silently skip the generation it asked for.
+        exit(
+            Int32(
+                await runFoundationCheck(
+                    prompt: option("--test-prompt", in: cliArgs),
+                    livePass: cliArgs.contains("--test-prompt"))))
     case "bench":
         let code = try await runBench(
             model: requireModelDir(),

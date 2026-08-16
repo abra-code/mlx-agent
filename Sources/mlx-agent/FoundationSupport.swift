@@ -30,9 +30,36 @@ import Foundation
 /// Whether the on-device system language model can be used right now, and why not if it cannot.
 enum FMAvailability {
 
-    /// The outcome of `probe()`. `unavailable` carries a description of the situation and a
-    /// separate sentence saying what the user can do about it - callers print both, and the
-    /// split keeps the actionable half from being lost when a caller wants a one-line summary.
+    /// A stable, machine-readable name for the situation.
+    ///
+    /// The prose in `summary` is written for a person to read and is expected to be reworded;
+    /// a host app deciding whether to OFFER this engine, and what to say instead, has to branch
+    /// on something that is not. These raw values are the contract - keep them stable, add rather
+    /// than rename. `mlx-agent fm-check` reports one in its `RESULT_JSON` line.
+    ///
+    /// The distinction the codes exist to preserve is that the situations need different UI:
+    /// `deviceNotEligible` and `osTooOld` are permanent, `appleIntelligenceOff` is one settings
+    /// toggle away, and `modelNotReady` just needs a wait. Collapsing them into "unavailable"
+    /// leaves a caller unable to tell "never" from "not yet".
+    enum Code: String {
+        case available
+        case osTooOld
+        case notBuilt
+        case deviceNotEligible
+        case appleIntelligenceOff
+        case modelNotReady
+        /// A reason the framework added after this was written.
+        case unknown
+        /// Availability said yes and a real generation still failed. Never returned by `probe()`,
+        /// which does not generate - it is here so that a caller reading `fm-check` output has one
+        /// closed vocabulary to switch over rather than a code plus a special case.
+        case generationFailed
+    }
+
+    /// The outcome of `probe()`. `unavailable` carries a description of the situation, a separate
+    /// sentence saying what the user can do about it, and a stable code to branch on - callers
+    /// print both strings, and the split keeps the actionable half from being lost when a caller
+    /// wants a one-line summary.
     enum Status: Equatable {
         /// The framework is present and the model is ready to serve requests.
         case available
@@ -41,9 +68,19 @@ enum FMAvailability {
         /// Built against an SDK with no FoundationModels module, so the support is not compiled in.
         case notBuilt
         /// The framework is here but the model is not usable. See `FMAvailability.reasonText`.
-        case unavailable(reason: String, actionable: String)
+        case unavailable(reason: String, actionable: String, code: Code)
 
         var isAvailable: Bool { self == .available }
+
+        /// The machine-readable half of this status. See `Code`.
+        var code: Code {
+            switch self {
+            case .available: return .available
+            case .osTooOld: return .osTooOld
+            case .notBuilt: return .notBuilt
+            case .unavailable(_, _, let code): return code
+            }
+        }
 
         /// One line for logs and error payloads: reason and remedy joined, or a bare description.
         var summary: String {
@@ -56,7 +93,7 @@ enum FMAvailability {
             case .notBuilt:
                 return
                     "this build has no Foundation Models support (compiled against an SDK without the framework)"
-            case .unavailable(let reason, let actionable):
+            case .unavailable(let reason, let actionable, _):
                 return "\(reason); \(actionable)"
             }
         }
@@ -70,14 +107,15 @@ enum FMAvailability {
             case .available:
                 return .available
             case .unavailable(let reason):
-                let (what, todo) = reasonText(reason)
-                return .unavailable(reason: what, actionable: todo)
+                let (what, todo, code) = reasonText(reason)
+                return .unavailable(reason: what, actionable: todo, code: code)
             @unknown default:
                 // A reason added after this was written. Report it as unavailable rather than
                 // guessing it is fine: an optimistic default here fails later and less clearly.
                 return .unavailable(
                     reason: "the on-device model is unavailable for an unrecognized reason",
-                    actionable: "check Apple Intelligence in System Settings")
+                    actionable: "check Apple Intelligence in System Settings",
+                    code: .unknown)
             }
         #else
             return .notBuilt
@@ -105,27 +143,31 @@ enum FMAvailability {
         @available(macOS 26.0, *)
         private static func reasonText(
             _ reason: SystemLanguageModel.Availability.UnavailableReason
-        ) -> (String, String) {
+        ) -> (String, String, Code) {
             switch reason {
             case .deviceNotEligible:
                 return (
                     "this Mac is not eligible for Apple Intelligence",
-                    "the on-device model cannot be enabled on this hardware"
+                    "the on-device model cannot be enabled on this hardware",
+                    .deviceNotEligible
                 )
             case .appleIntelligenceNotEnabled:
                 return (
                     "Apple Intelligence is switched off",
-                    "turn it on in System Settings > Apple Intelligence & Siri, then retry"
+                    "turn it on in System Settings > Apple Intelligence & Siri, then retry",
+                    .appleIntelligenceOff
                 )
             case .modelNotReady:
                 return (
                     "the model assets are not downloaded yet",
-                    "leave the Mac on power and network for a while, then retry"
+                    "leave the Mac on power and network for a while, then retry",
+                    .modelNotReady
                 )
             @unknown default:
                 return (
                     "the on-device model is unavailable for an unrecognized reason",
-                    "check Apple Intelligence in System Settings"
+                    "check Apple Intelligence in System Settings",
+                    .unknown
                 )
             }
         }

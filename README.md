@@ -25,7 +25,7 @@ mlx-agent digest    [--backend mlx|openai|foundation] [--model <dir> | --base-ur
 mlx-agent gate      [--model <dir>]
 mlx-agent bench     --model <dir> [--prompt-tokens <n>] [--gen-tokens <n>] [--runs <n>]
                     [--prefill-step <n>]
-mlx-agent fm-check  [--prompt <text>]
+mlx-agent fm-check  [--test-prompt [<text>]]
 mlx-agent --version
 ```
 
@@ -54,12 +54,15 @@ mlx-agent --version
   (e.g. a build).
 
 - **fm-check** - report whether Apple's on-device system model is usable on this machine:
-  availability, context size, language support, and one real generation to prove a pass completes.
-  Loads no MLX model and reads no config, so it is safe on a machine with nothing installed.
-  Exit 0 only if a generation actually worked, plus a `RESULT_JSON:` line. It is a cheap GATE and
-  does not prove GUIDED generation works; a caller that wants that follows it with
-  `mlx-agent digest --backend foundation`, which is the expensive half. See
-  [`docs/foundation-models.md`](docs/foundation-models.md).
+  availability, context size and language support. Loads no MLX model and reads no config, so it
+  is safe on a machine with nothing installed. Bare, it does NOT generate - that is the cheap
+  answer (~0.05s), for gating a menu. `--test-prompt` adds one real generation, which is the only
+  way to catch a model that reports ready and fails on first use; give it text, or leave it bare
+  for the built-in probe. Exit 0 means usable, worth what the mode is worth. The `RESULT_JSON:`
+  line carries a stable `reason` code to branch on and a `probe` field saying which question was
+  answered. It is a cheap GATE either way and does not prove GUIDED generation works; a caller
+  that wants that follows it with `mlx-agent digest --backend foundation`, which is the expensive
+  half. See [`docs/foundation-models.md`](docs/foundation-models.md).
 
 - **--version** - print `mlx-agent <version>` and exit 0 (`-version` and a bare `version`
   are accepted too). Loads no model and reads no config, so it doubles as a liveness probe

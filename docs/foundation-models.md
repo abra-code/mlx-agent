@@ -64,27 +64,80 @@ One is permanent, one is a settings toggle, one just needs a wait.
 Ask the question without running anything expensive:
 
 ```
-mlx-agent fm-check                 # availability, context size, languages, one real generation
-mlx-agent fm-check --prompt "..."  # use your own prompt for the live pass
+mlx-agent fm-check                      # availability, context size, languages. No generation.
+mlx-agent fm-check --test-prompt        # ...and one real generation, with the built-in probe text
+mlx-agent fm-check --test-prompt "..."  # ...with your own probe text
 ```
 
-It reports two different things, and the distinction matters to a caller:
+It reports two different things, and `--test-prompt` chooses between them rather than merely
+decorating one:
 
-- **availability** - a settings, hardware and asset fact, obtained without inference.
+- **availability** - a settings, hardware and asset fact, obtained without inference. This is the
+  bare command. ~0.05 s, so it is cheap enough to sit on a UI path that asks it every time a menu
+  opens.
 - **a live pass** - proof that a generation actually completes. Availability alone does not
-  guarantee it: assets can report ready and still fail on first use.
+  guarantee it: assets can report ready and still fail on first use. ~0.3 s, because it is a real
+  generation.
 
-Exit 0 only when a real generation completed, so `if mlx-agent fm-check >/dev/null; then` is a
-valid probe. A `RESULT_JSON:` line follows the `bench` convention for scripts.
+**The cheap answer is the default because it is the question with an impatient caller.** A caller
+that wants proof is by definition willing to wait for it, so the expensive mode is the explicit
+one. Passing `--test-prompt` with no text after it still generates, using the built-in probe -
+which is greedy-sampled, so repeat runs read identically and it works as a smoke test.
+
+The name says what the text is FOR: it is a fixture chosen to prove a pass completes, not a
+question whose answer anyone consumes. `--prompt` means the opposite elsewhere in this CLI - in
+`oneshot` and `chat` it is the actual work - and reusing that spelling for a probe was a collision
+worth one extra word.
+
+Exit 0 means "usable", and what that is worth follows the mode: bare, that availability said yes;
+with `--test-prompt`, that a generation completed. `if mlx-agent fm-check >/dev/null; then` is a
+valid gate either way. A `RESULT_JSON:` line follows the `bench` convention for scripts.
 
 Loads no MLX model and reads no config, so it is safe on a machine with no model installed.
 
+#### Branch on `reason`, show `detail`
+
+```
+mlx-agent fm-check
+RESULT_JSON: {"available":true,"detail":"not generated (no --test-prompt)","probe":"availability","reason":"available"}
+
+mlx-agent fm-check --test-prompt
+RESULT_JSON: {"available":true,"detail":"ok","generated":"...","ms":574,"probe":"generation","reason":"available"}
+```
+
+`probe` says which question was answered: `availability` or `generation`. It exists because
+`reason` cannot say - `available` is emitted either way, so a consumer holding only this line (a
+log, a telemetry record, anything that did not choose the argv) would otherwise read a bare
+availability check as proof of a completed pass. `ms` and `generated` are absent without a
+generation, but inferring from a missing key is exactly what this contract asks callers not to do.
+
+`detail` is prose for a person and gets reworded; `reason` is a stable code and is the contract.
+An app that decides whether to OFFER this engine needs to tell "never" from "not yet", which
+`available: false` alone cannot say:
+
+| `reason` | Means | What a caller should do |
+| --- | --- | --- |
+| `available` | usable; a generation completed too, if `--test-prompt` was given | offer it |
+| `appleIntelligenceOff` | the one recoverable case | offer it, and point at System Settings |
+| `modelNotReady` | assets still downloading | offer it, and say to retry shortly |
+| `deviceNotEligible` | this hardware never will be | do not offer it |
+| `osTooOld` | macOS < 26 | do not offer it |
+| `notBuilt` | built against an SDK without the framework | do not offer it |
+| `generationFailed` | availability said yes, the pass still failed | treat as unusable; `detail` says why |
+| `unknown` | a reason added after this was written | unusable now, but do not report it as permanent |
+
+`generationFailed` is the reason `--test-prompt` exists at all: every other code is answerable
+without generating, and availability can report ready while the first generation still fails. It
+is therefore the one code the bare command can never return - if you need to rule that case out,
+you have to generate. Codes are added rather than renamed, so treat an unrecognized one as
+"unusable for now" rather than hiding the feature.
+
 ### The deeper check, when a caller wants it
 
-**`fm-check` is a gate, not a proof.** Its live pass is a plain `respond(to:)` with no schema, so
-it does not exercise the thing that actually breaks: a custom `@Generable` type, the permissive
-guardrails and the `.general` use case TOGETHER. Each of those three has broken the pair before,
-and a plain generation succeeding proves none of it.
+**`fm-check` is a gate, not a proof - even with `--test-prompt`.** Its live pass is a plain
+`respond(to:)` with no schema, so it does not exercise the thing that actually breaks: a custom
+`@Generable` type, the permissive guardrails and the `.general` use case TOGETHER. Each of those
+three has broken the pair before, and a plain generation succeeding proves none of it.
 
 That check is a real summarization, which is expensive, so it is not folded into the gate - it is
 the second step, run only by a caller that wants it:
@@ -93,6 +146,10 @@ the second step, run only by a caller that wants it:
 mlx-agent fm-check >/dev/null \
   && mlx-agent digest --backend foundation --in probe.json --keep-recent 2
 ```
+
+**Note the gate is bare here.** `digest` performs a real generation, and a guided one, so adding
+`--test-prompt` to the line above would pay for a plain generation to decide whether to run a
+stronger one immediately after. The cheap gate is the right half of this pair.
 
 **Copy the probe below rather than shrinking it, and keep the `--keep-recent 2`.** `digest` takes a
 transcript, and the planner summarizes only what is OLDER than the verbatim tail - so a probe that
@@ -302,16 +359,34 @@ measured, with an innocuous paragraph coming back as `guardrailViolation`. A sum
 declines the user's own conversation is useless, and summarizing is a transformation of text the
 user already has rather than generation of new content.
 
-Language support is smaller than people assume, and a prompt in an absent language fails outright
-with `unsupportedLanguageOrLocale` rather than degrading. `fm-check` prints both the locale count
-and the distinct language codes, because `supportedLanguages` holds LOCALES (`en-AU`, `en-GB`,
-`en-US`; `zh-Hans-CN`, `zh-Hant-HK`, `zh-Hant-TW`), so reducing it to primary language codes gives
-a materially smaller number.
+Language support is smaller than people assume. `fm-check` prints both the locale count and the
+distinct language codes, because `supportedLanguages` holds LOCALES (`en-AU`, `en-GB`, `en-US`;
+`zh-Hans-CN`, `zh-Hant-HK`, `zh-Hant-TW`), so reducing it to primary language codes gives a
+materially smaller number - 15 on this machine: `da de en es fr it ja ko nb nl pt sv tr vi zh`.
+
+**An absent language DEGRADES; it does not fail cleanly.** Do not expect
+`unsupportedLanguageOrLocale` to protect you - measured with Polish, which is not in the set
+above, no prompt produced that error. What happens instead is one of three things, and which one
+you get is not stable:
+
+| Prompt (Polish) | Result |
+| --- | --- |
+| "Ile to jest dwa plus dwa?" | answered correctly, but **in English**: "Two plus two equals four." |
+| "Mow po polsku. Co to jest pi?" | answered in Polish, fluent-looking and **factually nonsense** ("the proportion between the radius and the diameter of a square angle in a square circle") |
+| "Powiedz mi dowcip o pi", "Napisz jedno zdanie o kotach" | began generating Polish, then died mid-stream with `guardrailViolation` |
+
+The third is the trap, because it arrives as a SAFETY refusal for a request that is plainly
+benign - "tell me a joke about pi". The output guardrail is itself a classifier, and low-quality
+text in a language it does not cover appears to trip it. The same prompts in English and German
+(both supported) answer normally, so it is the language rather than the content.
+
+Ask the model whether it speaks a language and it will say yes. `supportedLanguages` is the
+authority; the model's self-report is not.
 
 ## Verify
 
 ```
-mlx-agent fm-check
+mlx-agent fm-check --test-prompt
 python3 tools/fm_tools_smoke.py              <mlx-agent>
 python3 tools/acp_smoke.py                   <mlx-agent> --backend foundation
 python3 tools/acp_cancel_reprompt_smoke.py   <mlx-agent> --backend foundation 6
