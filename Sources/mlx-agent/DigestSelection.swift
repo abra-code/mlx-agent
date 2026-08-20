@@ -24,7 +24,15 @@ import Foundation
 /// compiled at all. `FMDigestGenerator.name` is this constant.
 let foundationSummarizerName = "apple-foundation-models"
 
-/// Which model summarizes at prime time. `--digest-backend`.
+/// Which model summarizes at prime time. `--digest-backend`, or one restore's `condense.backend`.
+///
+/// The flag is the agent's DEFAULT and the request wins, because the two answer to different
+/// people: the flag is whoever launched the agent, the request is whoever is sitting in front of
+/// the client choosing a summarizer for the conversation they are looking at. A client that offers
+/// the choice cannot honor it otherwise - the agent outlives any one restore, so the answer would
+/// always be the one that was true when it started.
+///
+/// `none` is the exception and does not yield to a request: see `ACPServer.effectiveBackend`.
 enum DigestBackendChoice: String, Sendable, CaseIterable {
     /// Measure, then pick. See the file header.
     case auto

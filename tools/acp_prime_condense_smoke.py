@@ -17,10 +17,14 @@
 #     it guards against is silent history loss.
 #   - --digest-dir writes an artifact holding the digest AND the text it was made from
 #
-# WHICH model summarizes is a separate axis (--digest-backend), and the contract above is the same
-# on all of them: either a valid digest, or the full history with a reason. So this script does not
-# branch on the engine. `--expect` states which of the two outcomes the caller is testing for, and
-# it is what turns "the session's own model can summarize" into an assertion rather than a hope.
+# WHICH model summarizes is a separate axis, and the contract above is the same on all of them:
+# either a valid digest, or the full history with a reason. So this script does not branch on the
+# engine. `--expect` states which of the two outcomes the caller is testing for, and it is what
+# turns "the session's own model can summarize" into an assertion rather than a hope.
+#
+# That axis has two sources - `--digest-backend` at launch and `condense.backend` per restore - and
+# `backend_override_checks` below asserts the precedence between them. Those checks all resolve to
+# refusals, so they cost process launches and no generation.
 #
 # Usage: python3 tools/acp_prime_condense_smoke.py /path/to/mlx-agent \
 #            [--expect condensed|declined|any] [--backend foundation | --model <dir>] [acp args]
@@ -185,6 +189,13 @@ def main():
         check("declining says why", bool(res.get("reason")), f"result={res}")
         agent.p.kill()
         shutil.rmtree(archive, ignore_errors=True)
+        # STILL RUN THESE. They build their own agents and assert refusals, so they neither need
+        # nor care whether the prime above condensed - and this is the branch a machine that
+        # cannot summarize always takes, which is exactly where a summarizer-selection bug would
+        # go unnoticed. Returning here used to skip them and print ALL PASS.
+        print("-" * 60)
+        print("condense.backend: the request against the launch flag")
+        backend_override_checks(binary, backend_args, check)
         print("-" * 60)
         print("ALL PASS" if not failures else f"{len(failures)} FAILED: " + ", ".join(failures))
         return len(failures)
@@ -265,7 +276,12 @@ def main():
     agent.p.kill()
     shutil.rmtree(archive, ignore_errors=True)
 
-    # 5. Concurrency. A condensing prime takes SECONDS, which is a wide-open window the rest of
+    # 5. Who summarizes, asked per restore rather than per process.
+    print("-" * 60)
+    print("condense.backend: the request against the launch flag")
+    backend_override_checks(binary, backend_args, check)
+
+    # 6. Concurrency. A condensing prime takes SECONDS, which is a wide-open window the rest of
     #    this file never looks at - and a review found a real leak in it: a session/new during a
     #    condensation was overwritten when the condensation published, so a conversation the user
     #    had discarded came back and the model quoted from it.
@@ -277,6 +293,133 @@ def main():
     print("-" * 60)
     print("ALL PASS" if not failures else f"{len(failures)} FAILED: " + ", ".join(failures))
     return len(failures)
+
+
+def without_digest_backend(args):
+    """`args` with any `--digest-backend <x>` removed, so this file can state the flag itself."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a == "--digest-backend":
+            skip = True
+            continue
+        out.append(a)
+    return out
+
+
+def backend_override_checks(binary, backend_args, check):
+    """`condense.backend` names the summarizer for ONE restore; `--digest-backend` is the default.
+
+    Every check here resolves BEFORE any model runs - each one is a refusal, and a refusal is
+    decided by `chooseSummarizer` before the planner is called - so this section costs a few
+    process launches and no generation whatever engine it is pointed at. Keep it that way: the
+    obvious way to test an ACCEPTED value is to let one through, and on a machine with Apple
+    Intelligence that quietly turns a structural assertion into a real summarization.
+
+    What is being proved is precedence, and the reasons are asserted rather than just the outcome:
+    a decline with the wrong reason means the request was read as something else, which is exactly
+    the failure a client cannot see. The clause that matters most is `--digest-backend none`: it is
+    the operator turning summarization off, and a request must not switch it back on.
+    """
+    base = without_digest_backend(backend_args)
+    history = long_history(pairs=8)
+
+    def prime(flag, requested):
+        agent = Agent([binary, "acp", "--digest-backend", flag] + base)
+        sid = agent.start_session()
+        ask = {"keepRecentTurns": KEEP_RECENT}
+        if requested is not None:
+            ask["backend"] = requested
+        r = agent.await_response(agent.send("session/prime", {
+            "sessionId": sid, "messages": history, "condense": ask}), timeout=120)
+        agent.p.kill()
+        return r.get("result") or {}
+
+    res = prime("auto", "none")
+    reason = str(res.get("reason", ""))
+    check("a request for `none` overrides a permissive launch flag",
+          res.get("condensed") is False and "no summarizer" in reason, f"result={res}")
+    check("and overriding still primes the FULL history",
+          res.get("primed") == len(history), f"primed={res.get('primed')} of {len(history)}")
+
+    res = prime("none", "session")
+    reason = str(res.get("reason", ""))
+    check("--digest-backend none is NOT overridable by a request",
+          res.get("condensed") is False and "disabled" in reason, f"result={res}")
+    check("and the refusal says the requested summarizer was not used",
+          "session" in reason, f"reason={reason}")
+
+    res = prime("auto", "wizard")
+    reason = str(res.get("reason", ""))
+    check("an unknown summarizer declines rather than falling back to the flag",
+          res.get("condensed") is False and "wizard" in reason, f"result={res}")
+
+    # Asked under `none` rather than under a permissive flag: the refusal is decided before any
+    # model runs, and it distinguishes the two readings of an empty string. Absent gives the plain
+    # "disabled" reason; parsed as a value it would give either "unknown summarizer" or the
+    # "was not used" clause that names a request.
+    res = prime("none", "")
+    reason = str(res.get("reason", ""))
+    check("an empty backend is absent, not a summarizer named \"\"",
+          res.get("condensed") is False and "disabled" in reason
+          and "unknown summarizer" not in reason and "was not used" not in reason,
+          f"result={res}")
+
+    # A value of the wrong TYPE is a client bug, not a preference. Reading it as "absent" would
+    # summarize with the launch flag's model and report only that name - the same silent
+    # substitution the string case refuses. Named by TYPE: a JSON boolean arrives as a number, so
+    # echoing the value reports a summarizer called "1", which the client never sent.
+    res = prime("auto", 42)
+    reason = str(res.get("reason", ""))
+    check("a backend that is not a string is refused, not ignored",
+          res.get("condensed") is False and "must be a string" in reason and "a number" in reason,
+          f"result={res}")
+
+    res = prime("auto", True)
+    check("  and a boolean is named as one rather than echoed as a value",
+          "a boolean" in str(res.get("reason", "")), f"result={res}")
+
+    # The value is echoed into `reason` and into the log, so it needs a bound - and a bound is
+    # only worth having if it is asserted on the input that breaks it. A cap measured in Swift
+    # `Character`s bounds GRAPHEMES: one base letter plus 20 000 combining marks is a single
+    # Character, so an ASCII-only assertion here passes while 40 KB goes out on the wire.
+    res = prime("auto", "a" + "\u0301" * 20000)
+    reason = str(res.get("reason", ""))
+    check("  and an overlong value is capped rather than echoed whole",
+          res.get("condensed") is False and len(reason) < 200,
+          f"reason is {len(reason)} chars")
+    res = prime("auto", "x" * 500)
+    check("  whatever it is made of",
+          len(str(res.get("reason", ""))) < 200 and "..." in str(res.get("reason", "")),
+          f"result={res}")
+
+    # Control characters are not whitespace by Unicode's definition, so a value carrying terminal
+    # escapes would reach a terminal reading the log intact.
+    res = prime("auto", "\u001b[2J\u001b[1;31mPWNED\u001b[0m")
+    check("  and terminal escapes do not survive into the reason",
+          "\u001b" not in str(res.get("reason", "")), f"result={res}")
+
+    # A value with nothing displayable in it is the same class of non-answer as whitespace, and is
+    # read the same way. Asked under `none` so the reason distinguishes "absent" from "a value I
+    # could not read", and so it costs no generation.
+    res = prime("none", "\u001b\u001b")
+    reason = str(res.get("reason", ""))
+    check("  and a value made only of controls is absent, not a summarizer named \"\"",
+          "unknown summarizer" not in reason and "was not used" not in reason and "disabled" in reason,
+          f"result={res}")
+
+    # The positive direction needs a request that reaches a DIFFERENT summarizer than the flag
+    # would have, and identifies itself without generating. The foundation engine has exactly one:
+    # `session` there is refused with a reason no other path produces, so seeing it proves the
+    # request - not the flag - chose the summarizer.
+    if "foundation" in base:
+        res = prime("foundation", "session")
+        reason = str(res.get("reason", ""))
+        check("a request selects a different summarizer than the flag would have",
+              res.get("condensed") is False and "session's model IS the on-device model" in reason,
+              f"result={res}")
 
 
 SECRET = "ZEBRA-77"

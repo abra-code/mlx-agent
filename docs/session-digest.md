@@ -70,9 +70,9 @@ Two summarizers, same output either way:
   loaded, or one loaded for the purpose in batch mode. Far fewer passes, but each is a full
   generation.
 
-On the live path `--digest-backend` chooses and defaults to measuring; see
-[`session-prime.md`](session-prime.md#which-model-summarizes). In batch mode `--backend` names the
-summarizer directly, since no session is involved.
+On the live path the restore's `condense.backend` chooses, falling back to `--digest-backend`,
+which defaults to measuring; see [`session-prime.md`](session-prime.md#which-model-summarizes). In
+batch mode `--backend` names the summarizer directly, since no session is involved.
 
 ## `mlx-agent digest` - the batch mode
 
@@ -106,8 +106,9 @@ line rather than hoisted, and instructions stored that way are lost from the dig
 arithmetic below simple: `injected` is exactly 1 or 2, never more.)
 
 **Only `messages` is read from the object form.** A captured request's `condense` block is ignored -
-those knobs are `--keep-recent` and `--max-digest-tokens` here, and honoring both would give one
-knob two sources. State them as flags if the captured values matter.
+`backend` included; those knobs are `--backend`, `--keep-recent` and `--max-digest-tokens` here,
+and honoring both would give one knob two sources. State them as flags if the captured values
+matter.
 
 Output on stdout, or to `--out`:
 

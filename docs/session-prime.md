@@ -65,7 +65,7 @@ key ignores it.
   "params": {
     "sessionId": "mlx-session-1",
     "messages": [ ... ],
-    "condense": { "keepRecentTurns": 6, "maxDigestTokens": 700 }
+    "condense": { "keepRecentTurns": 6, "maxDigestTokens": 700, "backend": "session" }
   }
 }
 ```
@@ -74,8 +74,25 @@ key ignores it.
   to 2...64. The boundary is snapped backward to a user turn where one is nearby, so the tail may
   be one or two messages longer than asked.
 - `maxDigestTokens` (optional, default 700): ceiling on the generated summary. Clamped to 128...2048.
+- `backend` (optional): which model summarizes THIS restore - `auto`, `foundation`, `session` or
+  `none`, the same four words as `--digest-backend`, which is the default when the key is absent.
+  An empty (or all-whitespace) string and `null` are treated as absent, since a host storing "the
+  user has not chosen" that way is ordinary. Any other value declines the condensation and says
+  why in `reason` - an unrecognized word is quoted back, a value of the wrong type is named by
+  type - rather than falling back to the flag and reporting a summarizer nobody chose. A
+  malformed value is reported even on an agent running `--digest-backend none`, which otherwise
+  refuses first.
 - Slice sizing is NOT on the wire. It is a property of the summarizing model's context window,
   which the agent knows and the client does not.
+
+**`backend` is why a client can offer this choice to a person at all.** The flag belongs to the
+agent process, which outlives any one restore; the request belongs to the conversation in front of
+the user. Without the request, someone who picks a summarizer is answered by whichever one the
+agent happened to start with, and the only trace of the difference is the `summarizer` name in the
+response - a mismatch that reads as the client ignoring them. The one value that does not yield is
+`--digest-backend none`: that is the operator turning summarization off for this agent, and a
+request that could switch it back on would make the flag advisory. A request under `none` is
+refused with a reason saying so.
 
 ### Response, condensed
 
@@ -158,7 +175,8 @@ since each sizes its slices from its own context window; that is a cost, and pas
 also a refusal. For the on-device model as an engine rather than a summarizer, see
 [`foundation-models.md`](foundation-models.md).
 
-`--digest-backend` chooses, and defaults to `auto`:
+`--digest-backend` sets the default, and defaults to `auto`; `condense.backend` names the
+summarizer for one restore. Same four words either way:
 
 | Value | Behavior |
 | --- | --- |
@@ -172,7 +190,13 @@ no disturbance to the loaded model - but its 4096-token window turns a long conv
 sequential passes, and past its limit it refuses outright; a 32k-window model that is already
 loaded does the same job in one or two. So the agent counts the passes THIS history would need on
 the on-device budget and picks accordingly. Under `auto` only, an on-device attempt that fails
-outright falls back to the session's model; an explicit `--digest-backend` never silently switches.
+outright falls back to the session's model; an explicit choice - the flag or the request - never
+silently switches.
+
+Precedence is one line: the request wins, except that `--digest-backend none` wins over
+everything - other than the complaint about a malformed value, which is a client bug worth naming
+wherever it is sent. `auto` is `auto` whichever of the two says it, so a request naming it gets
+the same fallback the flag would.
 
 Sizing follows the summarizing model's context window: reported by the framework on the on-device
 path, read from the model's `config.json` on the MLX path, and assumed to be 8192 on

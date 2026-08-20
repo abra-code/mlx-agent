@@ -749,6 +749,9 @@ func usage() {
                                                 on the loaded model but takes far fewer passes
                                    none       = never summarize; condense primes everything and
                                                 says so
+                                   A DEFAULT, not a lock: a client may name the summarizer for one
+                                   restore with `condense.backend`. `none` is the exception - it
+                                   turns summarizing off for this agent and no request overrides it
           --digest-window <n>      acp/digest: the summarizing model's context window in tokens.
                                    Only needed with --backend openai, where the window belongs to
                                    a llama-server this process did not start (assumed 8192); the

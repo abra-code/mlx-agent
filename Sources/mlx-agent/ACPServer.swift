@@ -969,8 +969,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
 
-        // Only the client's two knobs are read here. WHICH summarizer runs - and therefore which
-        // window the slice budget is derived from - depends on how many slices the history needs,
+        // Only what the client ASKED FOR is read here - including which summarizer, which is a
+        // request rather than a decision. Whether that summarizer can run, and therefore which
+        // window the slice budget is derived from, depends on how many slices the history needs,
         // which is not known until the history has been parsed. So the policy is finished inside
         // the Task, next to the choice it belongs to.
         let overrides = Self.condenseOverrides(from: request)
@@ -1130,21 +1131,136 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
 
     // MARK: - session/prime condensation
 
-    /// The two knobs a condensing prime exposes on the wire.
+    /// The knobs a condensing prime exposes on the wire.
     ///
     /// `sliceBudgetTokens` and `maxSlices` are deliberately NOT among them: they are properties of
     /// the summarizing model's context window, which the agent knows and the client does not - and
     /// which is not even decided until a summarizer has been chosen. `PrimePolicy` clamps whatever
     /// arrives, so a hostile value cannot get past this into the slicing loop.
+    ///
+    /// `backend` IS among them, and it is the one that is a request rather than a bound. It names
+    /// the summarizer for this restore, defaulting to `--digest-backend` when absent. A client
+    /// that offers the choice to a person needs it: the launch flag belongs to the agent process,
+    /// so without this a user who picks a summarizer is answered by whichever one the agent was
+    /// started with, and the only trace of the difference is a name in the response.
     struct CondenseOverrides: Sendable {
         var keepRecentTurns: Int?
         var maxDigestTokens: Int?
+        /// The summarizer this restore asked for, or nil to use the launch flag.
+        var backend: DigestBackendChoice?
+        /// Why a `backend` that was present could not be used, ready to be reported verbatim.
+        /// Set INSTEAD of `backend`, never alongside it.
+        var backendRefusal: String?
+    }
+
+    /// A client's `backend` value, rendered short enough to put in a reason and a log line.
+    ///
+    /// Echoing it raw is wrong in two ways that both showed up in review: a JSON object's
+    /// description is multi-line, and `log()` writes one prefixed line, so one refusal became
+    /// several unprefixed lines of stderr; and there is no length bound on a client's string, so
+    /// a megabyte of it would land in `reason` and in the log. Whitespace is collapsed and the
+    /// value is capped - the point is to let a person recognize what they sent, not to reproduce
+    /// it.
+    private static func describeBackendValue(_ value: String) -> String {
+        // SCALARS, NOT CHARACTERS. A `Character` is a grapheme cluster, so one base letter
+        // followed by twenty thousand combining marks counts as ONE - a cap measured in
+        // Characters passes it through whole, which is 40 KB into `reason` and into a single log
+        // line. Measured, not theorized.
+        //
+        // Controls are stripped alongside whitespace: `isWhitespace` is Unicode White_Space,
+        // which does not include ESC, so a value carrying terminal escapes would arrive intact at
+        // a terminal reading the log. The scan is bounded too, so a megabyte of whitespace cannot
+        // be walked in full to produce nothing.
+        let strip = CharacterSet.whitespacesAndNewlines.union(.controlCharacters)
+        let limit = 40
+        let scanned = 4096
+        var out = String.UnicodeScalarView()
+        var gap = false
+        var truncated = false
+        for scalar in value.unicodeScalars.prefix(scanned) {
+            if strip.contains(scalar) {
+                gap = !out.isEmpty
+                continue
+            }
+            if out.count + (gap ? 2 : 1) > limit {
+                truncated = true
+                break
+            }
+            if gap {
+                out.append(" ")
+                gap = false
+            }
+            out.append(scalar)
+        }
+        if !truncated, value.unicodeScalars.count > scanned { truncated = true }
+        return truncated ? String(out) + "..." : String(out)
     }
 
     private static func condenseOverrides(from request: [String: Any]) -> CondenseOverrides {
         func int(_ key: String) -> Int? { (request[key] as? NSNumber)?.intValue }
-        return CondenseOverrides(
+        var overrides = CondenseOverrides(
             keepRecentTurns: int("keepRecentTurns"), maxDigestTokens: int("maxDigestTokens"))
+        // NULL AND EMPTY ARE ABSENT; ANYTHING ELSE UNRECOGNIZED IS AN ERROR. A host storing "the
+        // user has not chosen" as an empty string (or as JSON null) is ordinary, and refusing to
+        // summarize over it would turn a non-answer into a visible failure. A value that is
+        // present and is not one of the four words - including one of the wrong TYPE, which is a
+        // client bug rather than a preference - is reported rather than quietly replaced by the
+        // launch flag, because replacing it is how a summary gets written by a model nobody chose.
+        if let rawValue = request["backend"], !(rawValue is NSNull) {
+            if let raw = rawValue as? String {
+                // Trimmed but not lowercased for the message: the refusal should quote what they
+                // sent. Lowercasing is for the match only. Trimming first also keeps the
+                // description's scan budget for the value rather than for leading spaces.
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                let shown = Self.describeBackendValue(trimmed)
+                if trimmed.isEmpty || shown.isEmpty {
+                    // Nothing requested. `shown` is empty when the value was made entirely of
+                    // characters that cannot be displayed - controls, bidi overrides - which is
+                    // the same class of non-answer as whitespace and is treated the same way
+                    // rather than being refused as a summarizer named "".
+                } else if let choice = DigestBackendChoice(rawValue: trimmed.lowercased()) {
+                    overrides.backend = choice
+                } else {
+                    overrides.backendRefusal =
+                        "unknown summarizer \"\(shown)\" requested: "
+                        + "expected \(DigestBackendChoice.usage)"
+                }
+            } else {
+                // The TYPE, not the value. JSON booleans arrive as NSNumber, so `true` echoed as a
+                // value reads as a summarizer named "1" - a diagnostic naming something the client
+                // never sent.
+                let kind: String
+                if let number = rawValue as? NSNumber,
+                    CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID()
+                {
+                    kind = "a boolean"
+                } else if rawValue is NSNumber {
+                    kind = "a number"
+                } else if rawValue is [Any] {
+                    kind = "an array"
+                } else if rawValue is [String: Any] {
+                    kind = "an object"
+                } else {
+                    kind = "\(type(of: rawValue))"
+                }
+                overrides.backendRefusal =
+                    "condense.backend must be a string naming one of "
+                    + "\(DigestBackendChoice.usage), got \(kind)"
+            }
+        }
+        return overrides
+    }
+
+    /// The summarizer this restore runs under: what the request asked for, else the launch flag.
+    ///
+    /// `--digest-backend none` is NOT overridable. Every other value is a default the client may
+    /// refine per restore, but `none` is the operator saying this agent does not summarize, and a
+    /// request that could switch it back on would make the flag advisory. The refusal below says
+    /// so rather than silently ignoring the request.
+    private func effectiveBackend(_ overrides: CondenseOverrides) -> DigestBackendChoice {
+        if digestBackend == DigestBackendChoice.none { return DigestBackendChoice.none }
+        if let requested = overrides.backend { return requested }
+        return digestBackend
     }
 
     /// A summarizer that could run, or why one could not.
@@ -1263,9 +1379,26 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     private func chooseSummarizer(history: [DigestTurn], overrides: CondenseOverrides)
         -> SummarizerOption
     {
-        switch digestBackend {
+        // A value that is not one of the four words DECLINES rather than falling back to the
+        // launch flag. Falling back would summarize with a model the client did not ask for and
+        // report it only in `summarizer`, which is the failure this parameter exists to end; the
+        // full history is primed instead, and the reason names what was wrong with the value.
+        //
+        // Checked BEFORE `none`, which otherwise wins over everything: a client that sent a
+        // malformed value should hear about it even on an agent that would have declined anyway,
+        // or the same request looks fine everywhere summarization happens to be off.
+        if let refusal = overrides.backendRefusal { return .unavailable(refusal) }
+        switch effectiveBackend(overrides) {
         case .none:
-            return .unavailable("summarization is disabled (--digest-backend none)")
+            if digestBackend == DigestBackendChoice.none {
+                if let requested = overrides.backend, requested != DigestBackendChoice.none {
+                    return .unavailable(
+                        "summarization is disabled for this agent (--digest-backend none), so "
+                            + "the requested \(requested.rawValue) summarizer was not used")
+                }
+                return .unavailable("summarization is disabled (--digest-backend none)")
+            }
+            return .unavailable("this restore asked for no summarizer")
         case .foundation:
             return foundationOption(overrides: overrides)
         case .session:
@@ -1324,11 +1457,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // ordinary content (measured, repeatably: "Failed to deserialize a Generable type from
         // model output" on a repetitive 7 KB transcript that it summarizes fine when the same text
         // arrives in one block). Falling back to the model already loaded costs one more pass on a
-        // restore that was going to prime everything anyway. An EXPLICIT --digest-backend gets no
-        // fallback: the operator named a summarizer, and quietly using the other one would make
-        // `summarizer` in the response the only trace of a decision they thought they had made.
+        // restore that was going to prime everything anyway. An EXPLICIT choice gets no fallback -
+        // from the CLI or from this restore's `backend`, since both are somebody naming a
+        // summarizer - because quietly using the other one would make `summarizer` in the response
+        // the only trace of a decision they thought they had made.
         var attempts: [SummarizerOption] = [first]
-        if digestBackend == .auto, firstBackend == nil {
+        if effectiveBackend(overrides) == .auto, firstBackend == nil {
             let session = sessionOption(overrides: overrides)
             if case .ready = session { attempts.append(session) }
         }
