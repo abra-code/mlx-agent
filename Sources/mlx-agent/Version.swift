@@ -10,4 +10,4 @@
 // Deliberately NOT derived from the Xcode project (MARKETING_VERSION / Info.plist): the tool
 // target ships no Info.plist, so a plist lookup would return nil in exactly the shipping
 // configuration and leave the CLI reporting nothing.
-let agentVersion = "0.1"
+let agentVersion = "0.2"
