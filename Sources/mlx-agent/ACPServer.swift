@@ -90,6 +90,15 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     }
     /// MLX path only; "" on the openai backend (the host app decides what llama-server serves).
     private var currentModelDir: String
+    /// What `/props` said at session/new, on the openai engine only. `.unknown` everywhere else,
+    /// and on a server that did not answer.
+    ///
+    /// This is the agent's ONLY way to learn what it is generating with on that engine: the host
+    /// app owns llama-server and hands this process a port. Without it the summarizer is sized
+    /// against a deliberately small constant and named after its engine, and both were wrong in
+    /// the same measured failure - a server started with an 8192-token context, a restore sized
+    /// for a guess, and an HTTP 400 on the first message afterwards.
+    private var servedProps = OpenAIBackend.ServerProps.unknown
     private let mcpConfigPath: String?
     private let guardrails: AgentGuardrails
     private var mode: String
@@ -113,8 +122,10 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// Which model may summarize at prime time (`--digest-backend`). See DigestSelection.swift.
     private let digestBackend: DigestBackendChoice
     /// `--digest-window`: the summarizing model's context window, when the operator states it.
-    /// nil means "work it out", which is exact for foundation, read from config.json for mlx, and
-    /// a conservative guess for openai - the one case where nothing on this side knows.
+    /// nil means "work it out", which every engine can now do: foundation asks the framework, mlx
+    /// reads config.json, and openai asks the server it was pointed at for its own `/props`. The
+    /// flag is for the case none of those cover - an OpenAI-compatible server that reports no
+    /// window - and it outranks all three.
     private let digestWindowOverride: Int?
     private let idleQueue = DispatchQueue(label: "com.abracode.mlx-agent.idle")
     private var idleTimer: DispatchSourceTimer?
@@ -518,6 +529,16 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             respondError(id, -32000, "session/new failed: \(error.localizedDescription)")
             return
         }
+        // AFTER health, and never a reason to fail: what it reports only sharpens decisions that
+        // have a fallback. Read once per session because the host app restarts llama-server rather
+        // than reconfiguring it, and a restart replaces this whole agent process anyway.
+        let props = await OpenAIBackend.probeProps(baseURL: baseURL)
+        lock.withLock { self.servedProps = props }
+        // The model path is a SERVER-supplied string, so it is logged through the same naming that
+        // bounds and flattens it everywhere else rather than whole - see DigestGeneratorName.
+        log(
+            "openai engine: server reports context=\(props.contextSize.map(String.init) ?? "unstated") "
+                + "model=\(props.modelPath.flatMap(DigestGeneratorName.fromModelPath) ?? "unstated")")
         let registry = await ensureRegistry()
         let (backend, agent) = buildOpenAIStack(baseURL: baseURL, history: [])
         let sid = "mlx-session-1"
@@ -1334,8 +1355,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                 "on the foundation engine the session's model IS the on-device model - "
                     + "use --digest-backend foundation")
         }
-        let (live, modelDir, unloaded) = lock.withLock {
-            (self.backend, self.currentModelDir, self.idleUnloaded)
+        let (live, modelDir, unloaded, props) = lock.withLock {
+            (self.backend, self.currentModelDir, self.idleUnloaded, self.servedProps)
         }
         guard let live else {
             // Deliberately not a reload. Priming does not reload weights (the KV prefill is lazy
@@ -1353,7 +1374,8 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // and names flags that exist in both modes.
         let policy = DigestSizing.backendPolicy(
             window: DigestSizing.window(
-                override: digestWindowOverride, modelDir: isMLXEngine ? modelDir : ""),
+                override: digestWindowOverride, modelDir: isMLXEngine ? modelDir : "",
+                discovered: isMLXEngine ? nil : props.contextSize),
             generationCeiling: DigestSizing.generationCeiling(gen),
             maxSlices: Self.sessionMaxSlices,
             keepRecentTurns: overrides.keepRecentTurns,
@@ -1364,7 +1386,9 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         case .sized(let policy):
             return .ready(
                 backend: live, policy: policy,
-                name: BackendDigestGenerator.name(engine: isMLXEngine ? "mlx" : "openai"))
+                name: BackendDigestGenerator.name(
+                    engine: isMLXEngine ? "mlx" : "openai",
+                    model: isMLXEngine ? modelDir : props.modelPath))
         }
     }
 
@@ -1431,18 +1455,130 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         }
     }
 
+    /// The context window of the model that will ANSWER, when this side knows it.
+    ///
+    /// A DIFFERENT QUESTION FROM THE SUMMARIZER'S WINDOW, which is what `DigestSizing.window`
+    /// answers. They are the same model on the session path and different models whenever the
+    /// on-device model summarizes for a local one, and only this one decides whether the result
+    /// can be primed at all.
+    ///
+    /// `--digest-window` is deliberately NOT consulted: it is documented as the SUMMARIZING
+    /// model's window, and an operator lowering it to force smaller slices would otherwise also be
+    /// silently trimming their conversations.
+    ///
+    /// NIL ON THE FOUNDATION ENGINE, WHICH IS NOT AN OVERSIGHT. Its window is 4096 and perfectly
+    /// well known, so this could answer - but `FoundationBackend` already handles an overflow by
+    /// SUMMARIZING (`needsCondensingBefore` before a pass, one reactive retry after), and that is
+    /// strictly better than dropping turns. Trimming here would pre-empt it: the turns would be
+    /// gone before the backend that knows how to keep their content ever saw them. Every other
+    /// engine has no such recovery, which is what makes the trim the right answer there.
+    private var servingWindowTokens: Int? {
+        if isFoundationEngine { return nil }
+        if isMLXEngine {
+            return DigestWindow.fromModelDirectory(lock.withLock { currentModelDir })
+        }
+        return lock.withLock { servedProps.contextSize }
+    }
+
+    /// How much of that window a restored conversation may occupy.
+    ///
+    /// OPTIMISTIC BY DESIGN, in a way worth stating: what is subtracted is what the model may
+    /// GENERATE plus a fixed allowance for the system prompt and chat template. Tool DEFINITIONS
+    /// are not counted, and a full MCP registry is thousands of tokens - so this bounds the
+    /// history and not the whole prompt. The generation reserve is what absorbs the difference
+    /// (nothing generates its entire ceiling on the first turn of a restore), and the turn error
+    /// on a real overflow is what catches the rest.
+    ///
+    /// NEVER MORE THAN HALF THE WINDOW FOR OUTPUT. `generationCeiling` is what the model MAY
+    /// generate, and it is an absolute number - 4096 by default - so a model whose whole window is
+    /// 4096 would reserve all of it and leave a restore the 256-token floor, gutting every
+    /// conversation on a small-context engine to protect an output nobody asked for. Half is the
+    /// most a reserve can honestly claim when the same window has to hold the conversation the
+    /// output is about.
+    private var primeBudgetTokens: Int? {
+        guard let window = servingWindowTokens else { return nil }
+        let reserve = min(DigestSizing.generationCeiling(gen), max(1, window / 2))
+        return max(256, window - reserve - PrimePolicy.promptOverheadTokens)
+    }
+
+    /// Drop the oldest turns of a verbatim tail until the serving model can hold it.
+    ///
+    /// Applied to BOTH prime paths - the condensed tail and the full history a decline falls back
+    /// to - because the decline is the one that fails: a conversation too large to summarize is
+    /// also too large to prime, and priming it anyway is what turned a restore into an HTTP 400 on
+    /// the first message afterwards.
+    ///
+    /// THE PREAMBLE IS NOT PASSED HERE, it is `reserving`. Dropping a digest while keeping the
+    /// turns it stands in for is the one thing this must never do, and the way to guarantee that
+    /// is for the preamble not to be in the array at all. It still costs its tokens, so the caller
+    /// charges them against the budget.
+    ///
+    /// Nothing happens when the window is unknown. That is the honest answer for an
+    /// OpenAI-compatible server that does not report one: trimming against a guess would discard
+    /// conversation to satisfy a number nobody stated.
+    private func fitTailToServingWindow(_ tail: [Chat.Message], reserving preamble: Int = 0)
+        -> (history: [Chat.Message], droppedTurns: Int, droppedBytes: Int)
+    {
+        guard let budget = primeBudgetTokens else { return (tail, 0, 0) }
+        let fitted = DigestPlanner.fit(
+            tail,
+            budgetTokens: max(0, budget - preamble),
+            cost: promptTokenCost(of:),
+            // What the CLIENT is told it lost, which is content and not framing.
+            bytes: { $0.content.utf8.count },
+            // A tool result cannot begin a history: it answers an announcement, and cutting
+            // between the two is a transcript a strict chat template refuses outright. The
+            // planner advances past them rather than reporting a smaller drop.
+            canStartHere: { $0.role != .tool })
+        if fitted.droppedTurns > 0 {
+            log(
+                "session/prime: trimmed \(fitted.droppedTurns) turns to fit a "
+                    + "\(max(0, budget - preamble))-token budget "
+                    + "(window \(servingWindowTokens.map(String.init) ?? "?"), "
+                    + "preamble \(preamble))")
+        }
+        return fitted
+    }
+
     /// Summarize the older part of `history`, or explain why not.
     ///
-    /// NEVER truncates and never throws: a summarizer that is unavailable, refuses, times out or
-    /// returns nothing usable results in the FULL history being primed with `condensed: false` and
-    /// a reason the client can show. That guarantee is `DigestPlanner.condense`'s; this method's
-    /// job is only to not undermine it.
+    /// NEVER throws: a summarizer that is unavailable, refuses, times out or returns nothing
+    /// usable results in the full history being primed with `condensed: false` and a reason the
+    /// client can show. That guarantee is `DigestPlanner.condense`'s; this method's job is only to
+    /// not undermine it.
+    ///
+    /// The one thing it does that the planner will not is TRIM, and only when the serving model
+    /// has stated a window the result does not fit in. See `fitToServingWindow`.
     private func condenseForPrime(history: [Chat.Message], overrides: CondenseOverrides) async -> (
         history: [Chat.Message], extra: [String: Any]
     ) {
         func declined(_ reason: String) -> ([Chat.Message], [String: Any]) {
             log("session/prime: condense requested but not performed - \(reason)")
-            return (history, ["condensed": false, "reason": reason])
+            // The full history is what a decline falls back to, and it is the case that overflows:
+            // "too large to summarize" and "too large to prime" are the same conversation. The
+            // trim is folded into `reason` rather than reported beside it because `reason` is what
+            // a client shows when `condensed` is false, and a trim the reader cannot see is a
+            // context loss they can only infer from the answers.
+            let fitted = fitTailToServingWindow(history)
+            guard fitted.droppedTurns > 0 else {
+                return (history, ["condensed": false, "reason": reason])
+            }
+            // WORDED TO FOLLOW THE CLIENT'S OWN LEAD-IN, which it has no way of knowing about.
+            // ActionUIChat renders a decline as "Not summarized - the whole conversation was sent
+            // to the model instead: <reason>", so a clause reading "the oldest messages were left
+            // out" contradicts the sentence it lands in. "and it still did not fit, so ..."
+            // continues that sentence instead of arguing with it, and is equally true read alone.
+            let noun = fitted.droppedTurns == 1 ? "message" : "messages"
+            return (
+                fitted.history,
+                [
+                    "condensed": false,
+                    "reason": reason
+                        + "; and it still did not fit, so the \(fitted.droppedTurns) oldest "
+                        + "\(noun) were left out",
+                    "trimmed": ["turns": fitted.droppedTurns, "bytes": fitted.droppedBytes],
+                ]
+            )
         }
 
         let turns = digestTurns(from: history)
@@ -1551,31 +1687,56 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         // lost in a round trip through DigestTurn; only the turns the planner produced are
         // converted. See DigestSupport.
         let tail = Array(history.dropFirst(result.tailStartIndex))
-        let condensed = chatMessages(from: result.injected) + tail
+        // A SUCCESSFUL condensation can still not fit. The verbatim tail is a message COUNT with
+        // no size bound, so six turns carrying one large tool result outweigh the digest that
+        // replaced sixty. Only the TAIL is offered for trimming; the preamble is charged against
+        // the budget instead, so there is no arrangement of the arithmetic in which the digest
+        // itself can be dropped while the turns it stands in for are kept.
+        let preambleCost = result.injected.reduce(0) {
+            $0 + DigestPlanner.estimateTokens($1.content) + DigestPlanner.turnOverheadTokens
+        }
+        let fitted = fitTailToServingWindow(tail, reserving: preambleCost)
+        // The acknowledgment turn was chosen from the tail BEFORE the trim, and a trim can change
+        // which turn the tail begins with - so the choice is re-made against what is actually
+        // being primed. Left alone, it produces the back-to-back user or assistant turns it exists
+        // to prevent.
+        let injected = chatMessages(
+            from: DigestPlanner.realignAcknowledgment(
+                result.injected,
+                tailStartsWithUser: fitted.history.first.map { $0.role == .user } ?? true))
         log(
             "session/prime: \(summarizer) summarized \(result.droppedTurns) turns "
                 + "(\(result.droppedBytes) bytes) into digest "
                 + "\(digest.sourceSHA256.prefix(8)) in "
                 + "\(String(format: "%.1f", Date().timeIntervalSince(started))) s; "
-                + "kept \(tail.count) verbatim")
-        return (
-            condensed,
-            [
-                "condensed": true,
-                // The count `primed` and `dropped.turns` are both relative to: primeHistory
-                // legitimately filters empty turns, orphan tool messages, unknown roles and a
-                // trailing unanswered tool announcement, so the client's own message count
-                // does NOT close the arithmetic and a client checking it would compute a
-                // negative injected count on a transcript with any of those.
-                "accepted": history.count,
-                // Which model made it. "The digest is thin" and "the digest was made by a 3B
-                // model" are the same observation from the client's side; it should be able to
-                // tell them apart.
-                "summarizer": summarizer,
-                "digest": digest.jsonObject,
-                "dropped": ["turns": result.droppedTurns, "bytes": result.droppedBytes],
-            ]
-        )
+                + "kept \(fitted.history.count) verbatim")
+        var extra: [String: Any] = [
+            "condensed": true,
+            // The count `primed`, `dropped.turns` and `trimmed.turns` are all relative to:
+            // primeHistory legitimately filters empty turns, orphan tool messages, unknown
+            // roles and a trailing unanswered tool announcement, so the client's own message
+            // count does NOT close the arithmetic and a client checking it would compute a
+            // negative injected count on a transcript with any of those. The identity, which
+            // docs/session-prime.md states for clients, is
+            // `primed == injected + (accepted - dropped.turns - trimmed.turns)`.
+            "accepted": history.count,
+            // Which model made it. "The digest is thin" and "the digest was made by a 3B
+            // model" are the same observation from the client's side; it should be able to
+            // tell them apart.
+            "summarizer": summarizer,
+            "digest": digest.jsonObject,
+            "dropped": ["turns": result.droppedTurns, "bytes": result.droppedBytes],
+        ]
+        // Reported SEPARATELY from `dropped`, which counts the turns the digest stands in for.
+        // These are turns nothing stands in for, and folding them together would let a marker
+        // claim they were summarized.
+        if fitted.droppedTurns > 0 {
+            extra["trimmed"] = ["turns": fitted.droppedTurns, "bytes": fitted.droppedBytes]
+        }
+        // The preamble is prepended HERE and nowhere else, which is what makes "the digest cannot
+        // be trimmed away" structural rather than a rule to remember: it is not in the array the
+        // fit was given.
+        return (injected + fitted.history, extra)
     }
 
     /// The on-device generator, behind the two guards that cannot be expressed at a call site that
@@ -1993,26 +2154,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         send(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
     }
 
-    /// Turn a raw generation-failure string into something a user can act on. The common opaque
-    /// case is a chat-template (Jinja) render failure - e.g. "upper filter requires string" from
-    /// a model whose tool-calling template our Jinja engine can't render. That text is meaningless
-    /// to a user and reads like the app is broken, when it is a model-compatibility issue that
-    /// disappears with tools off (the failing macros only run when tool schemas are rendered).
-    /// The raw message is still logged (see the call site) for debugging.
-    static func userFacingTurnError(_ raw: String) -> String {
-        let lower = raw.lowercased()
-        let templateSignals = [
-            "filter requires", "no filter named", "unknown filter", "unknown tag",
-            "jinja", "chat template", "template render", "template error",
-        ]
-        if templateSignals.contains(where: { lower.contains($0) }) {
-            return
-                "This model's chat template could not render the request, so it can't run here. "
-                + "This usually affects tool calling - start a new chat with tools turned off, or "
-                + "pick a different model. (details: \(raw))"
-        }
-        return "generation failed: \(raw)"
-    }
+    /// Turn a raw generation-failure string into something a user can act on.
+    ///
+    /// The logic is `TurnErrorText`, in the MLX-free target where it has tests. It moved there
+    /// when the context-overflow case was added: it is pure string work, this file links MLX, and
+    /// the file header on `ThinkSplitter` records what that combination cost the last time.
+    static func userFacingTurnError(_ raw: String) -> String { TurnErrorText.userFacing(raw) }
 
     private func send(_ message: [String: Any]) {
         guard

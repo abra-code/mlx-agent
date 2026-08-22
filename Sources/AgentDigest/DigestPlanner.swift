@@ -356,6 +356,101 @@ public enum DigestPlanner {
         return max(1, max(text.utf8.count / 4, wide))
     }
 
+    // MARK: - Fitting the result to the model that has to hold it
+
+    /// What one turn costs beyond its own text: the role marker and whatever the chat template
+    /// wraps it in. Small, but a 60-turn tail pays it 60 times, and under-reporting here is the
+    /// direction that produces an overflow.
+    public static let turnOverheadTokens = 4
+
+    /// Drop the oldest turns of a verbatim tail until what is left fits `budgetTokens`.
+    ///
+    /// A DIFFERENT BOUND FROM THE ONE `condense` APPLIES. Condensation is sized for the
+    /// SUMMARIZER's window - how much conversation one pass can read - and a summary that came out
+    /// fine can still be primed into a model that cannot hold it: the two models need not be the
+    /// same one, the verbatim tail is a message COUNT with no size bound, and every failure path in
+    /// `condense` falls back to the FULL history. That fallback is exactly the case that breaks - a
+    /// conversation too large to summarize is also too large to prime - and it broke as an HTTP 400
+    /// from llama-server on the first message after a restore, naming no cause a reader could act
+    /// on.
+    ///
+    /// Dropping is not free and must not be hidden: the caller reports what went. On the condense
+    /// path those turns are at least represented in the digest that replaced their predecessors.
+    /// It is still better than the alternative, which is a conversation that cannot answer at all.
+    ///
+    /// GENERIC BECAUSE THE CALLER THAT MATTERS DOES NOT HOLD `DigestTurn`s. A primed history is
+    /// `Chat.Message`, which carries tool-call metadata a round trip through `DigestTurn` would
+    /// discard - and the first version of this had a `DigestTurn` implementation that tests
+    /// exercised beside a hand-written copy in the caller that actually shipped. One
+    /// implementation, driven through closures, is the fix for that.
+    ///
+    /// - Parameters:
+    ///   - history: the verbatim tail, oldest first. Any preamble is the caller's to keep: it is
+    ///     not passed here, because dropping a digest while keeping the turns it stands in for is
+    ///     the one thing this must never do.
+    ///   - budgetTokens: how much PROMPT is left for these turns, after the serving model's own
+    ///     reserve for what it will generate and after anything the caller is prepending.
+    ///   - cost: what one turn occupies in the window, INCLUDING whatever rides outside its text.
+    ///   - bytes: what one turn is worth reporting as, for the client's "what did this cost me".
+    ///   - canStartHere: whether the kept region may BEGIN at this turn. See `alignedDrop`.
+    /// - Returns: what to prime, and what it cost.
+    public static func fit<T>(
+        _ history: [T],
+        budgetTokens: Int,
+        cost: (T) -> Int,
+        bytes: (T) -> Int,
+        canStartHere: (T) -> Bool
+    ) -> (history: [T], droppedTurns: Int, droppedBytes: Int) {
+        let costs = history.map(cost)
+        var drop = dropCount(costs: costs, budgetTokens: budgetTokens)
+        drop = alignedDrop(drop, count: history.count) { canStartHere(history[$0]) }
+        guard drop > 0 else { return (history, 0, 0) }
+        let gone = history[..<drop]
+        return (Array(history[drop...]), drop, gone.reduce(0) { $0 + bytes($1) })
+    }
+
+    /// How many leading turns have to go, given what each one costs.
+    ///
+    /// Index arithmetic rather than a filter over turns, so a caller holding any element type can
+    /// drop from its own array using the same rule, stated once.
+    public static func dropCount(costs: [Int], budgetTokens: Int) -> Int {
+        guard !costs.isEmpty else { return 0 }
+        var running = 0
+        var kept = 0
+        // From the END: what survives is the most recent conversation, which is what the next
+        // prompt refers to. ALWAYS at least one turn, even when that turn alone busts the budget -
+        // priming a preamble with no conversation after it would answer the next question with no
+        // question in front of it, and the caller's report is what makes a remaining overflow
+        // visible rather than silent.
+        for cost in costs.reversed() {
+            if kept > 0 && running + cost > budgetTokens { break }
+            kept += 1
+            running += cost
+        }
+        return costs.count - kept
+    }
+
+    /// Advance a drop count to the first index the kept region may legally begin at.
+    ///
+    /// WHY A TRIM CAN CORRUPT A TRANSCRIPT, and the reason this exists. A `tool` turn is only
+    /// meaningful after the assistant turn that announced its call: cutting between the two leaves
+    /// an ORPHAN tool result, which is the shape a strict chat template (Mistral-family
+    /// `raise_exception`) rejects - and llama-server renders that template on every turn, so it
+    /// hard-fails the whole session rather than one message. That is the same dead session this
+    /// fit was written to prevent, arrived at from the other side.
+    ///
+    /// Advancing is always safe against the budget: dropping MORE can only make the kept region
+    /// smaller. The last turn is never dropped, for the reason `dropCount` gives - a history with
+    /// nothing in it answers the next question with no question in front of it - so a tail whose
+    /// every candidate start is illegal still keeps its final turn, and the caller's own
+    /// well-formedness pass is what has the last word on that shape.
+    public static func alignedDrop(_ drop: Int, count: Int, canStartHere: (Int) -> Bool) -> Int {
+        guard count > 0 else { return 0 }
+        var index = min(max(drop, 0), count - 1)
+        while index < count - 1 && !canStartHere(index) { index += 1 }
+        return index
+    }
+
     // MARK: - Merging slices
 
     /// Combine per-slice digests into one, deduplicated and capped.
@@ -433,6 +528,32 @@ public enum DigestPlanner {
             out.append(.assistant(DigestRenderer.acknowledgment))
         }
         return out
+    }
+
+    /// Re-decide the acknowledgment after the verbatim tail has been trimmed under it.
+    ///
+    /// `injectedTurns` chooses it from the tail it was handed, and its reason is role alternation
+    /// against the digest turn. A trim afterwards can change which turn the tail now BEGINS with,
+    /// and the choice then produces exactly the shape it was made to avoid: two user turns back to
+    /// back when the tail became user-headed, or two assistant turns when it became
+    /// assistant-headed. Both are what strict chat templates reject.
+    ///
+    /// Re-decided here rather than by rebuilding the preamble, because the digest turn carries a
+    /// verbatim-turn count rendered into its text; the acknowledgment is the only part of a
+    /// preamble that a trim can invalidate.
+    public static func realignAcknowledgment(_ injected: [DigestTurn], tailStartsWithUser: Bool)
+        -> [DigestTurn]
+    {
+        let hasAcknowledgment =
+            injected.last?.role == .assistant
+            && injected.last?.content == DigestRenderer.acknowledgment
+        if tailStartsWithUser && !hasAcknowledgment {
+            return injected + [.assistant(DigestRenderer.acknowledgment)]
+        }
+        if !tailStartsWithUser && hasAcknowledgment {
+            return Array(injected.dropLast())
+        }
+        return injected
     }
 
     /// The full primed history: `injectedTurns` followed by the verbatim tail.

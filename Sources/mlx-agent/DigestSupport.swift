@@ -31,6 +31,32 @@ func digestTurns(from messages: [Chat.Message]) -> [DigestTurn] {
     }
 }
 
+/// What one message occupies in a context window, in tokens.
+///
+/// NOT `estimateTokens(message.content)`, and the difference is most of an agent conversation. A
+/// `Chat.Message` carries its tool calls OUTSIDE `content` - the library stores them in a separate
+/// case - so an assistant turn that is only a tool call has an EMPTY content string while
+/// occupying however many tokens its arguments serialize to. A `write_file` call with a 2 KB
+/// argument is some five hundred real tokens and would otherwise be costed at four.
+///
+/// That is the direction `estimateTokens` itself warns about: under-reporting is what produces the
+/// overflow the measurement exists to prevent, and twenty such turns are enough to defeat a budget
+/// entirely. So the cost is taken from what the wire will actually carry, through the library's own
+/// bridge - which is also the only way to read the calls at all, since their storage is fileprivate
+/// (the same constraint `OpenAIBackend.wireMessages` works around, for the same reason).
+func promptTokenCost(of message: Chat.Message) -> Int {
+    var text = message.content
+    let wire = DefaultMessageGenerator().generate(message: message) as [String: Any]
+    if let calls = wire["tool_calls"],
+        let data = try? JSONSerialization.data(withJSONObject: calls),
+        let rendered = String(data: data, encoding: .utf8)
+    {
+        text += rendered
+    }
+    if let id = wire["tool_call_id"] as? String { text += id }
+    return DigestPlanner.estimateTokens(text) + DigestPlanner.turnOverheadTokens
+}
+
 /// The reverse, for the turns the planner PRODUCED.
 ///
 /// Deliberately not used on the verbatim tail: `DigestTurn` carries role and text only, so a

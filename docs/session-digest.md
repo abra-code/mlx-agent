@@ -66,9 +66,11 @@ Two summarizers, same output either way:
   conversation becomes many sequential passes. See
   [`foundation-models.md`](foundation-models.md); note that summarizing is the job it is best at
   even where it is a poor chat engine.
-- **A regular generation backend** (`session:mlx`, `session:openai`) - a model that is already
-  loaded, or one loaded for the purpose in batch mode. Far fewer passes, but each is a full
-  generation.
+- **A regular generation backend** - a model that is already loaded, or one loaded for the purpose
+  in batch mode. Far fewer passes, but each is a full generation. It is recorded by NAME
+  (`mlx-community/Qwen3-4B`, `gemma-4-31B-it-Q4_K_M`), because which engine ran it is not something
+  a reader can act on while a 2B against a 31B is the whole judgment. `session:mlx` and
+  `session:openai` remain as the fallback for a model this agent cannot name.
 
 On the live path the restore's `condense.backend` chooses, falling back to `--digest-backend`,
 which defaults to measuring; see [`session-prime.md`](session-prime.md#which-model-summarizes). In
@@ -115,7 +117,7 @@ Output on stdout, or to `--out`:
 ```json
 {
   "condensed": true,
-  "summarizer": "session:mlx",
+  "summarizer": "mlx-community/Qwen3-4B",
   "accepted": 38,
   "primed": 8,
   "dropped": { "turns": 32, "bytes": 12904 },
@@ -154,12 +156,15 @@ on a local model. Nothing in it holds a session busy, and there is no PassGate h
 is built for this one job in a process that does nothing else.
 
 Sizing follows the summarizing model's window, read from the model's `config.json` on the MLX path,
-reported by the framework on the on-device path, and assumed to be 8192 on `--backend openai` where
-the window belongs to a llama-server this process did not start. `--digest-window` states it when
-that assumption is wrong. The mode logs what it settled on:
+reported by the framework on the on-device path, and read from `/props` on `--backend openai`,
+where the window belongs to a llama-server this process did not start. That last one used to be an
+assumption - a deliberately small 8192 - and it was wrong in both directions: too low on a server
+started with room, and exactly right on one whose context had been squeezed, with no way to tell
+the two apart. `--digest-window` still states it for a server that reports nothing. The mode logs
+what it settled on:
 
 ```
-[digest] summarizing with session:mlx: up to 32 slices of ~26504 tokens, keeping 6 messages verbatim
+[digest] summarizing with mlx-community/Qwen3-4B: up to 32 slices of ~26504 tokens, keeping 6 messages verbatim
 ```
 
 ### Verify

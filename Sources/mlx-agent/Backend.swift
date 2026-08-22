@@ -545,13 +545,76 @@ final class OpenAIBackend: GenerationBackend, @unchecked Sendable {
         abandonedText = ""
     }
 
-    /// `<base minus /v1>/health` - llama-server's health endpoint is NOT under the /v1
-    /// prefix, so the OpenAI base-url has to be trimmed back to the server root.
-    static func healthURL(base: URL) -> URL {
+    /// `<base minus /v1>/<path>` - llama-server's own endpoints are NOT under the /v1 prefix, so
+    /// the OpenAI base-url has to be trimmed back to the server root to reach them.
+    static func serverURL(base: URL, path: String) -> URL {
         var s = base.absoluteString
         while s.hasSuffix("/") { s.removeLast() }
         if s.hasSuffix("/v1") { s.removeLast(3) }
-        return URL(string: s + "/health") ?? base
+        return URL(string: s + "/" + path) ?? base
+    }
+
+    static func healthURL(base: URL) -> URL { serverURL(base: base, path: "health") }
+
+    /// What the server says about itself, as far as this agent cares.
+    struct ServerProps: Sendable {
+        /// The context window ONE request may occupy, in tokens.
+        ///
+        /// This is `default_generation_settings.n_ctx` and not the top-level `-c` the operator
+        /// asked for: llama-server divides the total context among its slots, so a server started
+        /// with 32768 and four slots rejects a request over 8192, and 8192 is the number in the
+        /// error. The per-slot value is therefore the only one worth knowing here.
+        let contextSize: Int?
+        /// The model file it loaded, which is the only place this agent can learn what it is
+        /// talking to: on this engine the host app owns llama-server and the agent's argv names a
+        /// port, never a model.
+        let modelPath: String?
+
+        static let unknown = ServerProps(contextSize: nil, modelPath: nil)
+    }
+
+    /// Read `/props` once, after health. Never throws and never blocks a session on its answer.
+    ///
+    /// Everything it reports is an IMPROVEMENT on a guess rather than a requirement: without it
+    /// the digest window falls back to a deliberately small constant and the summarizer is named
+    /// by its engine. So a server that does not implement `/props`, or answers something
+    /// unexpected, costs accuracy and not a session - which is also why an external
+    /// OpenAI-compatible server that is not llama-server at all is fine here.
+    static func probeProps(baseURL: URL, timeout: TimeInterval = 2) async -> ServerProps {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = timeout
+        // BOTH timeouts, because they bound different things and only one of them is the danger
+        // here. `timeoutIntervalForRequest` is the IDLE gap between packets; a process on this port
+        // that dribbles a byte every second satisfies it forever while `data(from:)` buffers the
+        // whole body with no size cap - and session/new is awaiting this before it answers.
+        // `timeoutIntervalForResource` bounds the transfer as a whole, and its default is 7 days.
+        config.timeoutIntervalForResource = timeout * 4
+        config.waitsForConnectivity = false
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+        guard
+            let (data, response) = try? await session.data(
+                from: serverURL(base: baseURL, path: "props")),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            // /props is a few kilobytes of settings; a megabyte of it is not this endpoint, and
+            // parsing it would only be a slower way to reach the same `.unknown`.
+            data.count <= 1_048_576,
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return .unknown }
+
+        let settings = root["default_generation_settings"] as? [String: Any]
+        // The top-level fallback is for OpenAI-compatible servers that report a window without
+        // llama.cpp's slot machinery. A value outside the plausible range is treated as unstated
+        // rather than trusted: a zero or a negative would turn every prime into a refusal.
+        let raw =
+            (settings?["n_ctx"] as? NSNumber)?.intValue
+            ?? (root["n_ctx"] as? NSNumber)?.intValue
+        let contextSize = raw.flatMap { (256...8_000_000).contains($0) ? $0 : nil }
+
+        let path = (root["model_path"] as? String) ?? (root["model_alias"] as? String)
+        return ServerProps(
+            contextSize: contextSize,
+            modelPath: path.flatMap { $0.isEmpty ? nil : $0 })
     }
 
     /// Poll `/health` until the server answers 200, so session/new fails with a clean,

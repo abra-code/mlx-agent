@@ -111,10 +111,17 @@ enum DigestWindow {
         return nil
     }
 
-    /// The window to size a session-backed condensation for, given what the CLI said and what the
-    /// model directory claims.
-    static func forSession(override: Int?, modelDir: String) -> Int {
+    /// The window to size a session-backed condensation for, most authoritative source first.
+    ///
+    /// The operator's flag wins because it is somebody stating a fact about their own setup.
+    /// `discovered` comes next: on the openai engine it is what the SERVER said it was started
+    /// with, which beats reading a model's training limit off disk - llama-server is routinely
+    /// started with far less than the model could take, and `conservativeDefault` was standing in
+    /// for exactly this number. `fromModelDirectory` is the MLX answer, and the constant is what
+    /// is left when nothing knows.
+    static func forSession(override: Int?, modelDir: String, discovered: Int? = nil) -> Int {
         if let override { return override }
+        if let discovered { return discovered }
         return fromModelDirectory(modelDir) ?? conservativeDefault
     }
 }
@@ -159,12 +166,14 @@ enum DigestSizing {
     /// past what the window can hold makes `backendPolicy` refuse and say so.
     static func generationCeiling(_ gen: GenConfig) -> Int { max(gen.maxNewTokens ?? 4096, 256) }
 
-    /// The window to size for, from the CLI override and the model directory, capped at
-    /// `DigestWindow.practicalCeiling`. Pass an empty `modelDir` where there is no local model to
-    /// read a `config.json` from (the llama-server case), which lands on the conservative default.
-    static func window(override: Int?, modelDir: String) -> Int {
+    /// The window to size for, from the CLI override, what the serving engine reported about
+    /// itself, and the model directory, capped at `DigestWindow.practicalCeiling`. Pass an empty
+    /// `modelDir` where there is no local model to read a `config.json` from (the llama-server
+    /// case), and `discovered` where the server stated its own window.
+    static func window(override: Int?, modelDir: String, discovered: Int? = nil) -> Int {
         min(
-            DigestWindow.forSession(override: override, modelDir: modelDir),
+            DigestWindow.forSession(
+                override: override, modelDir: modelDir, discovered: discovered),
             DigestWindow.practicalCeiling)
     }
 

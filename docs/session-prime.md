@@ -112,14 +112,46 @@ refused with a reason saying so.
 `accepted` is how many of the supplied messages survived the well-formedness filtering described
 above - empty turns, orphan tool messages, unknown roles and a trailing unanswered tool
 announcement are all dropped before anything else happens. **Do the arithmetic against `accepted`,
-not against your own message count**: `primed == injected + (accepted - dropped.turns)`, where
-`injected` is 1 or 2. (The acknowledgment turn is omitted when the verbatim tail already begins
+not against your own message count**: `primed == injected + (accepted - dropped.turns -
+trimmed.turns)`, where `injected` is 1 or 2 and `trimmed.turns` is 0 unless the key below is
+present. (The acknowledgment turn is omitted when the verbatim tail already begins
 with a non-user turn, because adding it there would put two assistant turns back to back.) A client
 that uses its own count computes a negative `injected` on any transcript with a filtered turn in
 it.
 
-`summarizer` names the model that produced the digest. Worth surfacing: "the summary is thin" and
-"the summary was made by a 3B on-device model" are the same observation from the client's side.
+`summarizer` names the MODEL that produced the digest - `mlx-community/Qwen3-4B`,
+`gemma-4-31B-it-Q4_K_M`, `apple-foundation-models`. Worth surfacing: "the summary is thin" and "the
+summary was made by a 3B on-device model" are the same observation from the client's side. It falls
+back to the engine convention (`session:mlx`, `session:openai`) only where this agent cannot find
+out what it is running: a model directory with no recognizable name, or an OpenAI-compatible server
+that reports no `model_path` from `/props`.
+
+### `trimmed`, when even the result did not fit
+
+```json
+{ "primed": 5, "condensed": true, "summarizer": "gemma-4-31B-it-Q4_K_M",
+  "digest": { ... }, "dropped": { "turns": 64, "bytes": 18132 },
+  "trimmed": { "turns": 3, "bytes": 9004 } }
+```
+
+Present only when the assembled history was still larger than the serving model's context and the
+oldest turns after the preamble had to go. **`trimmed` is not `dropped`.** `dropped` counts turns
+the digest stands in for; `trimmed` counts turns nothing stands in for, and a client that folds the
+two together will show a marker claiming those turns were summarized. Surface it separately, or at
+minimum say the conversation was shortened.
+
+A prime with NO `condense` key is never trimmed. Nothing was asked to be summarized, the full
+history is what the host requested, and a client that never sends `condense` has no place to read
+`trimmed` from - so silently shortening the conversation there would be a loss with nowhere to
+report it. Such a restore can still overflow at the next prompt; what it gets is the turn error,
+which now names both token counts and what to do about them.
+
+The window it is measured against is the serving model's own: `/props` on the openai engine and
+`config.json` on mlx. The FOUNDATION engine is deliberately absent: its backend recovers from an
+overflow by summarizing rather than by dropping turns, and trimming here would destroy the content
+before the part that knows how to keep it ever saw it. When nothing states a window, nothing is
+trimmed -
+trimming against a guess would discard conversation to satisfy a number nobody gave.
 
 ### Response, not condensed
 
@@ -127,10 +159,17 @@ it.
 { "primed": 70, "condensed": false, "reason": "summarization is disabled (--digest-backend none)" }
 ```
 
-**The fallback is full fidelity, never truncation.** Every failure - no summarizer, Apple
-Intelligence off, the model refused, timed out, produced an empty digest, or the conversation was
-too large to slice within budget - primes the COMPLETE history and says why. A client that ignores
-`condensed` still gets a correct session; it just gets a slower first turn.
+**The fallback is full fidelity.** Every failure - no summarizer, Apple Intelligence off, the model
+refused, timed out, produced an empty digest, or the conversation was too large to slice within
+budget - primes the COMPLETE history and says why. A client that ignores `condensed` still gets a
+correct session; it just gets a slower first turn.
+
+The one exception is the case that made that rule expensive. A conversation too large to summarize
+is usually also too large to PRIME, and priming it anyway produced an HTTP 400 from llama-server on
+the first message afterwards - a dead session, reported as a JSON object nobody could act on. So a
+decline whose history does not fit the serving model's window is trimmed to it: `reason` gains a
+clause naming how many messages were left out, and `trimmed` carries the numbers. Full fidelity
+remains the rule wherever the history fits, and wherever no window is known.
 
 ### What changes for the client
 

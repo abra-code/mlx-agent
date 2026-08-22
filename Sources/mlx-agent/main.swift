@@ -753,10 +753,11 @@ func usage() {
                                    restore with `condense.backend`. `none` is the exception - it
                                    turns summarizing off for this agent and no request overrides it
           --digest-window <n>      acp/digest: the summarizing model's context window in tokens.
-                                   Only needed with --backend openai, where the window belongs to
-                                   a llama-server this process did not start (assumed 8192); the
-                                   mlx path reads it from the model's config.json and foundation
-                                   asks the framework
+                                   Rarely needed: --backend openai asks llama-server for its own
+                                   window, the mlx path reads it from the model's config.json, and
+                                   foundation asks the framework. State it for a server that
+                                   reports none. It overrides all three, and applies only to
+                                   summarizing - never to how much conversation is primed
           --in <file>              digest: the transcript to summarize (default: stdin)
           --out <file>             digest: where to write the result (default: stdout)
           --render                 digest: print the preamble the digest renders to - the text
@@ -874,10 +875,17 @@ func positiveIntOption(_ name: String, _ expected: String, in args: [String]) ->
 
 /// --digest-window: the summarizing model's context window in tokens.
 ///
-/// Only needed for `--backend openai`, where the window belongs to a llama-server this process did
-/// not start and cannot interrogate; the MLX path reads it from the model's own config.json and
-/// the foundation path asks the framework. A number well below any real window is still accepted
-/// (`PrimePolicy` clamps to a floor) - what is refused is a non-number.
+/// Rarely needed now. Every engine states its own: `--backend openai` reads `/props` on the server
+/// it was pointed at, the MLX path reads the model's config.json, and foundation asks the
+/// framework. This is for the case none of them cover - an OpenAI-compatible server that is not
+/// llama-server and reports nothing - and it outranks all three when given.
+///
+/// SUMMARIZING ONLY. It does not decide how much conversation may be PRIMED: that is measured
+/// against what the serving engine reported about itself, so an operator lowering this to force
+/// smaller slices does not also start silently trimming their conversations.
+///
+/// A number well below any real window is still accepted (`PrimePolicy` clamps to a floor) - what
+/// is refused is a non-number.
 func digestWindowOption(in args: [String]) -> Int? {
     positiveIntOption("--digest-window", "a positive number of tokens", in: args)
 }

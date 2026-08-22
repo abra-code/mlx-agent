@@ -192,9 +192,10 @@ private func buildSummarizer(
     deadline: Date
 ) async throws -> SummarizerBuild {
 
-    func backendPolicy(modelDir: String) -> DigestSizing.Outcome {
+    func backendPolicy(modelDir: String, discovered: Int? = nil) -> DigestSizing.Outcome {
         DigestSizing.backendPolicy(
-            window: DigestSizing.window(override: options.windowOverride, modelDir: modelDir),
+            window: DigestSizing.window(
+                override: options.windowOverride, modelDir: modelDir, discovered: discovered),
             generationCeiling: DigestSizing.generationCeiling(gen),
             maxSlices: digestModeMaxSlices,
             keepRecentTurns: options.keepRecentTurns, maxDigestTokens: options.maxDigestTokens)
@@ -227,29 +228,36 @@ private func buildSummarizer(
         // No system prompt: `BackendDigestGenerator` carries its own instructions in every prompt,
         // and a "you are a helpful assistant" turn would spend window on contradicting them.
         let backend = MLXBackend(container: container, instructions: nil, parameters: parameters)
-        return .ready(backendSummarizer(backend, engine: "mlx", policy: policy, deadline: deadline))
+        return .ready(
+            backendSummarizer(
+                backend, engine: "mlx", model: dir, policy: policy, deadline: deadline))
 
     case .openai(let baseURL):
-        // Empty model directory: there is no local config.json to read a window out of, so this
-        // lands on `DigestWindow.conservativeDefault` unless --digest-window says otherwise.
+        // There is no local config.json to read a window out of here, so the server is asked what
+        // it was started with. It answers with the model it loaded too, which is the only way this
+        // side can name the summarizer: on this engine the argv carries a port, never a model.
+        try await OpenAIBackend.waitForHealth(baseURL: baseURL)
+        let props = await OpenAIBackend.probeProps(baseURL: baseURL)
         let policy: PrimePolicy
-        switch backendPolicy(modelDir: "") {
+        switch backendPolicy(modelDir: "", discovered: props.contextSize) {
         case .refused(let reason): return .refused(reason)
         case .sized(let sized): policy = sized
         }
-        try await OpenAIBackend.waitForHealth(baseURL: baseURL)
         let backend = OpenAIBackend(baseURL: baseURL, parameters: parameters, systemPrompt: nil)
         return .ready(
-            backendSummarizer(backend, engine: "openai", policy: policy, deadline: deadline))
+            backendSummarizer(
+                backend, engine: "openai", model: props.modelPath, policy: policy,
+                deadline: deadline))
     }
 }
 
 /// `BackendDigestGenerator` over a backend built for this run alone. See the file header for why
 /// that is safe here and nowhere else.
 private func backendSummarizer(
-    _ backend: GenerationBackend, engine: String, policy: PrimePolicy, deadline: Date
+    _ backend: GenerationBackend, engine: String, model: String?, policy: PrimePolicy,
+    deadline: Date
 ) -> Summarizer {
-    let name = BackendDigestGenerator.name(engine: engine)
+    let name = BackendDigestGenerator.name(engine: engine, model: model)
     return Summarizer(
         model: BackendDigestGenerator(
             backend: backend, name: name, policy: policy, timeout: digestModeSliceTimeout,

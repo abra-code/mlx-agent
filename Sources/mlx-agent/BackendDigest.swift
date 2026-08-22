@@ -61,10 +61,21 @@ struct DigestCondenseDeadline: LocalizedError {
 /// Summarizes one slice of conversation with whatever model the session is already running.
 struct BackendDigestGenerator: DigestModel {
 
-    /// The convention the prime response's `summarizer` field reports, e.g. `session:mlx`. Named
-    /// so a client can tell "the digest is thin" from "the digest was made by a 3B model" - the
-    /// same observation from its side otherwise.
-    static func name(engine: String) -> String { "session:\(engine)" }
+    /// What the prime response's `summarizer` field reports: THE MODEL, when this side can find
+    /// out what it is, and `session:<engine>` when it cannot.
+    ///
+    /// A client renders this verbatim - "64 earlier messages summarized by X" - and X is the
+    /// reader's only basis for deciding how much to trust the summary. `session:mlx` was the whole
+    /// answer for a while, and it answers the wrong question: which engine wrote it is not
+    /// something a reader can act on, while a 2B versus a 31B is the entire judgment. The paths
+    /// have several conventions to get wrong (a cached model's directory is `snapshots/main`), so
+    /// the decoding is DigestGeneratorName, in the target where it has tests.
+    ///
+    /// - Parameter model: the model path this engine is running, or nil where nothing knows it.
+    static func name(engine: String, model: String? = nil) -> String {
+        DigestGeneratorName.session(
+            engine: engine, model: model.flatMap(DigestGeneratorName.fromModelPath))
+    }
 
     /// The LIVE backend. See rule 2 in the file header.
     let backend: GenerationBackend
