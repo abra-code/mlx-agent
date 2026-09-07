@@ -1,0 +1,50 @@
+cpp_magic.h - vendored inside swift-nio
+
+Source:  swift-nio/Sources/CNIOAtomics/src/cpp_magic.h
+Origin:  Thomas Nixon and Jonathan Heathcote, the uSHET project
+         https://github.com/18sg/uSHET/blob/c09e0acafd86720efe42dc15c63e0cc228244c32/lib/cpp_magic.h
+Pin:     swift-nio 0b18836bd8b0162e7e17a995a3fbee20ed8f3b2b
+
+A C preprocessor macro library included by the CNIOAtomics sources, so its macros expand into
+the compiled output whenever swift-nio is built. Two things hide it from every automatic
+search. It carries no license FILE, and its header comment declares the license without
+reproducing it - the whole notice is the three lines:
+
+    // this is https://github.com/18sg/uSHET/blob/c09e0acafd86720efe42dc15c63e0cc228244c32/lib/cpp_magic.h
+    // LICENSE: MIT
+
+It also never uses the word "Copyright", so even the "grep the sources for Copyright" fallback
+that this repository's generate_third_party_notices.sh recommends does not surface it. It was
+found by reading swift-nio's NOTICE.txt, which attributes the file to uSHET and links to it,
+but likewise reproduces no license text.
+
+Because neither the vendored file nor anything else in the checkout carries the license body,
+what follows is the standard MIT License text that the file names, with the attribution taken
+from swift-nio's NOTICE.txt. It is reproduced here so that the MIT notice requirement is met
+for a binary that includes this code; it is not a byte-for-byte copy of an upstream LICENSE
+file, because upstream ships none beside this header. Anyone moving the swift-nio pin should
+re-check the upstream repository above for a license file to quote instead.
+
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) Thomas Nixon and Jonathan Heathcote (the uSHET project)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

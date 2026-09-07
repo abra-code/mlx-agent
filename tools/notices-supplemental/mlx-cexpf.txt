@@ -1,0 +1,29 @@
+cexpf - vendored inside mlx-swift
+
+Source:  mlx-swift/Source/Cmlx/mlx/mlx/backend/metal/kernels/cexpf.h
+         (also embedded verbatim as JIT source text in mlx-generated/unary_ops.cpp)
+
+A Metal kernel header carrying its own Apache 2.0 notice, compiled into
+default.metallib and shipped inside mlx-swift_Cmlx.bundle. The Apache license
+text itself is already in this file several times over; what is reproduced here
+is the copyright notice, which is what section 4 asks to travel with a
+derivative work and which no license file in the graph carries.
+
+Copyright © 2025 Apple Inc.
+Copyright © 2008-2013 NVIDIA Corporation
+Copyright © 2013 Filipe RNC Maia
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Forked from
+https://github.com/NVIDIA/cccl/blob/main/thrust/thrust/detail/complex/cexpf.h

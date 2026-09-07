@@ -13,13 +13,34 @@
 # Reads the resolved package graph and the SPM checkouts that the documented xcodebuild
 # -derivedDataPath build leaves behind, so the output tracks the actual pins rather than a
 # hand-maintained list. Anything that would make the output incomplete - a package with no
-# license text, a checkout with no pin, a missing supplemental directory - is a hard error.
-# A notices file that is quietly short is worse than no notices file at all, because it
-# looks complete.
+# license text, a checkout with no pin, checkouts that do not match the pins, a missing
+# supplemental directory - is a hard error. A notices file that is quietly short is worse
+# than no notices file at all, because it looks complete.
+#
+# WHAT THIS SEARCH CANNOT SEE, and what the supplemental directory is for: a license that
+# exists only as a comment at the top of a source file. Seven live cases. Four inside mlx,
+# all compiled in: small_vector.h (BSD-3, the V8 project, included by array.h and so in every
+# translation unit), pocketfft.h (BSD-3, included by both FFT backends), expm1f.h (BSD-2,
+# Norbert Juffa) and cexpf.h (Apache 2.0, NVIDIA and Filipe RNC Maia), the last two compiled
+# into the Metal library. Two inside swift-nio, whose NOTICE.txt names both but reproduces
+# neither: sha1.c (BSD-3, the WIDE Project, an ordinary compiled target) and cpp_magic.h
+# (MIT, the uSHET project, a macro header included by CNIOAtomics). And BoringSSL inside
+# swift-crypto. All seven are carried as supplementals. ACKNOWLEDGMENTS is searched for as
+# well, because mlx's copy carries a PocketFFT section, but that text names an older
+# copyright than the header of the code actually vendored, which is why the supplemental
+# exists rather than a reliance on it.
+#
+# The lesson, for whoever moves a pin: a file-name search finds license FILES, and this
+# graph's most-used third-party code does not have one. Grep the new sources for "Copyright"
+# - `grep -rIl -i copyright --include='*.h' --include='*.hpp' --include='*.cpp'
+# --include='*.metal'` over the checkouts - and read what it finds. Then read the package's
+# own NOTICE, which is where swift-nio attributes two components it does not license; and
+# know that even the Copyright grep has a blind spot, because cpp_magic.h declares "LICENSE:
+# MIT" without ever using the word.
 #
 # Usage: tools/generate_third_party_notices.sh [--checkouts DIR] [--resolved FILE]
 #                                              [--supplemental DIR] [--output FILE]
-#                                              [--allow-unpinned-checkout]
+#                                              [--allow-stale-checkouts]
 #
 # pipefail is deliberately not set: it is not POSIX, and on a shell where `set` rejects it
 # the whole option string fails and -u would be lost with it.
@@ -30,24 +51,40 @@ CHECKOUTS="$REPO_ROOT/build/SourcePackages/checkouts"
 RESOLVED="$REPO_ROOT/mlx-agent.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved"
 SUPPLEMENTAL="$REPO_ROOT/tools/notices-supplemental"
 OUTPUT=""
-ALLOW_UNPINNED="no"
+ALLOW_STALE="no"
 
 fail() { echo "generate_third_party_notices: $*" >&2; exit 1; }
+
+# Every value-taking flag goes through this, because `--output` written last on the line leaves
+# $1 empty after the shift, and an empty OUTPUT means "write to stdout" - so the one invocation
+# most likely to be a typo would silently print the notices instead of installing them. Not a
+# function that echoes the value: `fail` inside a command substitution kills the substitution
+# and not the script, which is the same class of quiet failure this whole file exists to refuse.
+require_value() { [ -n "${1:-}" ] || fail "$2 needs a value"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --checkouts=*)    CHECKOUTS="${1#*=}" ;;
-        --checkouts)      shift; CHECKOUTS="${1:-}" ;;
+        --checkouts)      shift; require_value "${1:-}" --checkouts; CHECKOUTS="$1" ;;
         --resolved=*)     RESOLVED="${1#*=}" ;;
-        --resolved)       shift; RESOLVED="${1:-}" ;;
+        --resolved)       shift; require_value "${1:-}" --resolved; RESOLVED="$1" ;;
         --supplemental=*) SUPPLEMENTAL="${1#*=}" ;;
-        --supplemental)   shift; SUPPLEMENTAL="${1:-}" ;;
-        --output=*)       OUTPUT="${1#*=}" ;;
-        --output|-o)      shift; OUTPUT="${1:-}" ;;
-        --allow-unpinned-checkout) ALLOW_UNPINNED="yes" ;;
+        --supplemental)   shift; require_value "${1:-}" --supplemental; SUPPLEMENTAL="$1" ;;
+        # require_value on this arm too: the other three `=` forms fail loudly on the
+        # later [ -f ] / [ -d ] gates, but an empty OUTPUT means "write to stdout", so
+        # `--output=` from an unset build variable would dump the notices into the build
+        # log and exit 0.
+        --output=*)       require_value "${1#*=}" --output; OUTPUT="${1#*=}" ;;
+        --output|-o)      shift; require_value "${1:-}" --output; OUTPUT="$1" ;;
+        --allow-stale-checkouts|--allow-unpinned-checkout) ALLOW_STALE="yes" ;;
         -h|--help)
             echo "Usage: $0 [--checkouts DIR] [--resolved FILE] [--supplemental DIR]"
-            echo "          [--output FILE] [--allow-unpinned-checkout]"
+            echo "          [--output FILE] [--allow-stale-checkouts]"
+            echo
+            echo "--allow-stale-checkouts downgrades three fatal checks to warnings: a checkout"
+            echo "  with no pin, a checkout whose revision does not match its pin, and a missing"
+            echo "  workspace-state.json. All three mean the output may not describe the binary"
+            echo "  beside it. --allow-unpinned-checkout is accepted as the former name."
             exit 0 ;;
         *) fail "Unknown argument: $1" ;;
     esac
@@ -57,18 +94,27 @@ done
 [ -f "$RESOLVED" ] || fail "No Package.resolved at $RESOLVED"
 [ -d "$CHECKOUTS" ] || fail "No SPM checkouts at $CHECKOUTS - run the documented xcodebuild (it populates build/SourcePackages) first"
 # The supplemental directory is the only carrier for notices that no checkout provides
-# (BoringSSL today). Skipping it because a path was mistyped would silently drop a required
-# notice, so its absence is fatal rather than a no-op.
-[ -d "$SUPPLEMENTAL" ] || fail "No supplemental notices directory at $SUPPLEMENTAL - it carries the licenses no checkout ships (BoringSSL)"
+# (BoringSSL, four mlx headers and two swift-nio components today). Skipping it because a
+# path was mistyped would silently drop a required notice, so its absence is fatal rather
+# than a no-op.
+[ -d "$SUPPLEMENTAL" ] || fail "No supplemental notices directory at $SUPPLEMENTAL - it carries the licenses that exist only as source-file headers"
+[ -z "$OUTPUT" ] || [ ! -d "$OUTPUT" ] || fail "--output names a directory: $OUTPUT"
 
-_pins="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-pins.XXXXXX")" || fail "mktemp failed"
-_liclist="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-lics.XXXXXX")" || fail "mktemp failed"
-_stage=""
-trap '/bin/rm -f "$_pins" "$_liclist" ${_stage:+"$_stage"}' EXIT
+STATE="$(/usr/bin/dirname "$CHECKOUTS")/workspace-state.json"
+
+# Declared and trapped before the first mktemp, so that a failure of the third or fourth one
+# still cleans up the ones already created.
+_pins=""; _liclist=""; _state=""; _licraw=""; _stage=""
+trap '/bin/rm -f ${_pins:+"$_pins"} ${_liclist:+"$_liclist"} ${_state:+"$_state"} ${_licraw:+"$_licraw"} ${_stage:+"$_stage"}' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 trap 'exit 131' QUIT
+
+_pins="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-pins.XXXXXX")" || fail "mktemp failed"
+_liclist="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-lics.XXXXXX")" || fail "mktemp failed"
+_state="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-state.XXXXXX")" || fail "mktemp failed"
+_licraw="$(/usr/bin/mktemp "${TMPDIR:-/tmp}/notices-raw.XXXXXX")" || fail "mktemp failed"
 
 # --- parse Package.resolved -------------------------------------------------------------
 # SPM writes one key per line, so a line-oriented parser is enough. Every pattern requires a
@@ -83,7 +129,7 @@ function qval(line,   n, s) {
 function flush(   v) {
     if (id == "") return
     v = (ver != "") ? ver : ((rev != "") ? "rev " substr(rev, 1, 12) : "-")
-    printf "%s\t%s\t%s\n", id, (loc != "" ? loc : "-"), v
+    printf "%s\t%s\t%s\t%s\n", id, (loc != "" ? loc : "-"), v, rev
 }
 /"identity"[[:space:]]*:[[:space:]]*"/ { flush(); id = qval($0); loc = ""; ver = ""; rev = ""; next }
 /"location"[[:space:]]*:[[:space:]]*"/ { loc = qval($0); next }
@@ -94,8 +140,8 @@ END { flush() }
 
 # This compares the file against itself - awk emits one row per identity line and grep counts
 # identity lines - so it detects a renamed or unquoted key, NOT a short or truncated file.
-# The real backstop against under-reporting is the unpinned-checkout check below, which
-# compares the pin list against what SPM actually put on disk.
+# The real backstops against under-reporting are the two checks below, which compare the pin
+# list against what SPM actually put on disk.
 _want=$(/usr/bin/grep -c '"identity"[[:space:]]*:' "$RESOLVED" | /usr/bin/tr -d " ")
 _got=$(/usr/bin/wc -l < "$_pins" | /usr/bin/tr -d " ")
 [ "${_got:-0}" -gt 0 ] || fail "Parsed no packages out of $RESOLVED - the format changed"
@@ -104,7 +150,7 @@ _got=$(/usr/bin/wc -l < "$_pins" | /usr/bin/tr -d " ")
 # Every checkout on disk must correspond to a pin. An unmatched one is either a stale leftover
 # from a dropped dependency or - the case that matters - a package this file would not cover.
 # Fatal by default: for a compliance artifact the safe direction is to stop, not to warn in
-# the middle of a wall of build output. --allow-unpinned-checkout is the escape hatch for a
+# the middle of a wall of build output. --allow-stale-checkouts is the escape hatch for a
 # build directory that is merely stale.
 _unpinned=""
 for _c in "$CHECKOUTS"/*; do
@@ -114,13 +160,88 @@ for _c in "$CHECKOUTS"/*; do
         || _unpinned="$_unpinned $_cb"
 done
 if [ -n "$_unpinned" ]; then
-    if [ "$ALLOW_UNPINNED" = "yes" ]; then
+    if [ "$ALLOW_STALE" = "yes" ]; then
         echo "generate_third_party_notices: WARNING: checkouts with no pin (not covered):$_unpinned" >&2
     else
         fail "Checkouts with no pin in $RESOLVED:$_unpinned
   Either they are stale (clean $CHECKOUTS, or re-resolve) or they are linked and this file
-  would not cover them. Re-run with --allow-unpinned-checkout once you know which."
+  would not cover them. Re-run with --allow-stale-checkouts once you know which."
     fi
+fi
+
+# And the pins must match the checkouts they are labeled with. The versions come from
+# Package.resolved and the license texts from the checkouts, which are two sources that can
+# disagree: pull a pin bump, run this without rebuilding, and every license set gets stamped
+# with a version whose sources are not on disk - the "describes an older graph" failure,
+# wearing the right version numbers. workspace-state.json is SPM's record of what it actually
+# checked out.
+if [ -f "$STATE" ]; then
+    /usr/bin/awk '
+    function qval(line,   n, s) {
+        n = index(line, ":"); s = substr(line, n + 1)
+        sub(/^[[:space:]]*"/, "", s); sub(/"[[:space:]]*,?[[:space:]]*$/, "", s)
+        return s
+    }
+    /"identity"[[:space:]]*:[[:space:]]*"/ { id = qval($0); rev = ""; ver = ""; next }
+    /"revision"[[:space:]]*:[[:space:]]*"/ { if (id != "" && rev == "") rev = qval($0); next }
+    /"version"[[:space:]]*:[[:space:]]*"/  { if (id != "" && ver == "") ver = qval($0); next }
+    /"subpath"[[:space:]]*:[[:space:]]*"/ {
+        if (id != "") printf "%s\t%s\t%s\n", id, rev, ver
+        id = ""; next
+    }
+    ' "$STATE" > "$_state" || fail "Could not parse $STATE"
+    _skew=""
+    # _checked, because a check that quietly examines nothing is the failure mode this whole
+    # file exists to refuse. A revision-less pin (a registry pin carries a version and no
+    # revision) used to be skipped outright, and so did every pin if the "revision" key were
+    # ever renamed - the run stayed green having verified nothing at all. Now revision-less
+    # pins fall through to the version comparison, and the tally is reported if it comes up
+    # short of the pin count.
+    _checked=0
+    _revchecked=0
+    while IFS="$(/usr/bin/printf '\t')" read -r _id _loc _ver _rev; do
+        [ -n "${_id:-}" ] || continue
+        # Last match, not first: `basedOn` is a nested ManagedDependency carrying the same key
+        # names, and it precedes the real block. First-match-wins would check a `swift package
+        # edit` dependency against its pre-edit revision while the sources on disk are an
+        # arbitrary local working copy.
+        _have=$(/usr/bin/awk -F'\t' -v n="$_id" 'tolower($1)==tolower(n) { v=$2 } END { print v }' "$_state")
+        _haveVer=$(/usr/bin/awk -F'\t' -v n="$_id" 'tolower($1)==tolower(n) { v=$3 } END { print v }' "$_state")
+        [ -n "$_have$_haveVer" ] || { _skew="$_skew $_id(absent)"; continue; }
+        _checked=$((_checked + 1))
+        if [ -n "${_rev:-}" ]; then
+            _revchecked=$((_revchecked + 1))
+            [ "$_have" = "$_rev" ] || { _skew="$_skew $_id"; continue; }
+        fi
+        # And the label, because the label is what gets printed. A pin whose version was edited
+        # without its revision is not something SPM writes, but it is what this file would
+        # repeat as fact.
+        case "$_ver" in
+            "rev "*|-) ;;
+            *) [ "$_haveVer" = "$_ver" ] || _skew="$_skew $_id(version)" ;;
+        esac
+    done < "$_pins"
+    [ "$_checked" = "$_got" ] || _skew="$_skew (only $_checked of $_got pins were checked)"
+    # Cross-checked against the state file rather than against $RESOLVED, because a renamed or
+    # unquoted "revision" key would leave the pin parser and a grep of the same file agreeing
+    # on zero. If SPM recorded revisions and we compared none, the parser has gone blind and
+    # the run would otherwise pass having compared version labels only.
+    _staterev=$(/usr/bin/awk -F'\t' '$2 != "" { n++ } END { print n + 0 }' "$_state")
+    [ "$_revchecked" -gt 0 ] || [ "$_staterev" = 0 ] \
+        || _skew="$_skew (no pin carried a revision though $STATE records $_staterev - the $RESOLVED format changed)"
+    if [ -n "$_skew" ]; then
+        if [ "$ALLOW_STALE" = "yes" ]; then
+            echo "generate_third_party_notices: WARNING: checkouts do not match the pins:$_skew" >&2
+        else
+            fail "Checkouts do not match the pins in $RESOLVED:$_skew
+  The license texts on disk are from a different resolution than the versions this file would
+  print. Re-run the documented xcodebuild."
+        fi
+    fi
+elif [ "$ALLOW_STALE" = "yes" ]; then
+    echo "generate_third_party_notices: WARNING: no $STATE - cannot prove the checkouts match the pins" >&2
+else
+    fail "No $STATE - without it there is no way to tell whether the checkouts match the pins. Re-run the documented xcodebuild."
 fi
 
 # --- per-package license discovery -------------------------------------------------------
@@ -135,17 +256,27 @@ checkout_dir() {   # $1 = identity
 # compiled straight into the binary and carries its own license beside the sources -
 # mlx-swift/Source/Cmlx holds Apple's MLX, mlx-c, fmt, nlohmann/json and metal-cpp, and
 # swift-nio/Sources/CNIOLLHTTP holds llhttp. Taking only the root LICENSE looked complete
-# while omitting all six. Tests are excluded because their fixtures are not redistributed.
-emit_package_licenses() {   # $1 = checkout dir; nonzero if it carries no license text at all
+# while omitting all six. ACKNOWLEDGMENTS is searched for as well, because that is where mlx
+# reproduces the license of the one component it vendors as a header rather than as a
+# directory (pocketfft). Tests are excluded because their fixtures are not redistributed.
+# Exit status: 0 emitted something, 1 the tree genuinely carries no license text, 2 the
+# search itself failed. 1 and 2 are both fatal at the call site but want different advice.
+emit_package_licenses() {   # $1 = checkout dir
+    # find's status, not the pipeline's: a subtree it cannot descend into is a set of licenses
+    # this file would omit, and `find | sort` would report the exit status of sort.
     /usr/bin/find "$1" -maxdepth 5 -type f \
-        \( -iname "LICENSE*" -o -iname "NOTICE*" -o -iname "COPYING*" \) \
-        ! -path "*/Tests/*" ! -path "*/.git/*" -print 2>/dev/null \
-        | LC_ALL=C /usr/bin/sort > "$_liclist" || return 1
+        \( -iname "LICENSE*" -o -iname "NOTICE*" -o -iname "COPYING*" \
+           -o -iname "ACKNOWLEDGMENTS*" \) \
+        ! -path "*/Tests/*" ! -path "*/.git/*" -print > "$_licraw" || return 2
+    LC_ALL=C /usr/bin/sort "$_licraw" > "$_liclist" || return 2
     _any=0
     while IFS= read -r _f; do
         [ -n "$_f" ] || continue
         [ -f "$_f" ] || continue
-        echo "--- ${_f#"$1"/} ---"
+        # Not `--- path ---`: fmt's LICENSE contains a line of exactly that shape ("---
+        # Optional exception to the license ---"), so a reader could not tell a heading of
+        # ours from the text of a license.
+        echo "[license file] ${_f#"$1"/}"
         echo
         /bin/cat "$_f" || fail "Could not read $_f"
         echo
@@ -184,7 +315,7 @@ HEADER
 
     _n=0
     _tab=$(/usr/bin/printf '\t')
-    while IFS="$_tab" read -r _id _loc _ver; do
+    while IFS="$_tab" read -r _id _loc _ver _rev; do
         [ -n "${_id:-}" ] || continue
         _dir=$(checkout_dir "$_id")
         [ -n "$_dir" ] && [ -d "$_dir" ] || fail "No checkout for '$_id' under $CHECKOUTS - build first so SPM resolves it"
@@ -194,14 +325,20 @@ HEADER
         echo "   ${_loc:--}"
         echo "--------------------------------------------------------------------------------"
         echo
-        emit_package_licenses "$_dir" \
-            || fail "No license text anywhere under $_dir - '$_id' would ship with no notice. Vendor its license under $SUPPLEMENTAL if upstream ships none."
+        emit_package_licenses "$_dir"
+        case $? in
+            0) ;;
+            2) fail "Could not search $_dir for license files - the search itself failed (an unreadable subtree?), so '$_id' may carry licenses this run cannot see." ;;
+            *) fail "No license text anywhere under $_dir - '$_id' would ship with no notice. Vendor its license under $SUPPLEMENTAL if upstream ships none." ;;
+        esac
         echo
     done < "$_pins"
 
-    # Vendored code that its own package ships without any license file. BoringSSL inside
-    # swift-crypto is the live case: per-file headers only, and swift-crypto's NOTICE.txt
-    # does not mention it. Each supplemental file explains what it covers and why.
+    # Licenses that exist only as a header comment in a source file, which the search above
+    # cannot find by construction: BoringSSL inside swift-crypto (per-file headers only, and
+    # swift-crypto's NOTICE.txt does not mention it), four headers inside mlx, and two
+    # components swift-nio attributes in its NOTICE.txt without reproducing their terms. Each
+    # supplemental file explains what it covers and why.
     _sup=0
     for _s in "$SUPPLEMENTAL"/*.txt; do
         [ -f "$_s" ] || continue
@@ -213,7 +350,7 @@ HEADER
         echo
         _sup=$((_sup + 1))
     done
-    [ "$_sup" -gt 0 ] || fail "No *.txt in $SUPPLEMENTAL - it must carry at least the BoringSSL notice"
+    [ "$_sup" -gt 0 ] || fail "No *.txt in $SUPPLEMENTAL - it must carry the licenses that exist only as source-file headers (BoringSSL, small_vector, pocketfft, expm1f, cexpf, nio-sha1, nio-cpp_magic)"
 }
 
 if [ -n "$OUTPUT" ]; then
