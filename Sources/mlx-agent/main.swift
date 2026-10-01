@@ -17,6 +17,7 @@
 
 import Foundation
 import AgentText
+import SandboxProfile
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -703,6 +704,12 @@ func usage() {
                                                           "-version" and bare "version" work too)
 
         OPTIONS:
+          --sandbox-profile <json> confine this process with a macOS sandbox profile before
+                                   anything else is read: folders it may read or write, programs
+                                   it may start, local ports it may connect to, and the GPU
+                                   (see docs/sandbox.md). Applies to every mode, and to every
+                                   child process. A profile that is refused ends the process.
+          --sandbox-print          with --sandbox-profile: print the profile text and exit
           --backend mlx|openai|foundation
                                    generation engine for acp/oneshot (default: mlx; map takes
                                    mlx or openai).
@@ -1043,6 +1050,60 @@ func resolveEngine(_ args: [String]) -> EngineSpec {
             Data("unknown --backend \"\(other)\": expected mlx, openai or foundation\n".utf8))
         exit(2)
     }
+}
+
+/// `--sandbox-profile <json>`: confine THIS process (see SandboxProfile.swift) before a model, an
+/// MCP config or a prompt is read. With `--sandbox-print` the profile text goes to stdout and
+/// nothing else runs, so a host can show or test what it is about to ask for. A profile that
+/// cannot be read or is refused ends the process: starting unconfined when confinement was asked
+/// for would be the one outcome nobody chose.
+func applySandboxProfile(_ args: [String]) {
+    let printOnly = args.contains("--sandbox-print")
+    // Given twice, which one is meant is a guess, and a guess is no way to pick a sandbox.
+    if args.filter({ $0 == "--sandbox-profile" }).count > 1 {
+        FileHandle.standardError.write(
+            Data("[mlx-agent sandbox] not started: --sandbox-profile was given more than once\n".utf8))
+        exit(2)
+    }
+    guard let path = option("--sandbox-profile", in: args) else {
+        // The option as the last argument, its value missing: confinement was asked for, so
+        // this must not read as "no profile" and run unconfined.
+        if args.contains("--sandbox-profile") {
+            FileHandle.standardError.write(
+                Data("[mlx-agent sandbox] not started: --sandbox-profile needs a value, the path of a JSON profile\n".utf8))
+            exit(2)
+        }
+        if printOnly {
+            FileHandle.standardError.write(Data("--sandbox-print needs --sandbox-profile <json>\n".utf8))
+            exit(2)
+        }
+        return
+    }
+    do {
+        let config = try SandboxConfig.load(path)
+        let profile = SandboxProfile.sbpl(
+            config, environment: .current,
+            warn: { warning in
+                FileHandle.standardError.write(Data("[mlx-agent sandbox] warning: \(warning)\n".utf8))
+            })
+        if printOnly {
+            print(profile, terminator: "")
+            exit(0)
+        }
+        try Sandbox.apply(profile)
+        FileHandle.standardError.write(
+            Data("[mlx-agent sandbox] applied \((path as NSString).lastPathComponent)\n".utf8))
+    } catch {
+        FileHandle.standardError.write(
+            Data("[mlx-agent sandbox] not started: \(error.localizedDescription)\n".utf8))
+        exit(2)
+    }
+}
+
+// Before the engine is resolved: `--backend foundation` asks the system about the model, and that
+// question is already something the sandbox should cover.
+if mode != "--version", mode != "-version", mode != "version" {
+    applySandboxProfile(cliArgs)
 }
 
 let extraEOSTokens = parseExtraEOSTokens(cliArgs)

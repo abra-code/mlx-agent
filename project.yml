@@ -98,6 +98,14 @@ targets:
     sources:
       - Sources/SchemaIR
 
+  # The engine's own Seatbelt profile: config parsing and the profile text. Foundation-only, so
+  # the rules (what is granted, how a path is escaped) are tested without MLX or Metal.
+  SandboxProfile:
+    type: library.static
+    platform: macOS
+    sources:
+      - Sources/SandboxProfile
+
   mlx-agent:
     type: tool
     platform: macOS
@@ -105,6 +113,7 @@ targets:
       - Sources/mlx-agent
     dependencies:
       - target: Chunking
+      - target: SandboxProfile
       - target: AgentText
       - target: AgentDigest
       - target: SchemaIR
@@ -181,6 +190,17 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
 
+  SandboxProfileTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/SandboxProfileTests
+    dependencies:
+      - target: SandboxProfile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   # Ships the tool. This is what Cadabra's embedded binary is built from.
   #
@@ -213,6 +233,7 @@ schemes:
         AgentTextTests: [test]
         AgentDigestTests: [test]
         SchemaIRTests: [test]
+        SandboxProfileTests: [test]
     test:
       config: Debug
       gatherCoverageData: false
@@ -221,3 +242,4 @@ schemes:
         - AgentTextTests
         - AgentDigestTests
         - SchemaIRTests
+        - SandboxProfileTests

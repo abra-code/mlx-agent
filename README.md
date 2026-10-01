@@ -305,6 +305,12 @@ directly. "Each call" is the default: the user can answer `allow_always` / `reje
 to settle a tool for the rest of the session. The decision is keyed on the tool name and
 never on paths - where a tool may act is the sandbox's question, not this gate's.
 
+### Confining the engine (`--sandbox-profile`)
+
+`--sandbox-profile <json>` applies a macOS sandbox profile to mlx-agent itself, before a model
+or a prompt is read: the folders it may read or write, the programs it may start, the local
+ports it may connect to, and the GPU. It covers the MCP servers it starts too. See
+[`docs/sandbox.md`](docs/sandbox.md).
 
 In ACP mode, `SIGHUP` reloads the MCP servers from the config file without ending the session
 (see [`docs/mcp-config.md`](docs/mcp-config.md)).
