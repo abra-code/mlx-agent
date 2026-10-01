@@ -33,6 +33,7 @@ the model. The set of servers is described by a JSON file passed with `--mcp-con
 
 - Each server is spawned as a child process. mlx-agent performs the MCP handshake
   (`initialize` + `tools/list`) at startup and calls `tools/call` per dispatch.
+- A second server with a name already listed is skipped, with a line in the log.
 - The tools of all servers are unioned and offered to the model. If two servers export
   the same tool name, the first server keeps the bare name and later ones are exposed as
   `<name>__<tool>`; routing maps the exposed name back to the real one.
@@ -47,6 +48,36 @@ the model. The set of servers is described by a JSON file passed with `--mcp-con
   prints the resulting tool surface (exposed names, descriptions, input schemas, gating,
   per-server handshake status) as JSON on stdout, and shuts the servers down. GUI
   inspectors (MLXChat's "Inspect MCP Servers" window) consume this dump.
+
+## Reloading the servers (SIGHUP)
+
+In ACP mode, `SIGHUP` makes mlx-agent read the `--mcp-config` file again and bring the
+running servers in line with it, without ending the session: the loaded model, the
+conversation and the session's standing permissions stay. A host uses it to change what a
+server may do while a conversation runs, for example to give a file server another allowed
+folder: it rewrites the file (write a new file and rename it over the old one, since the
+agent may read at any moment) and sends the signal.
+
+- A server whose `command`, `args` and `env` are unchanged keeps running. A change of
+  `gatedTools` alone restarts nothing; the new gating applies to the next call.
+- A server that changed is started anew, and the old process is stopped only once the new
+  one answered. If the new one cannot start, the old one keeps serving and the failure is
+  logged.
+- A server no longer listed is stopped; a new one is started.
+- A file that cannot be read or parsed changes nothing.
+- The reload runs between turns. A signal that arrives during a turn or a summarization
+  waits for its end; a prompt that arrives during a reload waits for the reload.
+- When the tools offered to the model changed (a name, a description or a schema), the
+  backend is given the new list, but the model's context still describes the old tools until
+  the session is primed or started again. Changing only what a server is allowed to do
+  changes no tool, so nothing needs priming. "Always allow" answers given in the session
+  are forgotten when the tools changed, since a name may now belong to another server.
+- Each reload writes one line to standard error, for example
+  `reload: MCP servers follow mcp-config.json: restarted local; the tools are unchanged`.
+- Before any server started (no session yet) the signal does nothing: the first session
+  reads the file as it is then. `oneshot` and `tools` do not handle the signal.
+
+`tools/acp_reload_smoke.py` exercises all of this with two fake servers.
 
 ## Guardrails
 

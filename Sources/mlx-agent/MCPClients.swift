@@ -210,9 +210,19 @@ final class MCPServer: @unchecked Sendable {
 
 // MARK: - Registry
 
-/// Immutable-after-build routing table: the union of all servers' tools as ToolSpecs,
-/// plus a lookup from the exposed (possibly namespaced) tool name back to its server,
-/// real tool name, and gated flag. Built once at session start.
+extension MCPServerConfig {
+    /// True when starting a server from `other` would start the same process as from this one:
+    /// the command, its arguments and its extra environment. `gatedTools` is not part of it: that
+    /// is a rule this process applies, and the running server is the same either way.
+    func startsSameProcess(as other: MCPServerConfig) -> Bool {
+        command == other.command && args == other.args && env == other.env
+    }
+}
+
+/// The routing table: the union of all servers' tools as ToolSpecs, plus a lookup from the
+/// exposed (possibly namespaced) tool name back to its server, real tool name, and gated flag.
+/// Built at session start, and replaced as a whole by `reload` when the config file changed
+/// (SIGHUP, see ACPServer.requestRegistryReload); readers take one consistent snapshot.
 final class MCPToolRegistry: @unchecked Sendable {
     struct Route {
         let server: MCPServer
@@ -220,24 +230,69 @@ final class MCPToolRegistry: @unchecked Sendable {
         let gated: Bool
     }
 
-    let toolSpecs: [ToolSpec]
-    private let routes: [String: Route]  // exposed name -> route
-    private let servers: [MCPServer]
-
-    private init(toolSpecs: [ToolSpec], routes: [String: Route], servers: [MCPServer]) {
-        self.toolSpecs = toolSpecs
-        self.routes = routes
-        self.servers = servers
+    /// A running server with the config that currently applies to it. After a reload that only
+    /// changed `gatedTools`, that is newer than the config the process was started from.
+    private struct Entry {
+        let server: MCPServer
+        let config: MCPServerConfig
     }
 
-    func route(_ exposedName: String) -> Route? { routes[exposedName] }
+    /// What a reload did, by server name, for the log.
+    struct ReloadReport {
+        var restarted: [String] = []
+        var added: [String] = []
+        var removed: [String] = []
+        var kept: [String] = []
+        /// Servers whose new process did not start. One that was running keeps running as before.
+        var failed: [String] = []
+        /// True when the tools offered to the model changed: a name, a description or a schema.
+        var toolsChanged = false
+
+        var summary: String {
+            var parts: [String] = []
+            if !restarted.isEmpty { parts.append("restarted \(restarted.joined(separator: ", "))") }
+            if !added.isEmpty { parts.append("added \(added.joined(separator: ", "))") }
+            if !removed.isEmpty { parts.append("removed \(removed.joined(separator: ", "))") }
+            if !failed.isEmpty { parts.append("failed to start \(failed.joined(separator: ", "))") }
+            if parts.isEmpty { parts.append("nothing to restart") }
+            return parts.joined(separator: "; ") + (toolsChanged ? "; the tools changed" : "; the tools are unchanged")
+        }
+    }
+
+    private let stateLock = NSLock()
+    private var specs: [ToolSpec]
+    private var routes: [String: Route]  // exposed name -> route
+    private var entries: [Entry]
+    private var signature: [String]
+    /// Servers a reload in flight has started but not yet put in `entries`. `terminateAll` has to
+    /// reach them too, or an exit during a reload leaves them running.
+    private var staged: [MCPServer] = []
+    /// Set by `terminateAll`: the process is going away, and a reload must start nothing more.
+    private var closed = false
+
+    private init(entries: [Entry]) {
+        let table = Self.assemble(entries)
+        self.entries = entries
+        self.specs = table.specs
+        self.routes = table.routes
+        self.signature = table.signature
+    }
+
+    var toolSpecs: [ToolSpec] { stateLock.withLock { specs } }
+
+    func route(_ exposedName: String) -> Route? { stateLock.withLock { routes[exposedName] } }
 
     func shutdownAll() async {
+        let servers = stateLock.withLock { entries.map(\.server) }
         for s in servers { await s.shutdown() }
     }
 
     /// Synchronous teardown for exit paths (SIGTERM every child immediately).
     func terminateAll() {
+        let servers = stateLock.withLock { () -> [MCPServer] in
+            closed = true
+            return entries.map(\.server) + staged
+        }
         for s in servers { s.terminateProcess() }
     }
 
@@ -245,32 +300,131 @@ final class MCPToolRegistry: @unchecked Sendable {
     /// launch is logged and skipped (its tools are simply absent) rather than aborting -
     /// one broken server should not disable the whole agent.
     static func build(_ configs: [MCPServerConfig]) async -> MCPToolRegistry {
-        var servers: [MCPServer] = []
+        var entries: [Entry] = []
+        var seen = Set<String>()
         for config in configs {
-            do {
-                servers.append(try await MCPServer.launch(config))
-            } catch {
+            // The first server of a name wins, here as in `reload`: the name is what a reload
+            // matches a running server by.
+            guard seen.insert(config.name).inserted else {
                 FileHandle.standardError.write(
-                    Data(
-                        "[mlx-agent mcp] server \(config.name) failed to launch: \(error.localizedDescription)\n"
-                            .utf8))
+                    Data("[mlx-agent mcp] skipping a second server named \(config.name)\n".utf8))
+                continue
+            }
+            if let server = await launchLogged(config) {
+                entries.append(Entry(server: server, config: config))
             }
         }
+        return MCPToolRegistry(entries: entries)
+    }
 
+    /// Bring the running servers in line with `configs`, the config file read again.
+    ///
+    /// A server whose command, arguments and environment are unchanged keeps running (its gated
+    /// tools follow the new config). One that changed is started anew, and only when the new
+    /// process answered is the old one retired, so a config that cannot start leaves the tools
+    /// working as they were. A server no longer listed is retired; a new one is started. The new
+    /// table replaces the old one in a single step, then the retired servers are shut down.
+    ///
+    /// The caller makes sure no turn is running: a tool call in flight on a retired server would
+    /// lose its answer.
+    func reload(_ configs: [MCPServerConfig]) async -> ReloadReport {
+        var report = ReloadReport()
+        // After terminateAll nothing may start: the servers are gone and the process is leaving.
+        let (current, closedAtStart) = stateLock.withLock { (entries, closed) }
+        if closedAtStart { return report }
+        var next: [Entry] = []
+        var retired: [MCPServer] = []
+        var seen = Set<String>()
+        for config in configs {
+            // The first server of a name wins, as a second one would be unreachable by name here.
+            guard seen.insert(config.name).inserted else { continue }
+            let old = current.first { $0.config.name == config.name }
+            if let old, old.config.startsSameProcess(as: config) {
+                next.append(Entry(server: old.server, config: config))
+                report.kept.append(config.name)
+                continue
+            }
+            if let server = await Self.launchLogged(config) {
+                stateLock.withLock { staged.append(server) }
+                next.append(Entry(server: server, config: config))
+                if let old {
+                    retired.append(old.server)
+                    report.restarted.append(config.name)
+                } else {
+                    report.added.append(config.name)
+                }
+            } else {
+                report.failed.append(config.name)
+                if let old { next.append(old) }
+            }
+        }
+        // Every running server that is not carried over is retired, whatever its name: `build`
+        // starts a second server of a name the file lists twice, and matching by name alone
+        // would drop that one from the table and leave its process running.
+        for old in current where !next.contains(where: { $0.server === old.server })
+            && !retired.contains(where: { $0 === old.server })
+        {
+            retired.append(old.server)
+            if !report.removed.contains(old.config.name) { report.removed.append(old.config.name) }
+        }
+        let table = Self.assemble(next)
+        let swapped: Bool? = stateLock.withLock {
+            let started = staged
+            staged = []
+            // terminateAll ran while the new servers were starting. It stopped the ones it could
+            // see; stop the rest here rather than publish a table nobody will use.
+            if closed {
+                for server in started { server.terminateProcess() }
+                return nil
+            }
+            let changed = table.signature != signature
+            entries = next
+            specs = table.specs
+            routes = table.routes
+            signature = table.signature
+            return changed
+        }
+        guard let swapped else { return ReloadReport() }
+        report.toolsChanged = swapped
+        for server in retired { await server.shutdown() }
+        return report
+    }
+
+    private static func launchLogged(_ config: MCPServerConfig) async -> MCPServer? {
+        do {
+            return try await MCPServer.launch(config)
+        } catch {
+            FileHandle.standardError.write(
+                Data(
+                    "[mlx-agent mcp] server \(config.name) failed to launch: \(error.localizedDescription)\n"
+                        .utf8))
+            return nil
+        }
+    }
+
+    /// The table for a set of servers: the specs, the routes, and a signature of what the model
+    /// is offered (each tool's exposed name, description and schema), to tell whether a reload
+    /// changed it.
+    private static func assemble(_ entries: [Entry]) -> (specs: [ToolSpec], routes: [String: Route], signature: [String]) {
         var routes: [String: Route] = [:]
         var specs: [ToolSpec] = []
-        for server in servers {
-            for tool in server.tools {
+        var signature: [String] = []
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        for entry in entries {
+            for tool in entry.server.tools {
                 // Namespace collision: first server wins the bare name; later servers
                 // get "<server>__<tool>" so both remain reachable and distinct.
-                let exposed = routes[tool.name] == nil ? tool.name : "\(server.config.name)__\(tool.name)"
+                let exposed = routes[tool.name] == nil ? tool.name : "\(entry.config.name)__\(tool.name)"
                 if routes[exposed] != nil { continue }  // extremely unlikely double collision
-                let gated = server.config.gatedTools.contains(tool.name)
-                routes[exposed] = Route(server: server, toolName: tool.name, gated: gated)
+                let gated = entry.config.gatedTools.contains(tool.name)
+                routes[exposed] = Route(server: entry.server, toolName: tool.name, gated: gated)
                 specs.append(makeToolSpec(tool, exposedName: exposed))
+                let schema = (try? encoder.encode(tool.inputSchema)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                signature.append("\(exposed)\u{0}\(tool.description ?? "")\u{0}\(schema)")
             }
         }
-        return MCPToolRegistry(toolSpecs: specs, routes: routes, servers: servers)
+        return (specs, routes, signature)
     }
 }
 

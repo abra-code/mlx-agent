@@ -150,6 +150,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     // be appended to `mlxTranscript` at turn end. Written from agentEmitText, read/reset under lock.
     private var assistantTurnBuffer = ""
     private var registryBuildTask: Task<MCPToolRegistry?, Never>?
+    // SIGHUP asks for the MCP servers to follow the config file again (requestRegistryReload).
+    // The reload runs only between turns: `registryReloadPending` holds a request that arrived
+    // during one, and `registryReloadTask` is the reload in flight, which a prompt waits for.
+    private var registryReloadPending = false
+    private var registryReloadTask: Task<Void, Never>?
     private var signalSources: [DispatchSourceSignal] = []
     private var sessionID: String?
     // The absolute working directory the client declared in session/new (ACP's `cwd`). The
@@ -675,7 +680,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return created
         }
         let built = await task.value
-        lock.withLock { if registry == nil { registry = built } }
+        lock.withLock {
+            if registry == nil { registry = built }
+            // A config that could not be loaded is not remembered as the answer: the next
+            // session, or a reload, reads the file again.
+            if built == nil { registryBuildTask = nil }
+        }
         return built
     }
 
@@ -694,6 +704,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
     /// Terminate MCP children on SIGTERM/SIGINT so they do not orphan when the client
     /// kills us rather than closing stdin (the pipe-EOF path goes through finish()).
     private func installSignalHandlers() {
+        // SIGHUP reloads the MCP servers from the config file (requestRegistryReload).
+        signal(SIGHUP, SIG_IGN)
+        let hangup = DispatchSource.makeSignalSource(signal: SIGHUP, queue: .global())
+        hangup.setEventHandler { [weak self] in self?.requestRegistryReload() }
+        hangup.resume()
+        lock.withLock { signalSources.append(hangup) }
         for sig in [SIGTERM, SIGINT] {
             signal(sig, SIG_IGN)  // disable default terminate so the source can fire
             let source = DispatchSource.makeSignalSource(signal: sig, queue: .global())
@@ -712,6 +728,77 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
         }
     }
 
+    /// SIGHUP: the file behind `--mcp-config` changed, and the running servers should follow it
+    /// without ending the session (a host that lets its user allow another folder for a file
+    /// server rewrites the file and signals). Runs at once when nothing is in progress; a request
+    /// that arrives during a turn or a summarization waits for its end, since a tool call in
+    /// flight on a server being replaced would lose its answer. Several requests while one waits
+    /// are one reload: the file is read when the reload runs.
+    private func requestRegistryReload() {
+        lock.withLock {
+            if registryReloadTask != nil || busyReasonLocked() != nil {
+                registryReloadPending = true
+            } else {
+                startRegistryReloadLocked()
+            }
+        }
+    }
+
+    /// MUST be called with `lock` held, with no reload in flight.
+    private func startRegistryReloadLocked() {
+        registryReloadPending = false
+        registryReloadTask = Task { [weak self] in await self?.performRegistryReload() }
+    }
+
+    /// Starts the reload a turn or a summarization held up, once it has ended.
+    private func runPendingRegistryReload() {
+        lock.withLock {
+            if registryReloadPending, registryReloadTask == nil, busyReasonLocked() == nil {
+                startRegistryReloadLocked()
+            }
+        }
+    }
+
+    private func performRegistryReload() async {
+        defer {
+            lock.withLock {
+                registryReloadTask = nil
+                if registryReloadPending, busyReasonLocked() == nil { startRegistryReloadLocked() }
+            }
+        }
+        guard let path = mcpConfigPath else {
+            log("reload asked for (SIGHUP), but there is no --mcp-config to read again")
+            return
+        }
+        // No servers yet, and none being started: the first session reads the file as it is then.
+        let started = lock.withLock { registry != nil || registryBuildTask != nil }
+        guard started, let registry = await ensureRegistry() else {
+            log("reload asked for (SIGHUP) before any MCP server started; the config is read at first use")
+            return
+        }
+        let configs: [MCPServerConfig]
+        do {
+            configs = try MCPConfigLoader.load(path)
+        } catch {
+            // The servers that run keep running: a file caught half written must not take the tools away.
+            log("reload: MCP config load failed, servers left as they are: \(error.localizedDescription)")
+            return
+        }
+        let report = await registry.reload(configs)
+        log("reload: MCP servers follow \((path as NSString).lastPathComponent): \(report.summary)")
+        if report.toolsChanged {
+            // The backend holds the tool list it was last given; hand it the new one. The model's
+            // context still describes the old tools until the session is primed or started again.
+            // "Always allow" answers are kept by exposed tool name, and a changed set of tools can
+            // put another server's tool behind a name, so they do not survive the change.
+            let (agent, modeNow) = lock.withLock { () -> (Agent?, String) in
+                resetSessionPermissionsLocked()
+                return (self.agent, self.mode)
+            }
+            agent?.setToolsEnabled(modeNow == "agent")
+        }
+    }
+
     private func handlePrompt(id: Int?, params: [String: Any]) {
         // One turn at a time: the backend is not safe to drive concurrently (see
         // MLXBackend). Claim the slot ATOMICALLY with the busy-check - see promptStarting.
@@ -726,7 +813,12 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
             return
         }
         // From here the claim (promptStarting) is held; every early return MUST release it.
-        func releaseClaim() { lock.withLock { self.promptStarting = false } }
+        // A reload that was asked for while the claim was held would otherwise wait for the end
+        // of a turn that never starts.
+        func releaseClaim() {
+            lock.withLock { self.promptStarting = false }
+            runPendingRegistryReload()
+        }
         // idleUnloaded means the session is live but its model was released to save RAM: the
         // agent is nil yet the prompt is valid, so reload rather than reject. A nil agent that is
         // NOT idle-unloaded is a genuine "no session yet".
@@ -757,7 +849,11 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     self.promptStarting = false
                 }
                 self.rearmIdleTimerIfIdle()
+                self.runPendingRegistryReload()
             }
+            // A reload of the MCP servers that began just before this turn claimed its slot: wait
+            // for the new servers rather than call one that is being replaced.
+            await self.lock.withLock({ self.registryReloadTask })?.value
             // Reload the model if it was idle-unloaded, then use the freshly rebuilt agent.
             let live: Agent
             if unloaded {
@@ -1014,6 +1110,7 @@ final class ACPServer: @unchecked Sendable, AgentDelegate {
                     self.condensing = false
                     self.condenseTask = nil
                 }
+                self.runPendingRegistryReload()
             }
             // Re-read rather than capture, and safe for a specific reason: idleFired tests
             // `condensing`, which we are holding, so no unload can free the container underneath
