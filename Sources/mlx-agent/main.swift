@@ -732,6 +732,8 @@ func usage() {
           --prompt <text>          prompt for chat/oneshot mode
           --spool <dir>            spool directory for map mode (job.json in, status/result out)
           --mcp-config <json>      stdio-direct MCP server config (enables tools)
+                                   in acp mode, SIGHUP reads it again and restarts the
+                                   servers that changed, keeping the session
           --mode chat|agent        initial ACP mode (default: agent if --mcp-config, else chat)
           --auto-permission <x>    oneshot gate answer: allow | deny (default: deny)
           --extra-eos-token <t>    extra generation stop token, unioned into the model's stop set
