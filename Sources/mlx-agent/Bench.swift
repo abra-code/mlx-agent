@@ -100,7 +100,7 @@ func runBench(
         // Greedy top-1 sampling. A model may emit its EOS before genTokens; such a run
         // reports its true genCount and the tok/s stays valid (rate, not total).
         var parameters = GenerateParameters(maxTokens: genTokens, temperature: 0)
-        if let prefillStep { parameters.prefillStepSize = prefillStep }
+        if let prefillStep { parameters.prefill.stepSize = prefillStep }
 
         var collected: [RunStats] = []
         for run in 0...runs {  // run 0 is the unmeasured JIT warmup

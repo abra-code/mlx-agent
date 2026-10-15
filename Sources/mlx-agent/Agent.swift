@@ -183,6 +183,7 @@ final class Agent: @unchecked Sendable {
             iteration += 1
 
             var pendingCalls: [ToolCall] = []
+            var rejections: [RejectedToolCall] = []
             do {
                 for try await event in backend.stream(messages) {
                     if Task.isCancelled { return .cancelled }
@@ -197,6 +198,8 @@ final class Agent: @unchecked Sendable {
                         delegate?.agentEmitText(kind: .thought, text)
                     case .toolCall(let call):
                         pendingCalls.append(call)
+                    case .rejectedToolCall(let rejection):
+                        rejections.append(rejection)
                     case .info(let info):
                         totalTokens += info.promptTokenCount + info.generationTokenCount
                         genTokens += info.generationTokenCount
@@ -216,6 +219,17 @@ final class Agent: @unchecked Sendable {
             // glued to the front of the next pass's answer. `inThink` survives on purpose -
             // a <think> block may span a tool call.
             for (kind, seg) in splitter.flush() { delegate?.agentEmitText(kind: kind, seg) }
+
+            // After the flush, so the notice cannot jump ahead of text the splitter was holding.
+            // Before mlx-swift-lm 3.32 this output reached the reader as raw tool markup; without
+            // a notice a pass that produced only a rejected call would end as a blank answer.
+            for rejection in rejections {
+                delegate?.agentEmitText(
+                    kind: .message,
+                    "\n[the model's tool call"
+                        + (rejection.toolName.map { " to \($0)" } ?? "")
+                        + " could not be used (\(rejection.reason.rawValue)); ignored]\n")
+            }
 
             messages = []  // consumed by the backend; next input is tool results (if any)
 

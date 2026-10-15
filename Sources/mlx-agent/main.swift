@@ -402,7 +402,7 @@ func runGate(model dir: String, extraEOSTokens: Set<String>) async throws -> Int
     print(String(repeating: "=", count: 78))
     print("mlx-agent tool-calling gate")
     print("model  : \(dir)")
-    print("engine : mlx-swift-lm 3.31.4 (MLXBackend + ToolCallProcessor)")
+    print("engine : mlx-swift-lm 3.32.3 (MLXBackend + ToolCallProcessor)")
     print(String(repeating: "=", count: 78))
 
     let baseline = MLX.Memory.snapshot()

@@ -10,8 +10,10 @@
 // `reasoning_content`) must NOT come through here - see Agent's `.reasoning` handling.
 //
 // Two marker vocabularies are understood, because the native MLX path gets raw model text
-// and mlx-swift-lm has no reasoning parser of any kind (it parses tool calls per family,
-// but nothing in MLXLMCommon so much as mentions reasoning - checked against 3.31.4):
+// and mlx-swift-lm passes reasoning through as plain text for every family this handles (it
+// parses tool calls per family; as of 3.32.3 it classifies reasoning only for the gpt-oss and
+// Atem token protocols, and DROPS that reasoning from its public `Generation` stream rather than
+// passing it on - so neither family's reasoning ever reaches this splitter):
 //
 //   <think>...</think>                      - the de-facto standard, most families
 //   <|channel>LABEL\n...<channel|>          - Gemma 4, whose delimiters are real special

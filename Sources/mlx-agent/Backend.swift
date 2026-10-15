@@ -39,6 +39,10 @@ enum BackendEvent: Sendable {
     /// Text the backend knows is reasoning; goes straight to thought.
     case reasoning(String)
     case toolCall(ToolCall)
+    /// Tool-call-shaped output the library refused to turn into a `ToolCall` (malformed,
+    /// incomplete, over its parser budget, or with arguments it could not represent). Only the
+    /// MLX backend yields it. Carries no executable call, so the loop reports it and moves on.
+    case rejectedToolCall(RejectedToolCall)
     case info(GenerateCompletionInfo)
 }
 
@@ -324,7 +328,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
             if !cache.isEmpty && !hasMedia {
                 log("cache not reusable (trimmable=\(canTrimPromptCache(cache)) uniform=\(uniformOffsets)); rebuilding and re-prefilling \(fullTokens.count) tokens")
             }
-            cache = makePromptCache(model: model, parameters: parameters)
+            cache = try makePromptCache(model: model, parameters: parameters)
         } else {
             // Never reuse the entire prompt: there has to be at least one token left to decode
             // the next logits from.
@@ -335,7 +339,7 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
             let surplus = offsets[0] - reused
             if surplus > 0, trimPromptCache(cache, numTokens: surplus) != surplus {
                 log("cache trim came up short; rebuilding")
-                cache = makePromptCache(model: model, parameters: parameters)
+                cache = try makePromptCache(model: model, parameters: parameters)
                 reused = 0
             }
         }
@@ -377,6 +381,30 @@ final class MLXBackend: GenerationBackend, @unchecked Sendable {
             case .toolCall(let call):
                 calls.append(call)
                 continuation.yield(.toolCall(call))
+            case .rejectedToolCall(let rejection):
+                // mlx-swift-lm 3.32 stopped passing unusable tool-call output through as text,
+                // and it now refuses a call to an undeclared tool itself. That second case used to
+                // reach Agent.dispatch as an ordinary call and come back to the model as "unknown
+                // tool", which is how a model that guessed a name recovers - so it is turned back
+                // into that call. The arguments are gone, but an unknown tool never reads them.
+                // Only while tools are declared: with none (ask mode, a digest pass) the gpt-oss
+                // router rejects EVERY call as undeclared, real registry tools included, and the
+                // converted call would then run that tool with no arguments.
+                // Never log `rawTextPreview`: the library warns it can hold argument values.
+                if rejection.reason == .undeclaredTool, let name = rejection.toolName,
+                    toolSpecs?.isEmpty == false
+                {
+                    let call = ToolCall(
+                        function: .init(name: name, arguments: [String: JSONValue]()),
+                        id: rejection.callID)
+                    calls.append(call)
+                    continuation.yield(.toolCall(call))
+                } else {
+                    log("rejected tool call: \(rejection.reason.rawValue)"
+                        + (rejection.toolName.map { " (\($0))" } ?? "")
+                        + (rejection.detail.map { ": \($0)" } ?? ""))
+                    continuation.yield(.rejectedToolCall(rejection))
+                }
             case .info(let info):
                 continuation.yield(.info(info))
             @unknown default:
