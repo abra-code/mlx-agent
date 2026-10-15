@@ -178,6 +178,17 @@ Two output modes:
   (classify, tag, extract) or when the caller does its own reduce/reassembly (e.g.
   map-reduce summarization).
 
+A stitch job may also carry a **`reduce`** template (`{"messages": [...]}` or `{"prompt":
+"..."}`, the same shapes as the job's own; a reduce `prompt` takes its own
+`add_special_tokens`) to make it a map-reduce with ONE output, such as a summary of a document
+of any length. When the text fits in one chunk, the reduce template runs on it directly.
+Otherwise every chunk goes through the job's own (map) template ("summarize this part"), the
+outputs are joined with blank lines, and the joined text goes round again:
+through the reduce template once it fits in one chunk ("summarize these part summaries"),
+through another map round while it does not (at most 4 rounds). `result.txt` is written once,
+with the final output, and `chunk`/`total` in `status.json` count every generation, the final
+reduce included.
+
 Spool protocol (writes are atomic - temp file + rename - except the append-only jsonl):
 
 - **in** `job.json` - `{"epoch": N, "text": "...", "budget_tokens": 1200, "output":
@@ -189,12 +200,14 @@ Spool protocol (writes are atomic - temp file + rename - except the append-only 
   `budget_tokens` (default 1200) caps the per-chunk source token count. In place of inline
   `text`, a job may set `"text_file": "<name>"` to read the source from that file in the spool
   dir (basename only) - handy for a shell producer avoiding JSON-encoding, and for large inputs.
+  An optional `"reduce": {...}` (stitch only) makes the job a map-reduce, as described above.
 - **in** `stop` - an empty flag file; requests cancellation of the current job. Checked
   between chunks and during generation (an in-flight chunk is canceled).
 - **out** `status.json` - `{"state": loading|ready|mapping|done|cancelled|error, "epoch": N,
   "chunk": k, "total": N, "message": "..."}`, plus optional progress fields while mapping
   (`tok_per_sec`, `tokens_done`, `tokens_total`, `eta_sec`).
-- **out** `result.txt` (stitch) - the accumulated stitched output so far (grows per chunk).
+- **out** `result.txt` (stitch) - the accumulated stitched output so far (grows per chunk); with
+  `reduce`, only the final output, written once at the end.
 - **out** `results.jsonl` (collect) - one `{"index", "source", "output", "sep"}` object per
   line, appended as each chunk finishes. `concat(source + sep)` over the records reproduces
   the input, so a caller can reassemble or align outputs itself.

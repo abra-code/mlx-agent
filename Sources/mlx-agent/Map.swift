@@ -28,19 +28,23 @@
 //     verbatim inter-chunk separators -> result.txt (progressive).
 //   - collect: emit a per-chunk record -> results.jsonl (one JSON object per line). Use for
 //     text->data maps (classify/extract) or when the caller does its own reduce/reassembly.
+//   A stitch job may add a "reduce" template (same shapes as its own) for a map-reduce with ONE
+//   output, e.g. a summary of any length: see processReduce.
 //
 // Spool protocol (writes are atomic - temp file + rename - except the append-only jsonl):
 //   in:  job.json  {"epoch": N, "text": "...", "budget_tokens": 1200,
 //                   "output": "stitch"|"collect",
 //                   "messages": [ <chat messages, with "{{chunk}}" somewhere> ]
 //                   | "prompt": "<completion prompt with {{chunk}}>"
-//                     [, "add_special_tokens": true|false]}   // prompt only; default true
+//                     [, "add_special_tokens": true|false]   // prompt only; default true
+//                     [, "reduce": {"messages": [...]} | {"prompt": "..."}]}  // stitch only
 //        stop       empty flag file; requests cancellation of the current job
 //   out: status.json {"state": loading|ready|mapping|done|cancelled|error,
 //                     "epoch": N, "chunk": k, "total": N, "message": "...",
 //                     // progress metrics (present on ready/mapping/done as available):
 //                     "tok_per_sec": F, "tokens_done": D, "tokens_total": T, "eta_sec": S}
-//        result.txt   (stitch) accumulated stitched output so far
+//        result.txt   (stitch) accumulated stitched output so far; with reduce, the final output
+//                     only, written once
 //        results.jsonl (collect) one {"index","source","output","sep"} object per line
 //
 // Exits when the spool directory disappears (owner quit) or stdin hits EOF (parent death).
@@ -103,10 +107,11 @@ private final class JobMeter: @unchecked Sendable {
 final class MapServer: @unchecked Sendable {
     private enum Output { case stitch, collect }
 
-    /// The job's per-chunk template: chat `messages` rendered through the model's own chat
-    /// template, or a raw completion `prompt` for models that ship none. `specialTokens`
-    /// mirrors HF's `add_special_tokens` (whether the tokenizer wraps the prompt in BOS/EOS);
-    /// chat templates emit their own special tokens, so it applies to `prompt` only.
+    /// A job's template (its per-chunk one, or its reduce one): chat `messages` rendered
+    /// through the model's own chat template, or a raw completion `prompt` for models that ship
+    /// none. `specialTokens` mirrors HF's `add_special_tokens` (whether the tokenizer wraps the
+    /// prompt in BOS/EOS); chat templates emit their own special tokens, so it applies to
+    /// `prompt` only.
     fileprivate enum Template: Sendable {
         case messages(Data)  // JSON of the `messages` template (carries {{chunk}})
         case prompt(String, specialTokens: Bool)
@@ -119,6 +124,9 @@ final class MapServer: @unchecked Sendable {
         let budget: Int
         let output: Output
         let template: Template
+        /// Optional map-reduce: applied to the whole text when it fits in one chunk, else to the
+        /// joined per-chunk outputs (see processReduce).
+        let reduce: Template?
     }
 
     /// One chunk's generation result plus the exact decode stats for tok/s.
@@ -331,6 +339,18 @@ final class MapServer: @unchecked Sendable {
             writeStatus(state: "error", epoch: job.epoch, message: placeholderMissing)
             return
         }
+        if case .messages(let data)? = job.reduce, !Self.templateHasPlaceholder(data) {
+            writeStatus(
+                state: "error", epoch: job.epoch,
+                message: "reduce messages template has no \(Self.placeholder) placeholder value")
+            return
+        }
+        if case .prompt(let prompt, _)? = job.reduce, !prompt.contains(Self.placeholder) {
+            writeStatus(
+                state: "error", epoch: job.epoch,
+                message: "reduce prompt template has no \(Self.placeholder) placeholder")
+            return
+        }
 
         // Reset the output surface: truncate the file this job writes and remove the other
         // mode's file, so a stale result from a prior job can never be read as this job's.
@@ -346,6 +366,11 @@ final class MapServer: @unchecked Sendable {
         if job.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if job.output == .stitch { writeText(job.text, to: resultTxtURL) }
             writeStatus(state: "done", epoch: job.epoch, chunk: 0, total: 0, message: "Done")
+            return
+        }
+
+        if let reduce = job.reduce {
+            await processReduce(job, reduce: reduce)
             return
         }
 
@@ -476,6 +501,174 @@ final class MapServer: @unchecked Sendable {
             job.epoch, sumGenTokens, sumGenTime, decodeRate))
     }
 
+    /// Rounds of mapping a reduce job may take before its text fits in one chunk. Each round
+    /// replaces every chunk with a short output, so one round covers any text up to (budget /
+    /// output size) chunks - hundreds of pages for a summary. The cap stops a template whose
+    /// outputs do not shrink the text from looping forever.
+    private static let maxReduceRounds = 4
+
+    /// A map-reduce job (job.reduce set; stitch only). When the text fits in one chunk, the
+    /// reduce template runs on it directly - so a short document gets exactly the one-pass result.
+    /// Otherwise each chunk goes through the job's own (map) template, the outputs are joined
+    /// with blank lines, and the joined text goes round again: the reduce template once it fits,
+    /// another map round if it still does not. Summarization is the use: "summarize this part",
+    /// then "summarize these part summaries".
+    ///
+    /// Unlike stitch, result.txt is written once, with the final output: the intermediate part
+    /// outputs are not the result, and a reader that shows result.txt as it grows must not show
+    /// them. Progress counts every generation as a step: N map chunks plus the final reduce.
+    private func processReduce(_ job: Job, reduce: Template) async {
+        let params = gen.apply(to: GenerateParameters(maxTokens: 2048, temperature: 0))
+        var text = job.text
+        var stepsDone = 0
+        var genTokens = 0
+        var genTime = 0.0
+        for round in 0...Self.maxReduceRounds {
+            let chunks: [Chunk]
+            let inTokens: [Int]
+            do {
+                (chunks, inTokens) = try await engine.chunkAndCount(text: text, budget: job.budget)
+            } catch {
+                writeStatus(
+                    state: "error", epoch: job.epoch,
+                    message: "Chunking failed: \(error.localizedDescription)")
+                log("job \(job.epoch): chunking failed: \(error.localizedDescription)")
+                return
+            }
+            let fits = chunks.count <= 1
+            if !fits && round == Self.maxReduceRounds {
+                writeStatus(
+                    state: "error", epoch: job.epoch,
+                    message: "The text is still \(chunks.count) chunks long after \(round) rounds of mapping")
+                log("job \(job.epoch): reduce gave up after \(round) rounds (\(chunks.count) chunks left)")
+                return
+            }
+            let template = fits ? reduce : job.template
+            let texts = fits ? [chunks.first?.text ?? text] : chunks.map(\.text)
+            let counts = fits ? [inTokens.first ?? 0] : inTokens
+            // The final reduce is one more step after this round's map steps.
+            let totalSteps = stepsDone + texts.count + (fits ? 0 : 1)
+            log("job \(job.epoch): reduce round \(round + 1): \(fits ? "reduce" : "map") over \(texts.count) chunk(s), \(counts.reduce(0, +)) input tokens")
+            guard
+                let outputs = await generateSteps(
+                    texts, inTokens: counts, template: template, epoch: job.epoch, params: params,
+                    firstStep: stepsDone, totalSteps: totalSteps, genTokens: &genTokens,
+                    genTime: &genTime)
+            else { return }  // cancelled or failed; the terminal status is written
+            stepsDone += texts.count
+            if fits {
+                writeText(outputs.first ?? "", to: resultTxtURL)
+                let decodeRate = genTime > 0 ? Double(genTokens) / genTime : primedRate
+                writeStatus(
+                    state: "done", epoch: job.epoch, chunk: stepsDone, total: stepsDone,
+                    tokPerSec: decodeRate > 0 ? decodeRate : nil, tokensDone: genTokens,
+                    tokensTotal: genTokens, etaSec: 0, message: "Done")
+                log(String(
+                    format: "job %d: done - %d tokens in %.1fs (%.1f tok/s)",
+                    job.epoch, genTokens, genTime, decodeRate))
+                return
+            }
+            text = outputs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n\n")
+            // Every part came back empty: reducing "" would hand the model nothing to work on, and
+            // its reply ("please provide the text") would read as the result.
+            if text.isEmpty {
+                writeStatus(
+                    state: "error", epoch: job.epoch, chunk: stepsDone, total: stepsDone,
+                    message: "The parts of the text produced no output")
+                log("job \(job.epoch): reduce stopped - every map output in round \(round + 1) was empty")
+                return
+            }
+        }
+    }
+
+    /// Generate `template` over each of `texts` in order, as progress steps firstStep... of
+    /// totalSteps, with the same background reporter and stop-file handling as a plain job.
+    /// Returns the outputs, or nil after writing the terminal status (cancelled or error).
+    private func generateSteps(
+        _ texts: [String], inTokens: [Int], template: Template, epoch: Int,
+        params: GenerateParameters, firstStep: Int, totalSteps: Int,
+        genTokens: inout Int, genTime: inout Double
+    ) async -> [String]? {
+        let meter = JobMeter(
+            jobStart: Date(), epoch: epoch, totalChunks: totalSteps,
+            totalInputTokens: inTokens.reduce(0, +), primedRate: primedRate)
+        meter.beginChunk(firstStep)
+        // At once, as a plain job does: the reporter's first tick is half a second away, and until
+        // then status.json would still describe the previous job (or this job's previous round).
+        writeStatus(
+            state: "mapping", epoch: epoch, chunk: firstStep, total: totalSteps,
+            tokPerSec: primedRate > 0 ? primedRate : nil,
+            message: "Mapping \(firstStep) of \(totalSteps)")
+        let reporter = Task { [self] in
+            var emaRate = meter.primedRate
+            var prevTokens = 0
+            var prevTime = meter.jobStart
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if Task.isCancelled { break }
+                let now = Date()
+                let s = meter.snapshot()
+                let dt = now.timeIntervalSince(prevTime)
+                let dTok = s.tokensDone - prevTokens
+                if dt > 0.05 && dTok > 0 {
+                    let inst = Double(dTok) / dt
+                    emaRate = emaRate > 0 ? 0.6 * emaRate + 0.4 * inst : inst
+                }
+                prevTokens = s.tokensDone
+                prevTime = now
+                let rate = emaRate > 0 ? emaRate : meter.primedRate
+                let eta = rate > 0 ? Int((Double(max(0, s.totalOut - s.tokensDone)) / rate).rounded()) : nil
+                self.writeStatus(
+                    state: "mapping", epoch: meter.epoch, chunk: s.chunkIndex, total: meter.totalChunks,
+                    tokPerSec: rate > 0 ? rate : nil, tokensDone: s.tokensDone, tokensTotal: s.totalOut,
+                    etaSec: eta, message: "Mapping \(s.chunkIndex) of \(meter.totalChunks)")
+            }
+        }
+        func stopReporter() async { reporter.cancel(); _ = await reporter.value }
+
+        var outputs: [String] = []
+        for (i, text) in texts.enumerated() {
+            let step = firstStep + i
+            if stopRequested() {
+                await stopReporter()
+                writeStatus(
+                    state: "cancelled", epoch: epoch, chunk: step, total: totalSteps, message: "Canceled")
+                log("job \(epoch): canceled before step \(step + 1)")
+                return nil
+            }
+            meter.beginChunk(step)
+            let result: ChunkResult
+            do {
+                result = try await engine.generate(
+                    chunk: text, template: template, params: params,
+                    meter: meter, stopURL: stopURL, stopCheckStride: stopCheckStride)
+            } catch {
+                await stopReporter()
+                writeStatus(
+                    state: "error", epoch: epoch, chunk: step, total: totalSteps,
+                    message: "Generation failed: \(error.localizedDescription)")
+                log("job \(epoch): step \(step + 1) error: \(error.localizedDescription)")
+                return nil
+            }
+            meter.endChunk(inputTokens: inTokens[i], outputTokens: result.genTokens)
+            genTokens += result.genTokens
+            genTime += result.genTime
+            outputs.append(result.text)
+            if stopRequested() {
+                await stopReporter()
+                writeStatus(
+                    state: "cancelled", epoch: epoch, chunk: step + 1, total: totalSteps,
+                    message: "Canceled")
+                log("job \(epoch): canceled after step \(step + 1)")
+                return nil
+            }
+        }
+        await stopReporter()
+        return outputs
+    }
+
     // MARK: Template rendering
 
     /// Parse the job's `messages` template and substitute the chunk text for `{{chunk}}` in
@@ -600,42 +793,73 @@ final class MapServer: @unchecked Sendable {
             return .invalid(epoch: epoch, reason: "job has no \"text\" or readable \"text_file\"")
         }
         // The per-chunk template is EITHER chat `messages` OR a raw completion `prompt` -
-        // exactly one. Both present is ambiguous (which would win?), so it is rejected rather
-        // than silently preferring one. An explicit JSON null (NSNull) counts as absent, so
-        // {"prompt": "...", "messages": null} means what the producer meant.
+        // exactly one (see parseTemplate).
+        let template: Template
+        switch Self.parseTemplate(obj) {
+        case .failure(let error): return .invalid(epoch: epoch, reason: error.description)
+        case .success(let t): template = t
+        }
+        let budget = (obj["budget_tokens"] as? NSNumber)?.intValue ?? 1200
+        let output: Output = (obj["output"] as? String == "collect") ? .collect : .stitch
+        // An optional "reduce" template ({"messages": [...]} or {"prompt": "..."}) turns the job
+        // into a map-reduce (see processReduce). It produces ONE output, so it pairs with stitch
+        // only: a collect job's per-chunk records are the caller's to reduce.
+        var reduce: Template? = nil
+        if let raw = obj["reduce"], !(raw is NSNull) {
+            guard let reduceObj = raw as? [String: Any] else {
+                return .invalid(epoch: epoch, reason: "job \"reduce\" is not an object")
+            }
+            guard output == .stitch else {
+                return .invalid(epoch: epoch, reason: "job \"reduce\" needs \"output\": \"stitch\"")
+            }
+            switch Self.parseTemplate(reduceObj) {
+            case .failure(let error): return .invalid(epoch: epoch, reason: "reduce: \(error.description)")
+            case .success(let t): reduce = t
+            }
+        }
+        return .job(
+            Job(
+                epoch: epoch, text: text, budget: max(64, budget), output: output,
+                template: template, reduce: reduce))
+    }
+
+    /// A template from a job object (or its "reduce" object): EITHER chat `messages` OR a raw
+    /// completion `prompt` - exactly one. Both present is ambiguous (which would win?), so it is
+    /// rejected rather than silently preferring one. An explicit JSON null (NSNull) counts as
+    /// absent, so {"prompt": "...", "messages": null} means what the producer meant.
+    private static func parseTemplate(_ obj: [String: Any]) -> Result<Template, TemplateError> {
         func present(_ key: String) -> Any? {
             let v = obj[key]
             return v is NSNull ? nil : v
         }
-        let template: Template
         switch (present("messages"), present("prompt")) {
         case (.some, .some):
-            return .invalid(epoch: epoch, reason: "job has both \"messages\" and \"prompt\"")
+            return .failure(TemplateError("job has both \"messages\" and \"prompt\""))
         case (.some(let raw), nil):
             guard let messages = raw as? [[String: Any]], !messages.isEmpty,
                 let messagesData = try? JSONSerialization.data(withJSONObject: messages)
             else {
-                return .invalid(epoch: epoch, reason: "job has no valid \"messages\" array")
+                return .failure(TemplateError("job has no valid \"messages\" array"))
             }
-            template = .messages(messagesData)
+            return .success(.messages(messagesData))
         case (nil, .some(let raw)):
             guard let prompt = raw as? String, !prompt.isEmpty else {
-                return .invalid(epoch: epoch, reason: "job \"prompt\" is not a non-empty string")
+                return .failure(TemplateError("job \"prompt\" is not a non-empty string"))
             }
             // Mirrors HF's add_special_tokens: whether the tokenizer wraps the prompt in
             // BOS/EOS. Default true (the tokenizer's standard behavior); a model card that
             // says add_special_tokens=False (e.g. MiLMMT-46) sets false.
             let special = (obj["add_special_tokens"] as? NSNumber)?.boolValue ?? true
-            template = .prompt(prompt, specialTokens: special)
+            return .success(.prompt(prompt, specialTokens: special))
         case (nil, nil):
-            return .invalid(epoch: epoch, reason: "job has no \"messages\" array or \"prompt\" string")
+            return .failure(TemplateError("job has no \"messages\" array or \"prompt\" string"))
         }
-        let budget = (obj["budget_tokens"] as? NSNumber)?.intValue ?? 1200
-        let output: Output = (obj["output"] as? String == "collect") ? .collect : .stitch
-        return .job(
-            Job(
-                epoch: epoch, text: text, budget: max(64, budget), output: output,
-                template: template))
+    }
+
+    /// Why a template could not be read; its text is the job's error message.
+    private struct TemplateError: Error, CustomStringConvertible {
+        let description: String
+        init(_ description: String) { self.description = description }
     }
 
     private func writeText(_ text: String, to url: URL) {
